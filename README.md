@@ -1,4 +1,6 @@
-> This project was ported by Gemini 3.5 Flash.
+> This project was ported by Gemini 3.5 Flash from
+> https://gitlab.inria.fr/bass-db/peass/-/tree/22c7fc4ef670f8bb6eea9ab4abea98323006b769/v2.0.1
+> (also in [peass_master_22c7fc4e](./peass_master_22c7fc4e) for the LLM to refer to)
 
 # PEASS Toolkit (Python Port)
 
@@ -105,7 +107,7 @@ You can run the entire PEASS evaluation pipeline in Python using the master scri
 
 ```python
 import numpy as np
-from PEASS_ObjectiveMeasure import PEASS_ObjectiveMeasure
+from peass_direct_python_port.PEASS_ObjectiveMeasure import PEASS_ObjectiveMeasure
 
 # Set your sampling frequency
 fs = 16000
@@ -123,9 +125,9 @@ print("Computing complete PEASS evaluation...")
 
 # 3. Execute the full PEASS master pipeline
 results = PEASS_ObjectiveMeasure(
-    originalFiles=[speech, noise],
-    estimateFile=denoised_output,
-    fs=fs
+  originalFiles=[speech, noise],
+  estimateFile=denoised_output,
+  fs=fs
 )
 
 # 4. Display objective ratios and predicted subjective ratings
