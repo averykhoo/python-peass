@@ -1,27 +1,27 @@
-# %%% myMapping.m %%%
+"""
+PEASS Toolkit - Python Port
+Equivalent of myMapping.m (and myLogSig.m functionality)
+"""
 import numpy as np
 
-def sigmoid(x):
-    # y=1./(1+exp(-x));
+
+def sigmoid(x: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-x))
 
-# function [y,dW,db,dv,da] = myMapping(x,W,b,v,a)
-def myMapping(x, W, b, v, a):
-    # [nin,ndata]=size(x);
+
+def dsigmoid(x: np.ndarray) -> np.ndarray:
+    return 1.0 / (2.0 + np.exp(x) + np.exp(-x))
+
+
+def myMapping(x: np.ndarray, W: np.ndarray, b: np.ndarray, v: np.ndarray, a: np.ndarray):
+    # %%% MATLAB Code %%%
     if len(x.shape) == 1:
         x = x[:, np.newaxis]
-    nin, ndata = x.shape
-    nhid = len(v)
 
-    # s1=W*x+b*ones(1,ndata);
-    # Note: Ensure shape alignment for the bias vector addition
+    # s1=W*x+b*ones(1,ndata); o1=sigmoid(s1); s2=v'*o1+a; y=100*sigmoid(s2);
     s1 = W @ x + b
-    # o1=sigmoid(s1);
     o1 = sigmoid(s1)
-    # s2=v'*o1+a;
     s2 = v.T @ o1 + a
-    # y=100*sigmoid(s2);
     y = 100.0 * sigmoid(s2)
 
-    # return
     return float(y[0, 0])

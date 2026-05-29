@@ -1,10 +1,13 @@
-# %%% ISR_SIR_SAR_fromNewDecomposition.m %%%
+"""
+PEASS Toolkit - Python Port
+Equivalent of ISR_SIR_SAR_fromNewDecomposition.m
+"""
 import numpy as np
 import soundfile as sf
 
 
-# function [ISR, SIR, SAR, SDR] = ISR_SIR_SAR_fromNewDecomposition(decompositionFilenames)
 def ISR_SIR_SAR_fromNewDecomposition(decompositionFilenames):
+    # %%% MATLAB Code %%%
     # sTrue = audioread(decompositionFilenames{1});
     # eTarget = audioread(decompositionFilenames{2});
     # eInterf = audioread(decompositionFilenames{3});
@@ -23,14 +26,13 @@ def ISR_SIR_SAR_fromNewDecomposition(decompositionFilenames):
     eArtif_flat = eArtif.ravel()
 
     # ISR = 10*log10(sum(sTrue(:).^2)/sum(eTarget(:).^2));
-    ISR = 10 * np.log10(np.sum(sTrue_flat ** 2) / np.sum(eTarget_flat ** 2))
+    ISR = 10.0 * np.log10(np.sum(sTrue_flat ** 2) / np.sum(eTarget_flat ** 2))
     # SIR = 10*log10(sum((sTrue(:)+eTarget(:)).^2)/sum(eInterf(:).^2));
-    SIR = 10 * np.log10(np.sum((sTrue_flat + eTarget_flat) ** 2) / np.sum(eInterf_flat ** 2))
+    SIR = 10.0 * np.log10(np.sum((sTrue_flat + eTarget_flat) ** 2) / np.sum(eInterf_flat ** 2))
     # SAR = 10*log10(sum((sTrue(:)+eTarget(:)+eInterf(:)).^2)/sum(eArtif(:).^2));
-    SAR = 10 * np.log10(np.sum((sTrue_flat + eTarget_flat + eInterf_flat) ** 2) / np.sum(eArtif_flat ** 2))
+    SAR = 10.0 * np.log10(np.sum((sTrue_flat + eTarget_flat + eInterf_flat) ** 2) / np.sum(eArtif_flat ** 2))
 
-    # if nargout>3
     # SDR = 10*log10(sum(sTrue(:).^2)/sum((eTarget(:)+eInterf(:)+eArtif(:)).^2));
-    SDR = 10 * np.log10(np.sum(sTrue_flat ** 2) / np.sum((eTarget_flat + eInterf_flat + eArtif_flat) ** 2))
+    SDR = 10.0 * np.log10(np.sum(sTrue_flat ** 2) / np.sum((eTarget_flat + eInterf_flat + eArtif_flat) ** 2))
 
     return ISR, SIR, SAR, SDR
