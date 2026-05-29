@@ -1,0 +1,85 @@
+<html xmlns="http://www.w3.org/1999/xhtml">
+
+
+<!--	<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01//EN"
+	   "http://www.w3.org/TR/html4/strict.dtd">
+<html>-->
+
+<head>
+<!--	<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Frameset//EN"  "http://www.w3.org/TR/html4/frameset.dtd">     -->
+<meta content="text/html; charset=ISO-8859-1" http-equiv="content-type" />
+
+	<title>The PEASS Toolkit - Perceptual Evaluation methods for Audio Source Separation</title>
+
+</head>
+
+<body>
+
+<h1>Distortion components in audio source separation<br> </h1>
+In the source separation process, the estimate &#349;<sub>j </sub>of a target source s<sub>j </sub>is obtained from the mixture x=s<sub>1</sub>+...+s<sub>J </sub>of several sources.<br/> The distortion is modeled as the sum of three distortion components:<br/><div style="text-align: center;">&#349;<sub>j</sub>-s<sub>j</sub>=e<sup>Target</sup>+e<sup>Interf</sup>+e<sup>Artif</sup><br/> </div>
+<ul>  <li>e<sup>Target</sup> is the target distortion</li>  <li>e<sup>Interf</sup> is the interference distortion component<br>  </li>  <li>e<sup>Artif</sup> is the artifact distortion component<br>  </li> </ul>
+We propose a new decomposition method to estimate e<sup>Target</sup>, e<sup>Interf</sup> and e<sup>Artif</sup>. Here are some sound examples to illustrate the resulting decomposition and compare it to the state-of-the-art decomposition method (E. Vincent, H. Sawada, P. Bofill, S. Makino, and J.P. Rosca, <span style="font-style: italic;">First Stereo Audio Source Separation Evaluation Campaign: Data, Algorithms and Results</span>, Int. Conf. on Independent Component Analysis and Signal Separation, 2007).<br/>
+<h2>Example 1<br> </h2>
+
+<div style="text-align: center;">
+Clean target (s<sub>j</sub>): <object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_target.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_target.mp3"></object><br/>
+Mix (x): <object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_anchorInterf.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_anchorInterf.mp3"></object><br/>
+Estimate (&#349;<sub>j</sub>): <object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7.mp3"></object><br/>
+<table style="margin-left: auto; margin-right: auto; vertical-align: middle; text-align: center;"><tbody>
+<tr style="background-color: rgb(187, 187, 187);">
+ <td>Components</td>
+ <td>Proposed decomposition</td>
+ <td>State-of-the-art decomposition (SASSEC/BSS eval)</td>
+</tr>
+<tr>
+ <td>Distorted target (s<sub>j</sub>+e<sup>Target</sup>)</td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_trsp.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_trsp.mp3"></object></td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_trsp.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_trsp.mp3"></object></td>
+</tr>
+<tr style="background-color: rgb(187, 187, 187);">
+ <td>Target distortion (e<sub>j</sub><sup>Target</sup>)</td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eTarget.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eTarget.mp3"></object></td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eTarget.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eTarget.mp3"></object></td>
+</tr>
+<tr>
+ <td>Interference (e<sup>Interf</sup>)</td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eInterf.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eInterf.mp3"></object></td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eInterf.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eInterf.mp3"></object></td>
+</tr>
+<tr style="background-color: rgb(187, 187, 187);">
+ <td>Artifacts (e<sup>Artif</sup>)</td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eArtif.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_eArtif.mp3"></object></td>
+<td><object type="application/x-shockwave-flash" data="dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eArtif.mp3" width="160" height="20"><param name="wmode" value="transparent"><param name="movie" value="../dewplayer-mini.swf?mp3=mp3/1-exp01_test7_old_eArtif.mp3"></object></td>
+</tr>
+</tbody></table>
+</div>
+<div style="text-align: left;">
+Go to: <a href="Ex02.html" target="_self">Example 2</a> 
+<a href="Ex03.html" target="_self">Example 3</a> 
+<a href="Ex04.html" target="_self">Example 4</a> 
+<a href="Ex05.html" target="_self">Example 5</a> 
+<a href="Ex06.html" target="_self">Example 6</a> 
+</div>
+<h2>Scatter plots<br> </h2>
+The proposed decomposition vs state-of-the-art decomposition are compared on a large number of test sounds, using several criteria:
+<ul>  <li>ISR, SIR and SAR;</li> <li> the proposed criteria q<sup>Target</sup>, q<sup>Interf</sup> and q<sup>Artif</sup> (audio quality measures of target preservation, interference suppression and absence of artifacts).</li></ul>
+<div style="text-align: center;">
+<table style="width: 80%; text-align: center;" border="0" cellpadding="2" cellspacing="2"><tbody><tr>
+<td>
+<img alt="Scatter energy ratios" src="scatterER2-CO.jpg.jpg" width="800px"/>
+</td><td colspan="1" rowspan="2">
+<img alt="Scatter energy ratios" src="scatterLeg2-CO.jpg.jpg" width="250px"/>
+</td></tr><tr>
+<td>
+<img alt="Scatter audio q" src="scatterPQ2-CO.jpg.jpg" width="800px"/>
+</td></tr></tbody></table></div>
+<p>
+ Clean targets, mixtures and estimates are under <a href="subjdata-license.htm">this license statement</a>. Distortion component sounds are made available under the terms of the <a href="http://creativecommons.org/licenses/by-nc-sa/2.0/">Creative Commons Attribution-NonCommercial-ShareAlike 2.0 license</a>.</p><div style="text-align: left;">
+Go to: <a href="Ex02.html" target="_self">Example 2</a> 
+<a href="Ex03.html" target="_self">Example 3</a> 
+<a href="Ex04.html" target="_self">Example 4</a> 
+<a href="Ex05.html" target="_self">Example 5</a> 
+<a href="Ex06.html" target="_self">Example 6</a> 
+</div>
+</body>
+</html>
