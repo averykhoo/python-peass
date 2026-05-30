@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [ "3.9", "3.10", "3.11", "3.12" ]
+        python-version: [ "3.10", "3.12", "3.14" ]
 
     steps:
       - name: Check out repository
@@ -33,6 +33,8 @@ jobs:
           pip install pytest numba  # Numba will significantly accelerate our integration tests
 
       - name: Run test suite
+        env:
+          PYTHONPATH: .  # <-- Adds the root directory to Python's search path
         run: |
           pytest
 
