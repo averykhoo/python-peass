@@ -1,3 +1,5 @@
 numpy
 scipy
 soundfile
+scipy-stubs
+pytest
