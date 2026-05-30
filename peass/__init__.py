@@ -3,7 +3,7 @@ python-peass: Perceptual Evaluation methods for Audio Source Separation
 A modern, Pythonic port of the PEASS v2.0.1 toolkit [1].
 """
 
-__version__ = "2.0.1"
+__version__ = "2.0.1.1"  # matches peass version, with one more segment for me to edit
 
 from .decomposition import extract_distortion_components
 from .metrics import audio_quality_features
