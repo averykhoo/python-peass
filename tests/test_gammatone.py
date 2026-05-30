@@ -1,16 +1,17 @@
 """
 PEASS Test Suite - Gammatone Filterbank Mathematics Unit Tests
-File path: tests/test_gammatone.py
 """
 
 import numpy as np
 
-from peass.gammatone import GammatoneAnalyzer
-from peass.gammatone import GammatoneFilter
-from peass.gammatone import calculate_erb_bandwidth
-from peass.gammatone import erb_scale_to_frequency
-from peass.gammatone import frequency_to_erb_scale
-from peass.gammatone import get_center_frequencies
+from peass.gammatone import (
+    GammatoneAnalyzer,
+    GammatoneFilter,
+    calculate_erb_bandwidth,
+    erb_scale_to_frequency,
+    frequency_to_erb_scale,
+    get_center_frequencies,
+)
 
 
 def test_erb_scale_inversion():

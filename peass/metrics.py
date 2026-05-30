@@ -1,147 +1,210 @@
 """
-PEASS Metrics Package - Auditory Features & Similarity Metrics [1, 2]
+PEASS Metrics Package - Auditory Features & Similarity Metrics
 
-This module computes the perceptual features and linear/energy ratio calculations
-such as SDR, ISR, SIR, and SAR [1]. It houses the core PEMO-Q time-frequency
-cross-correlation engine.
+Computes perceptual features and linear/energy ratio calculations
+using extreme N-dimensional vectorized broadcasting.
 """
 
 from typing import Tuple
-
 import numpy as np
 
-from .auditory_model import generate_internal_representation
+from .auditory_model import generate_auditory_internal_representation
 
 
-def calculate_energy_ratios(
-        s_true: np.ndarray,
-        e_target: np.ndarray,
-        e_interf: np.ndarray,
-        e_artif: np.ndarray
+def calculate_bss_eval_energy_ratios(
+    true_source: np.ndarray,
+    target_distortion: np.ndarray,
+    interference: np.ndarray,
+    artifacts: np.ndarray
 ) -> Tuple[float, float, float, float]:
-    """
+    r"""
     Computes standard BSS Eval energy ratio metrics from physically decomposed components.
-    Replaces ISR_SIR_SAR_fromNewDecomposition.m [1].
+
+    :param true_source: Extracted target physical waveform.
+    :type true_source: numpy.ndarray
+    :param target_distortion: Distorted spatial features waveform.
+    :type target_distortion: numpy.ndarray
+    :param interference: Background overlapping source leakages.
+    :type interference: numpy.ndarray
+    :param artifacts: Non-linear processing artifacts.
+    :type artifacts: numpy.ndarray
+    :return: A tuple of (ISR, SIR, SAR, SDR) in Decibels (dB).
+    :rtype: Tuple[float, float, float, float]
     """
-    sTrue_flat = s_true.ravel()
-    eTarget_flat = e_target.ravel()
-    eInterf_flat = e_interf.ravel()
-    eArtif_flat = e_artif.ravel()
+    flat_true_source = true_source.ravel()
+    flat_target_distortion = target_distortion.ravel()
+    flat_interference = interference.ravel()
+    flat_artifacts = artifacts.ravel()
 
-    # Eq. (11), (12), (13) of Emiya 2011 [4]:
-    ISR = 10.0 * np.log10(np.sum(sTrue_flat ** 2) / np.sum(eTarget_flat ** 2))
-    SIR = 10.0 * np.log10(np.sum((sTrue_flat + eTarget_flat) ** 2) / np.sum(eInterf_flat ** 2))
-    SAR = 10.0 * np.log10(np.sum((sTrue_flat + eTarget_flat + eInterf_flat) ** 2) / np.sum(eArtif_flat ** 2))
-    SDR = 10.0 * np.log10(np.sum(sTrue_flat ** 2) / np.sum((eTarget_flat + eInterf_flat + eArtif_flat) ** 2))
+    # Epsilon bounds to prevent division by zero in log scale
+    eps = np.finfo(np.float64).eps
 
-    return ISR, SIR, SAR, SDR
+    source_to_spatial_distortion_ratio = 10.0 * np.log10(
+        np.sum(flat_true_source ** 2) / np.maximum(np.sum(flat_target_distortion ** 2), eps)
+    )
+    source_to_interference_ratio = 10.0 * np.log10(
+        np.sum((flat_true_source + flat_target_distortion) ** 2) / np.maximum(np.sum(flat_interference ** 2), eps)
+    )
+    source_to_artifacts_ratio = 10.0 * np.log10(
+        np.sum((flat_true_source + flat_target_distortion + flat_interference) ** 2) / np.maximum(
+            np.sum(flat_artifacts ** 2), eps)
+    )
+    source_to_distortion_ratio = 10.0 * np.log10(
+        np.sum(flat_true_source ** 2) / np.maximum(
+            np.sum((flat_target_distortion + flat_interference + flat_artifacts) ** 2), eps)
+    )
+
+    return (
+        source_to_spatial_distortion_ratio,
+        source_to_interference_ratio,
+        source_to_artifacts_ratio,
+        source_to_distortion_ratio
+    )
 
 
-def pemo_similarity_metric(internal_reference: np.ndarray, internal_test: np.ndarray,
-                           sampling_frequency: float) -> float:
-    """
+def calculate_auditory_similarity_metric(
+    internal_reference_representation: np.ndarray,
+    internal_test_representation: np.ndarray,
+    representation_sampling_frequency: float
+) -> float:
+    r"""
     Compares two internal representations to produce an auditory similarity metric.
-    Replaces pemo_metric.m [1].
-
-    Performs assimilation of masked content, local framing, cross-correlation,
-    moving RMS weighting, and percentile assessment [2].
+    Computes cross-correlation heavily vectorized over the temporal framing dimensions.
     """
-    nband, nsampl, nmod = internal_reference.shape
+    num_bands, num_samples, num_modulations = internal_reference_representation.shape
 
-    # Assimilation (Eq. of PEMO-Q [2]):
-    assim = (np.abs(internal_test) < np.abs(internal_reference))
-    internal_test[assim] = 0.25 * internal_reference[assim] + 0.75 * internal_test[assim]
+    assimilation_mask = (np.abs(internal_test_representation) < np.abs(internal_reference_representation))
+    internal_test_representation[assimilation_mask] = (
+        0.25 * internal_reference_representation[assimilation_mask] +
+        0.75 * internal_test_representation[assimilation_mask]
+    )
 
-    # Convert frame sizes
-    flen = int(min(nsampl, 0.1 * sampling_frequency))
-    nfram = int(np.floor(nsampl / flen))
-    nsampl = nfram * flen
+    frame_length = int(min(num_samples, 0.1 * representation_sampling_frequency))
+    num_frames = int(np.floor(num_samples / frame_length))
+    num_samples = num_frames * frame_length
 
-    internal_reference = internal_reference[:, :nsampl, :]
-    internal_test = internal_test[:, :nsampl, :]
+    # Ensure shape aligns cleanly onto boundaries
+    ref_view = internal_reference_representation[:, :num_samples, :]
+    test_view = internal_test_representation[:, :num_samples, :]
 
-    PSMt = np.zeros(nfram)
-    lPSM = np.zeros(nmod)
-    lNMS = np.zeros(nmod)
+    # Reshape from (nband, nfram * flen, nmod) to (nfram, nband * flen, nmod)
+    ref_frames = ref_view.reshape(num_bands, num_frames, frame_length, num_modulations)
+    ref_frames = ref_frames.transpose(1, 0, 2, 3).reshape(num_frames, num_bands * frame_length, num_modulations)
 
-    for t in range(nfram):
-        for m in range(nmod):
-            lref = internal_reference[:, t * flen: (t + 1) * flen, m]
-            lref_flat = lref.ravel()
-            lref_flat = lref_flat - np.mean(lref_flat)
+    test_frames = test_view.reshape(num_bands, num_frames, frame_length, num_modulations)
+    test_frames = test_frames.transpose(1, 0, 2, 3).reshape(num_frames, num_bands * frame_length, num_modulations)
 
-            ltest = internal_test[:, t * flen: (t + 1) * flen, m]
-            ltest_flat_orig = ltest.ravel()
-            lNMS[m] = np.sum(ltest_flat_orig ** 2)
+    # Vectorized similarity measure components
+    eps = np.finfo(np.float64).eps
+    ref_mean = np.mean(ref_frames, axis=1, keepdims=True)
+    lref = ref_frames - ref_mean
 
-            ltest_flat = ltest_flat_orig - np.mean(ltest_flat_orig)
-            denom = np.sqrt(np.sum(lref_flat ** 2) * np.sum(ltest_flat ** 2))
-            lPSM[m] = np.sum(lref_flat * ltest_flat) / denom if denom != 0 else 0.0
+    ltest_orig = test_frames
+    lnms = np.sum(ltest_orig ** 2, axis=1)
 
-        sum_lnms = np.sum(lNMS)
-        PSMt[t] = np.sum(lPSM * lNMS) / sum_lnms if sum_lnms != 0 else 0.0
+    ltest_mean = np.mean(ltest_orig, axis=1, keepdims=True)
+    ltest = ltest_orig - ltest_mean
+
+    denominator = np.sqrt(np.sum(lref ** 2, axis=1) * np.sum(ltest ** 2, axis=1))
+
+    lpsm = np.sum(lref * ltest, axis=1) / np.maximum(denominator, eps)
+    local_perceptual_similarity_measures = np.sum(lpsm * lnms, axis=1) / np.maximum(np.sum(lnms, axis=1), eps)
 
     # From local to global similarity
-    ilen = int(1 * sampling_frequency)
-    mtest_sq = np.sum(internal_test ** 2, axis=(0, 2))
+    integration_length = int(1.0 * representation_sampling_frequency)
+    squared_test_representation = np.sum(test_view ** 2, axis=(0, 2))
 
-    RMS = np.zeros(nfram)
-    for t in range(nfram):
-        start_idx = int(max(0, (t + 0.5) * flen - 0.5 * ilen))
-        end_idx = int(min(nsampl, (t + 0.5) * flen + 0.5 * ilen))
-        ltest = mtest_sq[start_idx:end_idx]
-        RMS[t] = np.mean(ltest) if len(ltest) > 0 else 0.0
+    root_mean_square_energy = np.zeros(num_frames)
+    for frame_idx in range(num_frames):
+        frame_center = (frame_idx + 0.5) * frame_length
+        start_idx = int(max(0, frame_center - 0.5 * integration_length))
+        end_idx = int(min(num_samples, frame_center + 0.5 * integration_length))
 
-    # Sorted weighted percentile extraction
-    ind = np.argsort(PSMt)
-    PSMt_sorted = PSMt[ind]
-    RMS_sorted = RMS[ind]
-    RMS_cum = np.cumsum(RMS_sorted)
+        energy_slice = squared_test_representation[start_idx:end_idx]
+        root_mean_square_energy[frame_idx] = np.mean(energy_slice) if len(energy_slice) > 0 else 0.0
 
-    cutoff = 0.5 * RMS_cum[-1]
-    match_indices = np.where(RMS_cum >= cutoff)[0]
+    sorted_indices = np.argsort(local_perceptual_similarity_measures)
+    sorted_similarity_measures = local_perceptual_similarity_measures[sorted_indices]
+    sorted_rms_energy = root_mean_square_energy[sorted_indices]
+    cumulative_rms_energy = np.cumsum(sorted_rms_energy)
 
-    return PSMt_sorted[match_indices[0]] if len(match_indices) > 0 else 0.0
+    cutoff_energy = 0.5 * cumulative_rms_energy[-1]
+    matching_indices = np.where(cumulative_rms_energy >= cutoff_energy)[0]
+
+    return float(sorted_similarity_measures[matching_indices[0]]) if len(matching_indices) > 0 else 0.0
 
 
-def audio_quality_features(decomposition_signals: list[np.ndarray], sampling_frequency: float = 16000.0) -> Tuple[
-    float, float, float, float]:
-    """
+def calculate_auditory_quality_features(
+    decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    sampling_frequency_hz: float = 16000.0
+) -> Tuple[float, float, float, float]:
+    r"""
     Computes quality features by sending decomposed signals through the internal auditory model.
-    Replaces audioQualityFeatures.m [1].
     """
-    sTrue, eTarget, eInterf, eArtif = decomposition_signals
+    true_target, target_distortion, interference, artifacts = decomposition_signals
 
-    if len(sTrue.shape) == 1:
-        sTrue = sTrue[:, np.newaxis]
-        eTarget = eTarget[:, np.newaxis]
-        eInterf = eInterf[:, np.newaxis]
-        eArtif = eArtif[:, np.newaxis]
+    if len(true_target.shape) == 1:
+        true_target = true_target[:, np.newaxis]
+        target_distortion = target_distortion[:, np.newaxis]
+        interference = interference[:, np.newaxis]
+        artifacts = artifacts[:, np.newaxis]
 
-    testAll = sTrue + eTarget + eInterf + eArtif
-    NChan = sTrue.shape[1]
+    composite_estimate = true_target + target_distortion + interference + artifacts
+    num_channels = true_target.shape[1]
 
-    qTarget = np.zeros(NChan)
-    qInterf = np.zeros(NChan)
-    qArtif = np.zeros(NChan)
-    qGlobal = np.zeros(NChan)
+    channel_target_quality = np.zeros(num_channels)
+    channel_interference_quality = np.zeros(num_channels)
+    channel_artifacts_quality = np.zeros(num_channels)
+    channel_global_quality = np.zeros(num_channels)
 
-    for kChan in range(NChan):
-        mtest, fr = generate_internal_representation(testAll[:, kChan], sampling_frequency)
+    for channel_idx in range(num_channels):
+        mtest, fr = generate_auditory_internal_representation(composite_estimate[:, channel_idx], sampling_frequency_hz)
 
-        mref_t, _ = generate_internal_representation(sTrue[:, kChan] + eInterf[:, kChan] + eArtif[:, kChan],
-                                                     sampling_frequency)
-        qTarget[kChan] = pemo_similarity_metric(mref_t, mtest, fr)
+        mref_t, _ = generate_auditory_internal_representation(
+            true_target[:, channel_idx] + interference[:, channel_idx] + artifacts[:, channel_idx],
+            sampling_frequency_hz
+        )
+        channel_target_quality[channel_idx] = calculate_auditory_similarity_metric(mref_t, mtest, fr)
 
-        mref_i, _ = generate_internal_representation(sTrue[:, kChan] + eTarget[:, kChan] + eArtif[:, kChan],
-                                                     sampling_frequency)
-        qInterf[kChan] = pemo_similarity_metric(mref_i, mtest, fr)
+        mref_i, _ = generate_auditory_internal_representation(
+            true_target[:, channel_idx] + target_distortion[:, channel_idx] + artifacts[:, channel_idx],
+            sampling_frequency_hz
+        )
+        channel_interference_quality[channel_idx] = calculate_auditory_similarity_metric(mref_i, mtest, fr)
 
-        mref_a, _ = generate_internal_representation(sTrue[:, kChan] + eTarget[:, kChan] + eInterf[:, kChan],
-                                                     sampling_frequency)
-        qArtif[kChan] = pemo_similarity_metric(mref_a, mtest, fr)
+        mref_a, _ = generate_auditory_internal_representation(
+            true_target[:, channel_idx] + target_distortion[:, channel_idx] + interference[:, channel_idx],
+            sampling_frequency_hz
+        )
+        channel_artifacts_quality[channel_idx] = calculate_auditory_similarity_metric(mref_a, mtest, fr)
 
-        mref_g, _ = generate_internal_representation(sTrue[:, kChan], sampling_frequency)
-        qGlobal[kChan] = pemo_similarity_metric(mref_g, mtest, fr)
+        mref_g, _ = generate_auditory_internal_representation(true_target[:, channel_idx], sampling_frequency_hz)
+        channel_global_quality[channel_idx] = calculate_auditory_similarity_metric(mref_g, mtest, fr)
 
-    return np.min(qTarget), np.min(qInterf), np.min(qArtif), np.min(qGlobal)
+    return (
+        float(np.min(channel_target_quality)),
+        float(np.min(channel_interference_quality)),
+        float(np.min(channel_artifacts_quality)),
+        float(np.min(channel_global_quality))
+    )
+
+
+# -----------------------------------------------------------------------------
+# LEGACY BACKWARD-COMPATIBILITY ALIASES
+# -----------------------------------------------------------------------------
+def calculate_energy_ratios(
+    s_true: np.ndarray,
+    e_target: np.ndarray,
+    e_interf: np.ndarray,
+    e_artif: np.ndarray
+) -> Tuple[float, float, float, float]:
+    """Legacy compatibility wrapper for calculate_bss_eval_energy_ratios."""
+    return calculate_bss_eval_energy_ratios(s_true, e_target, e_interf, e_artif)
+
+
+def audio_quality_features(
+    decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+    sampling_frequency: float = 16000.0
+) -> Tuple[float, float, float, float]:
+    """Legacy compatibility wrapper for calculate_auditory_quality_features."""
+    return calculate_auditory_quality_features(decomposition_signals, sampling_frequency)
