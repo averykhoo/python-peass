@@ -10,8 +10,8 @@ from pathlib import Path
 import scipy.io as sio
 import numpy as np
 
-BASE_DIR = Path('references/peass_master_22c7fc4e/v2.0.1')
-OUT_DIR = Path('references/legacy_direct_python_port')
+BASE_DIR = Path('../peass_master_22c7fc4e/v2.0.1')
+OUT_DIR = Path('')
 
 def convert_mat_to_npz():
     # Loop through all 4 task parameter files

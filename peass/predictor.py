@@ -102,11 +102,11 @@ def predict_peass_scores(
 
         scores[nTask] = my_mapping(q_mapped[selec], W, b, v, a)
 
-    return {
-        "OPS": float(scores[0]),  # Overall Perceptual Score
-        "TPS": float(scores[1]),  # Target-related Perceptual Score
-        "IPS": float(scores[2]),  # Interference-related Perceptual Score
-        "APS": float(scores[3]),  # Artifact-related Perceptual Score
+    results = {
+        "OPS": float(scores[0]), # Overall Perceptual Score
+        "TPS": float(scores[1]), # Target-related Perceptual Score
+        "IPS": float(scores[2]), # Interference-related Perceptual Score
+        "APS": float(scores[3]), # Artifact-related Perceptual Score
         "SDR": SDR,
         "ISR": ISR,
         "SIR": SIR,

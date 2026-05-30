@@ -1,5 +1,7 @@
+numba
 numpy
-scipy
-soundfile
-scipy-stubs
 pytest
+pytest-cov
+scipy
+scipy-stubs
+soundfile

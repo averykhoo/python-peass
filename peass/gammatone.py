@@ -114,6 +114,10 @@ class GammatoneFilter:
         self.state = new_state / coeff
         return y
 
+    def clear_state(self) -> None:
+        """Resets the internal filter state to zeros."""
+        self.state = np.zeros(self.gamma_order, dtype=complex)
+
 
 class GammatoneAnalyzer:
     """
@@ -159,6 +163,11 @@ class GammatoneAnalyzer:
             response[:, band] = ((1.0 - coeff / z_col[:, 0]) ** -gamma) * norm
         return response
 
+    def clear_state(self) -> None:
+        """Resets all filters' states to zeros."""
+        for filter_obj in self.filters:
+            filter_obj.clear_state()
+
 
 class GammatoneDelay:
     """
@@ -167,6 +176,9 @@ class GammatoneDelay:
     """
 
     def __init__(self, analyzer: GammatoneAnalyzer, delay_samples: int):
+        # Reset the analyzer states before analyzing the impulse response
+        analyzer.clear_state()
+
         impulse = np.zeros(delay_samples + 2)
         impulse[0] = 1.0
 

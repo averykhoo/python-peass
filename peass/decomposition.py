@@ -321,18 +321,14 @@ def extract_distortion_components(
     ThopFRef = TframeFRef / 4.0
     idx_fref = np.argmin(np.abs(analyzer.center_frequencies - fRef))
     bwRef = analyzer.bandwidths[idx_fref]
-    fsb = analyzer.sampling_frequency / analyzer.filters[
-        0].sampling_frequency  # actually fsb is fs/Ndec but the state contains correct sizes
 
-    # Re-calculate correct frame metrics for subbands
-    Ndec = analyzer.filters[0].sampling_frequency / analyzer.sampling_frequency  # placeholder
-    # Simply using the configured analyzer values directly matches the MATLAB decimation:
-    fsb = analyzer.sampling_frequency / analyzer['Ndec']
+    # Corrected object-subscripting glitch:
+    fsb = analyzer.sampling_frequency / analyzer.Ndec
 
     TfilterFRef = min(options['filterLength'], TframeFRef / NChan / J / 3.0)
-    flens = np.maximum(3, 2 * np.round((TfilterFRef * bwRef / analyzer['bw'] * fsb - 1) / 2.0) + 1).astype(int)
-    Lws = np.maximum(3, np.round(TframeFRef * bwRef / analyzer['bw'] * fsb)).astype(int)
-    hops = np.maximum(1, np.round(ThopFRef * bwRef / analyzer['bw'] * fsb)).astype(int)
+    flens = np.maximum(3, 2 * np.round((TfilterFRef * bwRef / analyzer.bw * fsb - 1) / 2.0) + 1).astype(int)
+    Lws = np.maximum(3, np.round(TframeFRef * bwRef / analyzer.bw * fsb)).astype(int)
+    hops = np.maximum(1, np.round(ThopFRef * bwRef / analyzer.bw * fsb)).astype(int)
 
     sgTrue, egTarget, egInterf, egArtif = [], [], [], []
     for b in range(Nb):
@@ -367,10 +363,10 @@ def extract_distortion_components(
         return np.pad(sig, (0, target_len - len(sig)), mode='constant')
 
     for nChan in range(NChan):
-        synth_t, _, _ = my_synthesis_filter_bank(s_gamma_true[nChan], analyzer, Mmod)
-        synth_s, _, _ = my_synthesis_filter_bank(s_gamma_target[nChan], analyzer, Mmod)
-        synth_i, _, _ = my_synthesis_filter_bank(s_gamma_interf[nChan], analyzer, Mmod)
-        synth_a, _, _ = my_synthesis_filter_bank(s_gamma_artif[nChan], analyzer, Mmod)
+        synth_t, _ = my_synthesis_filter_bank(s_gamma_true[nChan], analyzer)
+        synth_s, _ = my_synthesis_filter_bank(s_gamma_target[nChan], analyzer)
+        synth_i, _ = my_synthesis_filter_bank(s_gamma_interf[nChan], analyzer)
+        synth_a, _ = my_synthesis_filter_bank(s_gamma_artif[nChan], analyzer)
 
         trueSynth[:, nChan] = fit_to_length(synth_t, L_original)
         targetSynth[:, nChan] = fit_to_length(synth_s, L_original)
@@ -438,7 +434,7 @@ def my_analysis_filter_bank(x: np.ndarray, fs: float, Mmod: np.ndarray = None):
     return gfb_out_dec, analyzer, Mmod
 
 
-def my_synthesis_filter_bank(xFB: list, analyzer: GammatoneAnalyzer, Mmod: np.ndarray = None):
+def my_synthesis_filter_bank(xFB: list, analyzer: GammatoneAnalyzer):
     """Temporary local alias for packaging isolation."""
     Nb = len(xFB)
     fs = analyzer.fs
@@ -456,27 +452,19 @@ def my_synthesis_filter_bank(xFB: list, analyzer: GammatoneAnalyzer, Mmod: np.nd
 
     time_steps = np.arange(max_len)
     cfs = analyzer.center_frequencies[:, np.newaxis]
-    Mmod = np.exp(2j * np.pi / fs * cfs * time_steps)
+    Mmod_synth = np.exp(2j * np.pi / fs * cfs * time_steps)
 
-    gfb_out_proc = gfb_out_proc * Mmod
+    gfb_out_proc = gfb_out_proc * Mmod_synth
 
     desired_delay_in_seconds = 1000.0 / fs
     synthesizer = GammatoneSynthesizer(analyzer, desired_delay_in_seconds)
-    output, _ = Gfb_Synthesizer_process(synthesizer, gfb_out_proc)
+
+    # Corrected object-oriented process execution directly matching interface definitions:
+    output = synthesizer.process(gfb_out_proc)
 
     fsOrig = analyzer.fsOrig
     output = signal.resample(output, int(round(len(output) * fsOrig / fs)))
     delay_samples = int(round(desired_delay_in_seconds * fsOrig))
     output = output[delay_samples:]
 
-    return output, synthesizer, Mmod
-
-
-def Gfb_Synthesizer_process(synthesizer, input_data):
-    """Synthesizer engine mapping helper."""
-    from .gammatone import Gfb_Delay_process, Gfb_Mixer_process
-    output, delay = Gfb_Delay_process(synthesizer.delay, input_data)
-    synthesizer.delay = delay
-    output, mixer = Gfb_Mixer_process(synthesizer.mixer, output)
-    synthesizer.mixer = mixer
     return output, synthesizer

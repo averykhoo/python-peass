@@ -13,6 +13,25 @@ import scipy.signal as signal
 
 from .gammatone import GammatoneAnalyzer
 
+# Check for Numba availability
+try:
+    import numba
+
+    _HAS_NUMBA = True
+except ImportError:
+    _HAS_NUMBA = False
+
+if _HAS_NUMBA:
+    @numba.jit(nopython=True, cache=True)
+    def _numba_adaptation_loop(rx: np.ndarray, gain_val: float, sthresh: float, factor: np.ndarray) -> np.ndarray:
+        num_bands, num_samples = rx.shape
+        for sample_idx in range(num_samples):
+            for band_idx in range(num_bands):
+                val = rx[band_idx, sample_idx] / factor[band_idx]
+                rx[band_idx, sample_idx] = val
+                factor[band_idx] = max((1.0 - gain_val) * val + gain_val * factor[band_idx], sthresh)
+        return rx
+
 
 def haircell_transduction(subband_signals: np.ndarray, sampling_frequency: float) -> np.ndarray:
     """
@@ -55,14 +74,19 @@ def adaptation_loops(subband_signals: np.ndarray, sampling_frequency: float) -> 
     for stage_idx in range(5):
         gain_val = np.exp(-np.pi * bw_loop[stage_idx] / sampling_frequency)
         sthresh = np.sqrt(sthresh)
-        factor = np.full(num_bands, sthresh)  # divisor factor for each band
+        factor = np.full(num_bands, sthresh, dtype=np.float32)  # divisor factor for each band
 
-        for sample_idx in range(num_samples):
-            # Divide current sample by current divisor factor
-            val = rx[:, sample_idx] / factor
-            rx[:, sample_idx] = val
-            # Update divisor filter state
-            factor = np.maximum((1.0 - gain_val) * val + gain_val * factor, sthresh)
+        if _HAS_NUMBA:
+            # Compiled loop executing at native C speeds
+            rx = _numba_adaptation_loop(rx, float(gain_val), float(sthresh), factor)
+        else:
+            # Fallback pure-Python loop
+            for sample_idx in range(num_samples):
+                # Divide current sample by current divisor factor
+                val = rx[:, sample_idx] / factor
+                rx[:, sample_idx] = val
+                # Update divisor filter state
+                factor = np.maximum((1.0 - gain_val) * val + gain_val * factor, sthresh)
 
     # % rx=double(dbrange/(1-sthresh))*(double(rx)-double(sthresh));
     return (dbrange / (1.0 - sthresh)) * (rx - sthresh)
