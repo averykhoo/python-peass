@@ -1,6 +1,6 @@
 # python-peass
 
-[![Test Suite](https://github.com/averykhoo/python-peass/actions/workflows/test.yml/badge.svg)](https://github.com/averykhoo/python-peass/actions)
+[![Test Suite](https://github.com/averykhoo/python-peass/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/averykhoo/python-peass/actions)
 [![PyPI version](https://img.shields.io/pypi/v/python-peass.svg)](https://pypi.org/project/python-peass/)
 
 > This project was ported by Gemini 3.5 Flash from
