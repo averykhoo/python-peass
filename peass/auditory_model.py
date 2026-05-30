@@ -7,8 +7,8 @@ and fails over gracefully to a SciPy/NumPy native vectorization.
 """
 
 import math
-from typing import Tuple
 from typing import Optional
+from typing import Tuple
 
 import numpy as np
 import scipy.signal as signal
@@ -225,7 +225,7 @@ def _fallback_fused_auditory_kernel(
 def simulate_inner_haircell_transduction(
         subband_signals: np.ndarray,
         sampling_frequency_hz: float,
-        sampling_frequency: Optional[float] = None # Legacy alias
+        sampling_frequency: Optional[float] = None  # Legacy alias
 ) -> np.ndarray:
     r"""
     Models the nonlinear mechanical-to-neural transduction of the inner hair cells.
@@ -246,7 +246,7 @@ def simulate_inner_haircell_transduction(
 def simulate_auditory_nerve_adaptation(
         subband_signals: np.ndarray,
         sampling_frequency_hz: float,
-        sampling_frequency: Optional[float] = None # Legacy alias
+        sampling_frequency: Optional[float] = None  # Legacy alias
 ) -> np.ndarray:
     r"""
     Simulates the physiological adaptive properties of the auditory nerve.

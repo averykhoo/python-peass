@@ -6,7 +6,8 @@ of frequency analysis, delay/phase alignment, and synthesis reconstruction.
 """
 
 import math
-from typing import List, Optional
+from typing import List
+from typing import Optional
 
 import numpy as np
 import scipy.signal as signal
@@ -66,14 +67,15 @@ class GammatoneFilter:
             center_frequency_hz: Optional[float] = None,
             filter_order: int = 4,
             bandwidth_factor: float = 1.0,
-            sampling_frequency: Optional[float] = None, # Legacy alias
-            center_frequency: Optional[float] = None # Legacy alias
+            sampling_frequency: Optional[float] = None,  # Legacy alias
+            center_frequency: Optional[float] = None  # Legacy alias
     ):
         fs = sampling_frequency_hz if sampling_frequency_hz is not None else sampling_frequency
         fc = center_frequency_hz if center_frequency_hz is not None else center_frequency
 
         if fs is None:
-            raise TypeError("GammatoneFilter.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
+            raise TypeError(
+                "GammatoneFilter.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
         if fc is None:
             raise TypeError("GammatoneFilter.__init__() missing 1 required positional argument: 'center_frequency_hz'")
 
@@ -145,11 +147,11 @@ class GammatoneAnalyzer:
             filters_per_equivalent_rectangular_bandwidth: Optional[float] = None,
             filter_order: int = 4,
             bandwidth_factor: float = 1.0,
-            sampling_frequency: Optional[float] = None, # Legacy alias
-            lower_cutoff_hz: Optional[float] = None, # Legacy alias
-            specified_center_hz: Optional[float] = None, # Legacy alias
-            upper_cutoff_hz: Optional[float] = None, # Legacy alias
-            filters_per_erb: Optional[float] = None # Legacy alias
+            sampling_frequency: Optional[float] = None,  # Legacy alias
+            lower_cutoff_hz: Optional[float] = None,  # Legacy alias
+            specified_center_hz: Optional[float] = None,  # Legacy alias
+            upper_cutoff_hz: Optional[float] = None,  # Legacy alias
+            filters_per_erb: Optional[float] = None  # Legacy alias
     ):
         fs = sampling_frequency_hz if sampling_frequency_hz is not None else sampling_frequency
         lower_cf = lower_cutoff_frequency_hz if lower_cutoff_frequency_hz is not None else lower_cutoff_hz
@@ -158,15 +160,20 @@ class GammatoneAnalyzer:
         density = filters_per_equivalent_rectangular_bandwidth if filters_per_equivalent_rectangular_bandwidth is not None else filters_per_erb
 
         if fs is None:
-            raise TypeError("GammatoneAnalyzer.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
+            raise TypeError(
+                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
         if lower_cf is None:
-            raise TypeError("GammatoneAnalyzer.__init__() missing 1 required positional argument: 'lower_cutoff_frequency_hz'")
+            raise TypeError(
+                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'lower_cutoff_frequency_hz'")
         if base_cf is None:
-            raise TypeError("GammatoneAnalyzer.__init__() missing 1 required positional argument: 'specified_center_frequency_hz'")
+            raise TypeError(
+                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'specified_center_frequency_hz'")
         if upper_cf is None:
-            raise TypeError("GammatoneAnalyzer.__init__() missing 1 required positional argument: 'upper_cutoff_frequency_hz'")
+            raise TypeError(
+                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'upper_cutoff_frequency_hz'")
         if density is None:
-            raise TypeError("GammatoneAnalyzer.__init__() missing 1 required positional argument: 'filters_per_equivalent_rectangular_bandwidth'")
+            raise TypeError(
+                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'filters_per_equivalent_rectangular_bandwidth'")
 
         self._sampling_frequency_hz: float = fs
         self.center_frequencies: np.ndarray = get_equivalent_rectangular_bandwidth_center_frequencies(

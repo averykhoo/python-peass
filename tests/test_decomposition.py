@@ -33,6 +33,15 @@ def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10
 def test_decomposition_algebraic_reconstruction(
     synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
+    """
+    Mathematically verifies that the decomposition satisfies the fundamental
+    separation error conservation identity:
+
+        estimate_reconstructed = target_distortion + interference + artifacts + true_target
+
+    This verifies that no signal energy is lost or created during the
+    subband least-squares and filterbank synthesis stages [1].
+    """
     target, interferer, estimate, fs = synthetic_audio_data
 
     configuration = DecompositionConfiguration()
@@ -65,6 +74,44 @@ def test_decomposition_algebraic_reconstruction(
     )
     np.testing.assert_allclose(est_reconstructed, summed_sub_components, atol=1e-7, rtol=1e-7)
 
+
+
+def test_decomposition_file_generation(
+        audio_files_fixture: Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
+):
+    """
+    Verifies that the decomposer successfully writes output WAV files to disk
+    in file-based execution mode.
+    """
+    target_path, interferer_path, estimate_path = audio_files_fixture
+
+    # Define the configurations using the new dataclass structure
+    configuration = DecompositionConfiguration(
+        destination_directory=str(target_path.parent)
+    )
+
+    # Execute using the modern, JIT-friendly entry point
+    result = decompose_distortion_components(
+        source_files=[str(target_path), str(interferer_path)],
+        estimate_file=str(estimate_path),
+        configuration=configuration
+    )
+
+    # Verify that the generated file paths are present
+    assert result.file_paths is not None
+    output_files = [
+        result.file_paths.true_target,
+        result.file_paths.target_distortion,
+        result.file_paths.interference,
+        result.file_paths.artifacts
+    ]
+
+    assert len(output_files) == 4
+    for file_path in output_files:
+        path_obj = pathlib.Path(file_path)
+        assert path_obj.is_file()
+        assert path_obj.stat().st_size > 0
+
 def test_decomposition_input_validation():
     sampling_frequency_hz = 16000.0
     signal_length = 1000
@@ -77,4 +124,12 @@ def test_decomposition_input_validation():
             source_files=[target, interferer],
             estimate_file=estimate_mismatched,
             sampling_frequency_hz=sampling_frequency_hz
+        )
+
+    # Missing sampling rate in in-memory mode
+    with pytest.raises(ValueError, match="requires explicit sampling rate"):
+        decompose_distortion_components(
+            source_files=[target, interferer],
+            estimate_file=target,
+            sampling_frequency_hz=None
         )

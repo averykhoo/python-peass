@@ -3,7 +3,8 @@ PEASS Configuration and Data Structures
 """
 
 from dataclasses import dataclass
-from enum import Enum, auto
+from enum import Enum
+from enum import auto
 from typing import Optional
 
 import numpy as np
@@ -98,16 +99,16 @@ class PerceptualSeparationScores:
             return mapping[key]
         if key == "decomposition_arrays" and self.decomposition_waveforms is not None:
             return {
-                "true_target": self.decomposition_waveforms.true_target,
+                "true_target":       self.decomposition_waveforms.true_target,
                 "target_distortion": self.decomposition_waveforms.target_distortion,
-                "interference": self.decomposition_waveforms.interference,
-                "artifacts": self.decomposition_waveforms.artifacts,
+                "interference":      self.decomposition_waveforms.interference,
+                "artifacts":         self.decomposition_waveforms.artifacts,
             }
         if key == "decomposition_files" and self.decomposition_files is not None:
             return {
-                "true_target": self.decomposition_files.true_target,
+                "true_target":       self.decomposition_files.true_target,
                 "target_distortion": self.decomposition_files.target_distortion,
-                "interference": self.decomposition_files.interference,
-                "artifacts": self.decomposition_files.artifacts,
+                "interference":      self.decomposition_files.interference,
+                "artifacts":         self.decomposition_files.artifacts,
             }
         raise KeyError(key)

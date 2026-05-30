@@ -6,16 +6,17 @@ using extreme N-dimensional vectorized broadcasting.
 """
 
 from typing import Tuple
+
 import numpy as np
 
 from .auditory_model import generate_auditory_internal_representation
 
 
 def calculate_bss_eval_energy_ratios(
-    true_source: np.ndarray,
-    target_distortion: np.ndarray,
-    interference: np.ndarray,
-    artifacts: np.ndarray
+        true_source: np.ndarray,
+        target_distortion: np.ndarray,
+        interference: np.ndarray,
+        artifacts: np.ndarray
 ) -> Tuple[float, float, float, float]:
     r"""
     Computes standard BSS Eval energy ratio metrics from physically decomposed components.
@@ -63,9 +64,9 @@ def calculate_bss_eval_energy_ratios(
 
 
 def calculate_auditory_similarity_metric(
-    internal_reference_representation: np.ndarray,
-    internal_test_representation: np.ndarray,
-    representation_sampling_frequency: float
+        internal_reference_representation: np.ndarray,
+        internal_test_representation: np.ndarray,
+        representation_sampling_frequency: float
 ) -> float:
     r"""
     Compares two internal representations to produce an auditory similarity metric.
@@ -75,8 +76,8 @@ def calculate_auditory_similarity_metric(
 
     assimilation_mask = (np.abs(internal_test_representation) < np.abs(internal_reference_representation))
     internal_test_representation[assimilation_mask] = (
-        0.25 * internal_reference_representation[assimilation_mask] +
-        0.75 * internal_test_representation[assimilation_mask]
+            0.25 * internal_reference_representation[assimilation_mask] +
+            0.75 * internal_test_representation[assimilation_mask]
     )
 
     frame_length = int(min(num_samples, 0.1 * representation_sampling_frequency))
@@ -135,8 +136,8 @@ def calculate_auditory_similarity_metric(
 
 
 def calculate_auditory_quality_features(
-    decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    sampling_frequency_hz: float = 16000.0
+        decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        sampling_frequency_hz: float = 16000.0
 ) -> Tuple[float, float, float, float]:
     r"""
     Computes quality features by sending decomposed signals through the internal auditory model.
@@ -193,18 +194,18 @@ def calculate_auditory_quality_features(
 # LEGACY BACKWARD-COMPATIBILITY ALIASES
 # -----------------------------------------------------------------------------
 def calculate_energy_ratios(
-    s_true: np.ndarray,
-    e_target: np.ndarray,
-    e_interf: np.ndarray,
-    e_artif: np.ndarray
+        s_true: np.ndarray,
+        e_target: np.ndarray,
+        e_interf: np.ndarray,
+        e_artif: np.ndarray
 ) -> Tuple[float, float, float, float]:
     """Legacy compatibility wrapper for calculate_bss_eval_energy_ratios."""
     return calculate_bss_eval_energy_ratios(s_true, e_target, e_interf, e_artif)
 
 
 def audio_quality_features(
-    decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-    sampling_frequency: float = 16000.0
+        decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        sampling_frequency: float = 16000.0
 ) -> Tuple[float, float, float, float]:
     """Legacy compatibility wrapper for calculate_auditory_quality_features."""
     return calculate_auditory_quality_features(decomposition_signals, sampling_frequency)

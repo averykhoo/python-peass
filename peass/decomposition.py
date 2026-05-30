@@ -7,15 +7,23 @@ and zero-copy arrays.
 """
 
 import pathlib
-from typing import List, Optional, Tuple, Union
+from typing import List
+from typing import Optional
+from typing import Tuple
+from typing import Union
 
 import numpy as np
 import scipy.linalg as linalg
 import scipy.signal as signal
 import soundfile as sf
 
-from .config import DecomposedFilePaths, DecomposedWaveforms, DecompositionConfiguration, DecompositionResult
-from .gammatone import GammatoneAnalyzer, GammatoneSynthesizer, calculate_equivalent_rectangular_bandwidth
+from .config import DecomposedFilePaths
+from .config import DecomposedWaveforms
+from .config import DecompositionConfiguration
+from .config import DecompositionResult
+from .gammatone import GammatoneAnalyzer
+from .gammatone import GammatoneSynthesizer
+from .gammatone import calculate_equivalent_rectangular_bandwidth
 
 
 def perform_least_squares_projection(
@@ -549,10 +557,10 @@ def decompose_distortion_components(
 # LEGACY BACKWARD-COMPATIBILITY ALIASES
 # -----------------------------------------------------------------------------
 def extract_distortion_components(
-    src_files: List[Union[str, np.ndarray]],
-    est_file: Union[str, np.ndarray],
-    options: Optional[dict] = None,
-    sampling_frequency: Optional[float] = None
+        src_files: List[Union[str, np.ndarray]],
+        est_file: Union[str, np.ndarray],
+        options: Optional[dict] = None,
+        sampling_frequency: Optional[float] = None
 ) -> Tuple[List[str], List[np.ndarray]]:
     """Legacy compatibility wrapper for decompose_distortion_components."""
     config = DecompositionConfiguration()

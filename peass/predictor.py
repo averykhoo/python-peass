@@ -7,22 +7,26 @@ Maps raw auditory similarity scores to Predicted Perceptual Scores
 
 import os
 import pathlib
-from typing import List, Optional, Union
+from typing import List
+from typing import Optional
+from typing import Union
 
 import numpy as np
 import soundfile as sf
 
-from .config import DecompositionConfiguration, PerceptualSeparationScores
+from .config import DecompositionConfiguration
+from .config import PerceptualSeparationScores
 from .decomposition import decompose_distortion_components
-from .metrics import calculate_auditory_quality_features, calculate_bss_eval_energy_ratios
+from .metrics import calculate_auditory_quality_features
+from .metrics import calculate_bss_eval_energy_ratios
 
 
 def evaluate_neural_network_mapping(
-    features: np.ndarray,
-    hidden_layer_weights: np.ndarray,
-    hidden_layer_bias: np.ndarray,
-    output_layer_weights: np.ndarray,
-    output_layer_bias: np.ndarray
+        features: np.ndarray,
+        hidden_layer_weights: np.ndarray,
+        hidden_layer_bias: np.ndarray,
+        output_layer_weights: np.ndarray,
+        output_layer_bias: np.ndarray
 ) -> float:
     r"""
     Evaluates forward propagation through the two-layer perceptron.
@@ -40,11 +44,11 @@ def evaluate_neural_network_mapping(
 
 
 def predict_perceptual_evaluation_scores(
-    original_files: List[Union[str, np.ndarray]],
-    estimate_file: Union[str, np.ndarray],
-    configuration: Optional[DecompositionConfiguration] = None,
-    sampling_frequency_hz: Optional[float] = None,
-    return_decomposition: bool = False
+        original_files: List[Union[str, np.ndarray]],
+        estimate_file: Union[str, np.ndarray],
+        configuration: Optional[DecompositionConfiguration] = None,
+        sampling_frequency_hz: Optional[float] = None,
+        return_decomposition: bool = False
 ) -> PerceptualSeparationScores:
     r"""
     Performs least-squares decomposition, generates auditory features,
@@ -135,11 +139,11 @@ def predict_perceptual_evaluation_scores(
 # LEGACY BACKWARD-COMPATIBILITY ALIASES
 # -----------------------------------------------------------------------------
 def predict_peass_scores(
-    original_files: List[Union[str, np.ndarray]],
-    estimate_file: Union[str, np.ndarray],
-    options: Optional[dict] = None,
-    sampling_frequency: Optional[float] = None,
-    return_decomposition: bool = False
+        original_files: List[Union[str, np.ndarray]],
+        estimate_file: Union[str, np.ndarray],
+        options: Optional[dict] = None,
+        sampling_frequency: Optional[float] = None,
+        return_decomposition: bool = False
 ) -> PerceptualSeparationScores:
     """Legacy compatibility wrapper for predict_perceptual_evaluation_scores."""
     config = DecompositionConfiguration()
