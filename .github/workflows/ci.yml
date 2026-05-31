@@ -2,7 +2,7 @@ name: CI/CD Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "**" ]  # <-- Triggers on every branch push
     tags:
       - 'v*'
   pull_request:
@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        python-version: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        # Dynamically scales the matrix: Full list on main/PRs, only 3.12 on feature branches
+        python-version: ${{ (github.ref_name == 'main' || github.event_name == 'pull_request') && fromJSON('["3.10", "3.11", "3.12", "3.13", "3.14"]') || fromJSON('["3.12"]') }}
 
     steps:
       - name: Check out repository

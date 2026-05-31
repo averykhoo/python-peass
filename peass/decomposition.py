@@ -6,7 +6,6 @@ Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
 and zero-copy arrays.
 """
 
-
 import pathlib
 from typing import List
 from typing import Optional
@@ -41,6 +40,12 @@ def perform_least_squares_projection(
     filter_length = 2 * filter_half_length + 1
     num_sources = true_sources.shape[1]
     num_samples = source_estimates.shape[0]
+
+    # --- SILENCE BYPASS OPTIMIZATION ---
+    # If reference sources are silent in this frame, bypass the solver entirely
+    source_energy = np.sum(true_sources.real ** 2 + true_sources.imag ** 2)
+    if source_energy < 1e-13:
+        return np.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype)
 
     # Stride tricks for zero-copy view of the Toeplitz bands
     strided_views = []
@@ -286,11 +291,20 @@ def run_auditory_analysis_filterbank(
     analyzer.sampling_frequency_hz = sampling_frequency_hz
     analyzer.bandwidths = equivalent_bandwidths
 
-    decimated_bands = []
-    for band_idx in range(num_bands):
-        # decimated_subband = signal.resample_poly(subbands_output[band_idx, :], 1, decimation_factors[band_idx])
-        decimated_subband = fast_resample_poly(subbands_output[band_idx, :], 1, decimation_factors[band_idx])
-        decimated_bands.append(decimated_subband)
+    # --- VECTORIZED 2D BLOCK RESAMPLING (NEW METHOD) ---
+    # Group bands with identical decimation factors and process them in contiguous 2D blocks
+    decimated_bands = [None] * num_bands
+    unique_factors = np.unique(decimation_factors)
+
+    for factor in unique_factors:
+        band_indices = np.where(decimation_factors == factor)[0]
+        block = subbands_output[band_indices, :]
+
+        # Vectorized 2D resampling along the last axis (-1) in a single C-backend execution pass
+        resampled_block = fast_resample_poly(block, 1, factor, axis=-1)
+
+        for idx, band_idx in enumerate(band_indices):
+            decimated_bands[band_idx] = resampled_block[idx, :]
 
     return decimated_bands, analyzer, modulation_matrix
 
@@ -308,15 +322,28 @@ def run_auditory_synthesis_filterbank(
     )
     processed_subbands = np.zeros((num_bands, max_samples_length), dtype=complex)
 
-    for band_idx in range(num_bands):
-        target_length = len(subband_list[band_idx]) * analyzer.decimation_factors[band_idx]
-        # upsampled_subband = signal.resample_poly(subband_list[band_idx], analyzer.decimation_factors[band_idx], 1)
-        upsampled_subband = fast_resample_poly(subband_list[band_idx], analyzer.decimation_factors[band_idx], 1)
-        if len(upsampled_subband) > target_length:
-            upsampled_subband = upsampled_subband[:target_length]
-        elif len(upsampled_subband) < target_length:
-            upsampled_subband = np.pad(upsampled_subband, (0, target_length - len(upsampled_subband)), mode='constant')
-        processed_subbands[band_idx, :target_length] = upsampled_subband
+    # --- VECTORIZED 2D BLOCK UPSAMPLING (NEW METHOD) ---
+    # Groups, stacks, and upsamples matching subbands in unified 2D blocks
+    unique_factors = np.unique(analyzer.decimation_factors)
+
+    for factor in unique_factors:
+        band_indices = np.where(analyzer.decimation_factors == factor)[0]
+        block = np.vstack([subband_list[b] for b in band_indices])
+
+        # Vectorized 2D upsampling along axis=-1
+        upsampled_block = fast_resample_poly(block, factor, 1, axis=-1)
+
+        for idx, band_idx in enumerate(band_indices):
+            target_length = len(subband_list[band_idx]) * factor
+            upsampled_subband = upsampled_block[idx, :]
+
+            if len(upsampled_subband) > target_length:
+                upsampled_subband = upsampled_subband[:target_length]
+            elif len(upsampled_subband) < target_length:
+                upsampled_subband = np.pad(upsampled_subband, (0, target_length - len(upsampled_subband)),
+                                           mode='constant')
+
+            processed_subbands[band_idx, :target_length] = upsampled_subband
 
     time_steps = np.arange(max_samples_length)
     center_frequencies = analyzer.center_frequencies[:, np.newaxis]
@@ -330,7 +357,7 @@ def run_auditory_synthesis_filterbank(
     reconstructed_signal = synthesizer.process(processed_subbands)
 
     original_sampling_frequency = analyzer.original_sampling_frequency_hz
-    reconstructed_signal = signal.resample_poly(
+    reconstructed_signal = fast_resample_poly(
         reconstructed_signal,
         int(original_sampling_frequency),
         int(sampling_frequency)
