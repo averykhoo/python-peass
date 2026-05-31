@@ -7,7 +7,6 @@ from typing import Tuple
 
 import numpy as np
 import pytest
-import scipy.signal as signal
 
 from peass.decomposition import DecompositionConfiguration
 from peass.decomposition import decompose_distortion_components
@@ -18,17 +17,23 @@ from peass.decomposition import run_auditory_synthesis_filterbank
 def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10.0,
                                 shade_out: float = 10.0) -> np.ndarray:
     sig_shaded = sig.copy()
-    if shade_in > 0:
-        win_len = 2 * int(round(shade_in / 1000.0 * fs + 1))
-        wShadeIn = signal.windows.hann(win_len, sym=False)[:win_len // 2]
-        for c in range(sig_shaded.shape[1]):
-            sig_shaded[:len(wShadeIn), c] *= wShadeIn
-    if shade_out > 0:
-        win_len = 2 * int(round(shade_out / 1000.0 * fs + 1))
-        wShadeOut = signal.windows.hann(win_len, sym=False)[:win_len // 2]
-        wShadeOut = np.flip(wShadeOut)
-        for c in range(sig_shaded.shape[1]):
-            sig_shaded[-len(wShadeOut):, c] *= wShadeOut
+    num_samples = sig_shaded.shape[0]
+
+    fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
+    fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
+
+    if fade_in_samples > 1 and fade_in_samples <= num_samples:
+        time_steps = np.arange(fade_in_samples)
+        shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
+        for chan_idx in range(sig_shaded.shape[1]):
+            sig_shaded[:fade_in_samples, chan_idx] *= shade_in_window
+
+    if fade_out_samples > 1 and fade_out_samples <= num_samples:
+        time_steps = np.arange(fade_out_samples)
+        shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
+        for chan_idx in range(sig_shaded.shape[1]):
+            sig_shaded[-fade_out_samples:, chan_idx] *= shade_out_window
+
     return sig_shaded
 
 

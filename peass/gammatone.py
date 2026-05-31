@@ -209,6 +209,8 @@ class GammatoneDelay:
         frequency_slopes = np.zeros(num_bands, dtype=complex)
         for band_idx in range(num_bands):
             max_idx = max_amplitude_indices[band_idx]
+            # Respect causality (t < 0 is zero) and prevent index wrap-around to -1
+            prev_val = impulse_response[band_idx, max_idx - 1] if max_idx > 0 else 0.0j
             frequency_slopes[band_idx] = (
                     impulse_response[band_idx, max_idx + 1] - impulse_response[band_idx, max_idx - 1]
             )

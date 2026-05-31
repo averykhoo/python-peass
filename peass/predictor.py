@@ -94,8 +94,12 @@ def predict_perceptual_evaluation_scores(
     )
 
     auditory_quality_features = np.array([q_global, q_target, q_interf, q_artif])
+
+    # Protect against floating-point boundary violations before log-mapping
+    eps = np.finfo(float).eps
+    clamped_quality_features = np.clip(auditory_quality_features, -1.0 + eps, 1.0 - eps)
     log_mapped_quality_features = np.clip(
-        np.log((1.0 + auditory_quality_features) / np.maximum(1.0 - auditory_quality_features, np.finfo(float).eps)),
+        np.log((1.0 + clamped_quality_features) / (1.0 - clamped_quality_features)),
         -5.5,
         5.5
     )

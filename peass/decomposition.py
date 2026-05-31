@@ -424,17 +424,31 @@ def decompose_distortion_components(
 
     def apply_window_shading(sig: np.ndarray, fs: float, shade_in: float, shade_out: float) -> np.ndarray:
         shaded_signal = sig.copy()
-        if shade_in > 0:
-            window_length = 2 * int(round(shade_in / 1000.0 * fs + 1))
-            shade_in_window = signal.windows.hann(window_length, sym=False)[:window_length // 2]
+        num_samples = shaded_signal.shape[0]
+
+        fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
+        fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
+
+        # Explicitly validate signal length against configured shading windows
+        if (fade_in_samples > 0 and num_samples < fade_in_samples) or \
+                (fade_out_samples > 0 and num_samples < fade_out_samples):
+            raise ValueError(
+                f"Signal length ({num_samples}) is shorter than the configured "
+                f"shading length (fade_in: {fade_in_samples}, fade_out: {fade_out_samples})."
+            )
+
+        if fade_in_samples > 1:
+            time_steps = np.arange(fade_in_samples)
+            shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
             for chan_idx in range(shaded_signal.shape[1]):
-                shaded_signal[:len(shade_in_window), chan_idx] *= shade_in_window
-        if shade_out > 0:
-            window_length = 2 * int(round(shade_out / 1000.0 * fs + 1))
-            shade_out_window = signal.windows.hann(window_length, sym=False)[:window_length // 2]
-            shade_out_window = np.flip(shade_out_window)
+                shaded_signal[:fade_in_samples, chan_idx] *= shade_in_window
+
+        if fade_out_samples > 1:
+            time_steps = np.arange(fade_out_samples)
+            shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
             for chan_idx in range(shaded_signal.shape[1]):
-                shaded_signal[-len(shade_out_window):, chan_idx] *= shade_out_window
+                shaded_signal[-fade_out_samples:, chan_idx] *= shade_out_window
+
         return shaded_signal
 
     shaded_sources = [
