@@ -5,19 +5,25 @@ import pathlib
 from typing import Tuple
 
 import numpy as np
+import pytest
 
 from peass.decomposition import DecompositionConfiguration
 from peass.predictor import predict_perceptual_evaluation_scores
 
 
+@pytest.mark.parametrize("estimate_scale", [1.0, 0.5, 0.1, 0.01])
 def test_predictor_score_range_constraints(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float],
+        estimate_scale
 ):
     target, interferer, estimate, fs = synthetic_audio_data
 
+    # Scale estimate to simulate varying degrees of signal degradation
+    scaled_estimate = estimate * estimate_scale
+
     results = predict_perceptual_evaluation_scores(
         original_files=[target, interferer],
-        estimate_file=estimate,
+        estimate_file=scaled_estimate,
         sampling_frequency_hz=fs,
         return_decomposition=True
     )

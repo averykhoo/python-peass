@@ -3,6 +3,7 @@ PEASS Test Suite - Gammatone Filterbank Mathematics Unit Tests
 """
 
 import numpy as np
+import pytest
 
 from peass.gammatone import GammatoneAnalyzer
 from peass.gammatone import GammatoneFilter
@@ -12,15 +13,14 @@ from peass.gammatone import convert_frequency_to_equivalent_rectangular_bandwidt
 from peass.gammatone import get_equivalent_rectangular_bandwidth_center_frequencies
 
 
-def test_erb_scale_inversion():
+@pytest.mark.parametrize("frequency_hz", [50.0, 100.0, 440.0, 1000.0, 5000.0, 12000.0])
+def test_erb_scale_inversion(frequency_hz):
     """
     Tests that frequency_to_erb_scale and erb_scale_to_frequency are mathematical inverses.
     """
-    frequencies = [50.0, 100.0, 440.0, 1000.0, 5000.0, 12000.0]
-    for f in frequencies:
-        erb = convert_frequency_to_equivalent_rectangular_bandwidth_scale(f)
-        f_recon = convert_equivalent_rectangular_bandwidth_scale_to_frequency(erb)
-        assert np.isclose(f, f_recon)
+    erb = convert_frequency_to_equivalent_rectangular_bandwidth_scale(frequency_hz)
+    f_recon = convert_equivalent_rectangular_bandwidth_scale_to_frequency(erb)
+    assert np.isclose(frequency_hz, f_recon)
 
 
 def test_calculate_erb_bandwidth_values():

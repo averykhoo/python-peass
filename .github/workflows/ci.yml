@@ -32,11 +32,23 @@ jobs:
           pip install -r requirements.txt
           pip install -e .
 
-      - name: Run test suite
+      - name: Run test suite with coverage
         env:
-          PYTHONPATH: .  # <-- Adds the root directory to Python's search path
+          PYTHONPATH: .
         run: |
-          pytest
+          pytest --cov=peass --cov-report=xml
+
+      - name: Generate Coverage Summary
+        uses: irongut/CodeCoverageSummary@v1.3.0
+        with:
+          filename: coverage.xml
+          badge: true
+          format: markdown
+          output: both
+
+      - name: Write Coverage to Job Summary
+        run: |
+          cat code-coverage-results.markdown >> $GITHUB_STEP_SUMMARY
 
   publish:
     name: Publish to PyPI

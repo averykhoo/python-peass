@@ -5,6 +5,7 @@ PEASS Test Suite - Auditory Physiological Model Tests
 from typing import Tuple
 
 import numpy as np
+import pytest
 
 from peass.auditory_model import ModulationProcessingType
 from peass.auditory_model import _fallback_adaptation_loops
@@ -16,8 +17,8 @@ from peass.gammatone import GammatoneAnalyzer
 from peass.gammatone import GammatoneSynthesizer
 
 
-def test_gammatone_analysis_reconstruction():
-    sampling_frequency_hz = 16000.0
+@pytest.mark.parametrize("sampling_frequency_hz", [8000.0, 16000.0, 44100.0])
+def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
     duration_seconds = 0.5
     num_samples = int(duration_seconds * sampling_frequency_hz)
     signal_input = np.sin(2.0 * np.pi * 500.0 * np.linspace(0, duration_seconds, num_samples))
