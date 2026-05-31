@@ -2,6 +2,7 @@ numba
 numpy
 pytest
 pytest-cov
+pytest-xdist
 scipy
 scipy-stubs
 soundfile

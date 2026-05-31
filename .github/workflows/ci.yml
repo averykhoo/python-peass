@@ -37,7 +37,7 @@ jobs:
         env:
           PYTHONPATH: .
         run: |
-          pytest --cov=peass --cov-report=xml
+          pytest -n auto --cov=peass --cov-report=xml
 
       - name: Generate Coverage Summary
         uses: irongut/CodeCoverageSummary@v1.3.0
