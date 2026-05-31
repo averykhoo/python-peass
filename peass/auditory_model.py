@@ -7,7 +7,6 @@ and fails over gracefully to a SciPy/NumPy native vectorization.
 """
 
 import math
-from typing import Optional
 from typing import Tuple
 
 import numpy as np
@@ -224,15 +223,9 @@ def _fallback_fused_auditory_kernel(
 # -----------------------------------------------------------------------------
 def simulate_inner_haircell_transduction(
         subband_signals: np.ndarray,
-        sampling_frequency_hz: float,
-        sampling_frequency: Optional[float] = None  # Legacy alias
+        sampling_frequency_hz: float
 ) -> np.ndarray:
-    r"""
-    Models the nonlinear mechanical-to-neural transduction of the inner hair cells.
-    """
-    if sampling_frequency is not None:
-        sampling_frequency_hz = sampling_frequency
-
+    """Models the nonlinear mechanical-to-neural transduction of the inner hair cells."""
     if _HAS_NUMBA:
         return _numba_haircell_transduction_kernel(subband_signals, sampling_frequency_hz)
     else:
@@ -245,15 +238,9 @@ def simulate_inner_haircell_transduction(
 
 def simulate_auditory_nerve_adaptation(
         subband_signals: np.ndarray,
-        sampling_frequency_hz: float,
-        sampling_frequency: Optional[float] = None  # Legacy alias
+        sampling_frequency_hz: float
 ) -> np.ndarray:
-    r"""
-    Simulates the physiological adaptive properties of the auditory nerve.
-    """
-    if sampling_frequency is not None:
-        sampling_frequency_hz = sampling_frequency
-
+    """Simulates the physiological adaptive properties of the auditory nerve."""
     decibel_range = 100.0
     absolute_hearing_threshold = 10.0 ** (-decibel_range / 20.0)
     adaptation_loop_bandwidths = 1.0 / (np.pi * np.array([0.005, 0.05, 0.129, 0.253, 0.5]))
@@ -279,9 +266,7 @@ def generate_auditory_internal_representation(
         sampling_frequency_hz: float,
         modulation_processing_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
 ) -> Tuple[np.ndarray, float]:
-    r"""
-    Generates the 3D internal auditory representation of a signal.
-    """
+    """Generates the 3D internal auditory representation of a signal."""
     if len(signal_data.shape) > 1:
         if signal_data.shape[0] < signal_data.shape[1]:
             signal_data = signal_data.T
@@ -369,11 +354,3 @@ def generate_auditory_internal_representation(
     )
 
     return internal_representation, sampling_frequency_hz
-
-
-# -----------------------------------------------------------------------------
-# LEGACY BACKWARD-COMPATIBILITY ALIASES
-# -----------------------------------------------------------------------------
-haircell_transduction = simulate_inner_haircell_transduction
-adaptation_loops = simulate_auditory_nerve_adaptation
-generate_internal_representation = generate_auditory_internal_representation

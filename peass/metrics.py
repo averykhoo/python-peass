@@ -139,9 +139,7 @@ def calculate_auditory_quality_features(
         decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
         sampling_frequency_hz: float = 16000.0
 ) -> Tuple[float, float, float, float]:
-    r"""
-    Computes quality features by sending decomposed signals through the internal auditory model.
-    """
+    """Computes quality features by sending decomposed signals through the internal auditory model."""
     true_target, target_distortion, interference, artifacts = decomposition_signals
 
     if len(true_target.shape) == 1:
@@ -188,24 +186,3 @@ def calculate_auditory_quality_features(
         float(np.min(channel_artifacts_quality)),
         float(np.min(channel_global_quality))
     )
-
-
-# -----------------------------------------------------------------------------
-# LEGACY BACKWARD-COMPATIBILITY ALIASES
-# -----------------------------------------------------------------------------
-def calculate_energy_ratios(
-        s_true: np.ndarray,
-        e_target: np.ndarray,
-        e_interf: np.ndarray,
-        e_artif: np.ndarray
-) -> Tuple[float, float, float, float]:
-    """Legacy compatibility wrapper for calculate_bss_eval_energy_ratios."""
-    return calculate_bss_eval_energy_ratios(s_true, e_target, e_interf, e_artif)
-
-
-def audio_quality_features(
-        decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
-        sampling_frequency: float = 16000.0
-) -> Tuple[float, float, float, float]:
-    """Legacy compatibility wrapper for calculate_auditory_quality_features."""
-    return calculate_auditory_quality_features(decomposition_signals, sampling_frequency)

@@ -3,15 +3,18 @@ PEASS Test Suite - Auditory Physiological Model Tests
 """
 
 from typing import Tuple
+
 import numpy as np
 
-from peass.auditory_model import (
-    ModulationProcessingType,
-    generate_auditory_internal_representation,
-    simulate_auditory_nerve_adaptation,
-    simulate_inner_haircell_transduction
-)
-from peass.gammatone import GammatoneAnalyzer, GammatoneSynthesizer
+from peass.auditory_model import ModulationProcessingType
+from peass.auditory_model import _fallback_adaptation_loops
+from peass.auditory_model import _fallback_fused_auditory_kernel
+from peass.auditory_model import generate_auditory_internal_representation
+from peass.auditory_model import simulate_auditory_nerve_adaptation
+from peass.auditory_model import simulate_inner_haircell_transduction
+from peass.gammatone import GammatoneAnalyzer
+from peass.gammatone import GammatoneSynthesizer
+
 
 def test_gammatone_analysis_reconstruction():
     sampling_frequency_hz = 16000.0
@@ -37,7 +40,7 @@ def test_gammatone_analysis_reconstruction():
 
 
 def test_haircell_and_adaptation_properties(
-    synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     target, _, _, sampling_frequency_hz = synthetic_audio_data
     subband_signals = target.T
@@ -53,7 +56,7 @@ def test_haircell_and_adaptation_properties(
 
 
 def test_internal_auditory_representation(
-    synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     target, _, _, sampling_frequency_hz = synthetic_audio_data
 
@@ -70,3 +73,46 @@ def test_internal_auditory_representation(
     assert representation_fb.ndim == 3
     assert processed_fs_fb == 800.0
     assert representation_fb.shape[2] == 8
+
+
+def test_auditory_fallback_kernels():
+    """Explicitly tests the fallback implementations to guarantee coverage on JIT environments."""
+    subband_signals = np.random.randn(4, 100)
+    adaptation_loop_bandwidths = 1.0 / (np.pi * np.array([0.005, 0.05, 0.129, 0.253, 0.5]))
+
+    # 1. Test fallback adaptation loops directly
+    res_loops = _fallback_adaptation_loops(
+        subband_signals=subband_signals,
+        sampling_frequency_hz=16000.0,
+        adaptation_bandwidths=adaptation_loop_bandwidths,
+        absolute_hearing_threshold=1e-5
+    )
+    assert res_loops.shape == subband_signals.shape
+
+    # 2. Test fallback fused auditory kernel directly
+    res_fused = _fallback_fused_auditory_kernel(
+        subband_signals=subband_signals,
+        sampling_frequency_hz=16000.0,
+        haircell_filter_gain=np.exp(-np.pi * 2000.0 / 16000.0),
+        adaptation_bandwidths=adaptation_loop_bandwidths,
+        absolute_hearing_threshold=1e-5
+    )
+    assert res_fused.shape == subband_signals.shape
+
+
+def test_generate_representation_input_shapes_and_resampling():
+    """Tests generate_auditory_internal_representation with alternative shapes and high sample rates."""
+    # Row vector shape (1, N) to test transpose branch
+    signal_row = np.random.randn(1, 1000)
+    rep_row, fs_row = generate_auditory_internal_representation(signal_row, 16000.0)
+    assert rep_row.ndim == 3
+
+    # Column vector shape (N, 1)
+    signal_col = np.random.randn(1000, 1)
+    rep_col, fs_col = generate_auditory_internal_representation(signal_col, 16000.0)
+    assert rep_col.ndim == 3
+
+    # High sampling rate (e.g., 48000 Hz) to test skipped resampling branch
+    signal_high = np.random.randn(1000)
+    rep_high, fs_high = generate_auditory_internal_representation(signal_high, 48000.0)
+    assert rep_high.ndim == 3

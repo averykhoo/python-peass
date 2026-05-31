@@ -7,7 +7,6 @@ of frequency analysis, delay/phase alignment, and synthesis reconstruction.
 
 import math
 from typing import List
-from typing import Optional
 
 import numpy as np
 import scipy.signal as signal
@@ -63,33 +62,22 @@ class GammatoneFilter:
 
     def __init__(
             self,
-            sampling_frequency_hz: Optional[float] = None,
-            center_frequency_hz: Optional[float] = None,
+            sampling_frequency_hz: float,
+            center_frequency_hz: float,
             filter_order: int = 4,
-            bandwidth_factor: float = 1.0,
-            sampling_frequency: Optional[float] = None,  # Legacy alias
-            center_frequency: Optional[float] = None  # Legacy alias
+            bandwidth_factor: float = 1.0
     ):
-        fs = sampling_frequency_hz if sampling_frequency_hz is not None else sampling_frequency
-        fc = center_frequency_hz if center_frequency_hz is not None else center_frequency
-
-        if fs is None:
-            raise TypeError(
-                "GammatoneFilter.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
-        if fc is None:
-            raise TypeError("GammatoneFilter.__init__() missing 1 required positional argument: 'center_frequency_hz'")
-
         self.filter_order: int = filter_order
-        self.sampling_frequency_hz: float = fs
-        self.center_frequency_hz: float = fc
+        self.sampling_frequency_hz: float = sampling_frequency_hz
+        self.center_frequency_hz: float = center_frequency_hz
 
-        audiological_bandwidth = calculate_equivalent_rectangular_bandwidth(fc) * bandwidth_factor
+        audiological_bandwidth = calculate_equivalent_rectangular_bandwidth(center_frequency_hz) * bandwidth_factor
         gamma_constant = (np.pi * math.factorial(2 * filter_order - 2) * (2.0 ** -(2 * filter_order - 2)) /
                           (math.factorial(filter_order - 1) ** 2))
         decay_constant = audiological_bandwidth / gamma_constant
 
-        self.lambda_decay_factor: float = np.exp(-2.0 * np.pi * decay_constant / fs)
-        self.frequency_phase_step: float = 2.0 * np.pi * fc / fs
+        self.lambda_decay_factor: float = np.exp(-2.0 * np.pi * decay_constant / sampling_frequency_hz)
+        self.frequency_phase_step: float = 2.0 * np.pi * center_frequency_hz / sampling_frequency_hz
 
         self.complex_filter_coefficient: complex = self.lambda_decay_factor * np.exp(1j * self.frequency_phase_step)
         self.normalization_factor: float = 2.0 * (1.0 - np.abs(self.complex_filter_coefficient)) ** filter_order
@@ -140,54 +128,27 @@ class GammatoneAnalyzer:
 
     def __init__(
             self,
-            sampling_frequency_hz: Optional[float] = None,
-            lower_cutoff_frequency_hz: Optional[float] = None,
-            specified_center_frequency_hz: Optional[float] = None,
-            upper_cutoff_frequency_hz: Optional[float] = None,
-            filters_per_equivalent_rectangular_bandwidth: Optional[float] = None,
+            sampling_frequency_hz: float,
+            lower_cutoff_frequency_hz: float,
+            specified_center_frequency_hz: float,
+            upper_cutoff_frequency_hz: float,
+            filters_per_equivalent_rectangular_bandwidth: float,
             filter_order: int = 4,
-            bandwidth_factor: float = 1.0,
-            sampling_frequency: Optional[float] = None,  # Legacy alias
-            lower_cutoff_hz: Optional[float] = None,  # Legacy alias
-            specified_center_hz: Optional[float] = None,  # Legacy alias
-            upper_cutoff_hz: Optional[float] = None,  # Legacy alias
-            filters_per_erb: Optional[float] = None  # Legacy alias
+            bandwidth_factor: float = 1.0
     ):
-        fs = sampling_frequency_hz if sampling_frequency_hz is not None else sampling_frequency
-        lower_cf = lower_cutoff_frequency_hz if lower_cutoff_frequency_hz is not None else lower_cutoff_hz
-        base_cf = specified_center_frequency_hz if specified_center_frequency_hz is not None else specified_center_hz
-        upper_cf = upper_cutoff_frequency_hz if upper_cutoff_frequency_hz is not None else upper_cutoff_hz
-        density = filters_per_equivalent_rectangular_bandwidth if filters_per_equivalent_rectangular_bandwidth is not None else filters_per_erb
-
-        if fs is None:
-            raise TypeError(
-                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'sampling_frequency_hz'")
-        if lower_cf is None:
-            raise TypeError(
-                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'lower_cutoff_frequency_hz'")
-        if base_cf is None:
-            raise TypeError(
-                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'specified_center_frequency_hz'")
-        if upper_cf is None:
-            raise TypeError(
-                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'upper_cutoff_frequency_hz'")
-        if density is None:
-            raise TypeError(
-                "GammatoneAnalyzer.__init__() missing 1 required positional argument: 'filters_per_equivalent_rectangular_bandwidth'")
-
-        self._sampling_frequency_hz: float = fs
+        self._sampling_frequency_hz: float = sampling_frequency_hz
         self.center_frequencies: np.ndarray = get_equivalent_rectangular_bandwidth_center_frequencies(
-            density,
-            lower_cf,
-            base_cf,
-            upper_cf
+            filters_per_equivalent_rectangular_bandwidth,
+            lower_cutoff_frequency_hz,
+            specified_center_frequency_hz,
+            upper_cutoff_frequency_hz
         )
         self.filters: List[GammatoneFilter] = [
-            GammatoneFilter(fs, freq, filter_order, bandwidth_factor)
+            GammatoneFilter(sampling_frequency_hz, freq, filter_order, bandwidth_factor)
             for freq in self.center_frequencies
         ]
         self.bandwidths: np.ndarray = calculate_equivalent_rectangular_bandwidth(self.center_frequencies)
-        self.original_sampling_frequency_hz: float = fs
+        self.original_sampling_frequency_hz: float = sampling_frequency_hz
         self.decimation_factors: np.ndarray = np.ones(len(self.filters), dtype=int)
 
     @property
@@ -197,10 +158,6 @@ class GammatoneAnalyzer:
     @sampling_frequency_hz.setter
     def sampling_frequency_hz(self, value: float) -> None:
         self._sampling_frequency_hz = value
-
-    @property
-    def sampling_frequency(self) -> float:
-        return self._sampling_frequency_hz
 
     @property
     def center_frequencies_hz(self) -> np.ndarray:
@@ -349,12 +306,3 @@ class GammatoneSynthesizer:
     def process(self, input_data: np.ndarray) -> np.ndarray:
         delayed_signal = self.delay_unit.process(input_data)
         return self.mixer_unit.process(delayed_signal)
-
-
-# -----------------------------------------------------------------------------
-# LEGACY BACKWARD-COMPATIBILITY ALIASES
-# -----------------------------------------------------------------------------
-calculate_erb_bandwidth = calculate_equivalent_rectangular_bandwidth
-frequency_to_erb_scale = convert_frequency_to_equivalent_rectangular_bandwidth_scale
-erb_scale_to_frequency = convert_equivalent_rectangular_bandwidth_scale_to_frequency
-get_center_frequencies = get_equivalent_rectangular_bandwidth_center_frequencies

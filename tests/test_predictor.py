@@ -3,20 +3,22 @@ PEASS Test Suite - Predictor End-to-End Regressor Tests
 """
 import pathlib
 from typing import Tuple
+
 import numpy as np
 
 from peass.decomposition import DecompositionConfiguration
-from peass.predictor import predict_peass_scores
+from peass.predictor import predict_perceptual_evaluation_scores
+
 
 def test_predictor_score_range_constraints(
-    synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     target, interferer, estimate, fs = synthetic_audio_data
 
-    results = predict_peass_scores(
+    results = predict_perceptual_evaluation_scores(
         original_files=[target, interferer],
         estimate_file=estimate,
-        sampling_frequency=fs,
+        sampling_frequency_hz=fs,
         return_decomposition=True
     )
 
@@ -26,6 +28,7 @@ def test_predictor_score_range_constraints(
     assert 0.0 <= results.target_perceptual_score <= 100.0
     assert 0.0 <= results.interference_perceptual_score <= 100.0
     assert 0.0 <= results.artifact_perceptual_score <= 100.0
+
 
 def test_predictor_pristine_audio_conditions():
     sampling_frequency_hz = 16000.0
@@ -38,62 +41,68 @@ def test_predictor_pristine_audio_conditions():
 
     estimate = target.copy()
 
-    results = predict_peass_scores(
+    results = predict_perceptual_evaluation_scores(
         original_files=[target, noise],
         estimate_file=estimate,
-        sampling_frequency=sampling_frequency_hz
+        sampling_frequency_hz=sampling_frequency_hz
     )
 
     assert results.overall_perceptual_score > 90.0
     assert results.target_perceptual_score > 90.0
     assert results.interference_perceptual_score > 90.0
 
+
 def test_predictor_file_based_execution(
-    audio_files_fixture: Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
+        audio_files_fixture: Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 ):
     """
     Verifies that the end-to-end predictor runs successfully in file-based mode.
     """
     target_path, interferer_path, estimate_path = audio_files_fixture
 
-    results = predict_peass_scores(
+    configuration = DecompositionConfiguration(
+        destination_directory=str(target_path.parent)
+    )
+
+    results = predict_perceptual_evaluation_scores(
         original_files=[str(target_path), str(interferer_path)],
         estimate_file=str(estimate_path),
-        options={'destDir': str(target_path.parent)},
+        configuration=configuration,
         return_decomposition=True
     )
 
     # Assert that score outputs are valid
-    assert 0.0 <= results["OPS"] <= 100.0
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
 
     # Assert that file-path mappings are present
-    assert results["decomposition_files"] is not None
-    assert pathlib.Path(results["decomposition_files"]["true_target"]).is_file()
+    assert results.decomposition_files is not None
+    assert pathlib.Path(results.decomposition_files.true_target).is_file()
+
 
 def test_predictor_with_alternative_options(
-    synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Tests predictor behavior when invoking custom parameters like use_two_stage_projection.
     """
     target, interferer, estimate, fs = synthetic_audio_data
 
-    custom_options = {
-        'FLAG_2PROJ':   True,
-        'frameLength':  0.4,
-        'filterLength': 0.03,
-        'shadeInMs':    5.0,
-        'shadeOutMs':   5.0
-    }
-
-    results = predict_peass_scores(
-        original_files=[target, interferer],
-        estimate_file=estimate,
-        options=custom_options,
-        sampling_frequency=fs
+    configuration = DecompositionConfiguration(
+        use_two_stage_projection=True,
+        frame_length_seconds=0.4,
+        filter_length_seconds=0.03,
+        shade_in_milliseconds=5.0,
+        shade_out_milliseconds=5.0
     )
 
-    assert 0.0 <= results["OPS"] <= 100.0
-    assert 0.0 <= results["TPS"] <= 100.0
-    assert 0.0 <= results["IPS"] <= 100.0
-    assert 0.0 <= results["APS"] <= 100.0
+    results = predict_perceptual_evaluation_scores(
+        original_files=[target, interferer],
+        estimate_file=estimate,
+        configuration=configuration,
+        sampling_frequency_hz=fs
+    )
+
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
+    assert 0.0 <= results.target_perceptual_score <= 100.0
+    assert 0.0 <= results.interference_perceptual_score <= 100.0
+    assert 0.0 <= results.artifact_perceptual_score <= 100.0

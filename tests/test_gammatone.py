@@ -4,14 +4,12 @@ PEASS Test Suite - Gammatone Filterbank Mathematics Unit Tests
 
 import numpy as np
 
-from peass.gammatone import (
-    GammatoneAnalyzer,
-    GammatoneFilter,
-    calculate_erb_bandwidth,
-    erb_scale_to_frequency,
-    frequency_to_erb_scale,
-    get_center_frequencies,
-)
+from peass.gammatone import GammatoneAnalyzer
+from peass.gammatone import GammatoneFilter
+from peass.gammatone import calculate_equivalent_rectangular_bandwidth
+from peass.gammatone import convert_equivalent_rectangular_bandwidth_scale_to_frequency
+from peass.gammatone import convert_frequency_to_equivalent_rectangular_bandwidth_scale
+from peass.gammatone import get_equivalent_rectangular_bandwidth_center_frequencies
 
 
 def test_erb_scale_inversion():
@@ -20,8 +18,8 @@ def test_erb_scale_inversion():
     """
     frequencies = [50.0, 100.0, 440.0, 1000.0, 5000.0, 12000.0]
     for f in frequencies:
-        erb = frequency_to_erb_scale(f)
-        f_recon = erb_scale_to_frequency(erb)
+        erb = convert_frequency_to_equivalent_rectangular_bandwidth_scale(f)
+        f_recon = convert_equivalent_rectangular_bandwidth_scale_to_frequency(erb)
         assert np.isclose(f, f_recon)
 
 
@@ -31,10 +29,10 @@ def test_calculate_erb_bandwidth_values():
     Formula: ERB = 24.7 * (0.00437 * fc + 1.0)
     """
     # At fc = 0: ERB = 24.7
-    assert np.isclose(calculate_erb_bandwidth(0.0), 24.7)
+    assert np.isclose(calculate_equivalent_rectangular_bandwidth(0.0), 24.7)
 
     # At fc = 1000: ERB = 24.7 * (4.37 + 1.0) = 132.639
-    assert np.isclose(calculate_erb_bandwidth(1000.0), 132.639)
+    assert np.isclose(calculate_equivalent_rectangular_bandwidth(1000.0), 132.639)
 
 
 def test_get_center_frequencies_range():
@@ -46,7 +44,7 @@ def test_get_center_frequencies_range():
     upper = 8000.0
     filters_per_erb = 1.0
 
-    cfs = get_center_frequencies(filters_per_erb, lower, base, upper)
+    cfs = get_equivalent_rectangular_bandwidth_center_frequencies(filters_per_erb, lower, base, upper)
 
     assert cfs[0] >= lower
     assert cfs[-1] <= upper
@@ -58,7 +56,7 @@ def test_gammatone_filter_state_clearing():
     """
     Verifies state setting and clearing inside GammatoneFilter.
     """
-    filt = GammatoneFilter(sampling_frequency=16000.0, center_frequency=1000.0)
+    filt = GammatoneFilter(sampling_frequency_hz=16000.0, center_frequency_hz=1000.0)
 
     # Assert state is initially zeros
     assert np.all(filt.state == 0.0)
@@ -80,11 +78,11 @@ def test_gammatone_analyzer_state_clearing():
     Verifies state setting and clearing inside GammatoneAnalyzer.
     """
     analyzer = GammatoneAnalyzer(
-        sampling_frequency=16000.0,
-        lower_cutoff_hz=100.0,
-        specified_center_hz=1000.0,
-        upper_cutoff_hz=4000.0,
-        filters_per_erb=1.0
+        sampling_frequency_hz=16000.0,
+        lower_cutoff_frequency_hz=100.0,
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=4000.0,
+        filters_per_equivalent_rectangular_bandwidth=1.0
     )
 
     # All filter states should start at zero

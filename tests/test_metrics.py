@@ -3,7 +3,9 @@ PEASS Test Suite - Metrics Unit Tests
 """
 import numpy as np
 
-from peass.metrics import calculate_bss_eval_energy_ratios, calculate_auditory_similarity_metric
+from peass.metrics import calculate_auditory_similarity_metric
+from peass.metrics import calculate_bss_eval_energy_ratios
+
 
 def test_calculate_energy_ratios_analytical():
     true_source = np.array([2.0, 2.0, 2.0])
@@ -22,6 +24,7 @@ def test_calculate_energy_ratios_analytical():
     assert np.isclose(source_to_interference_ratio, 10.0 * np.log10(484.0))
     assert np.isclose(source_to_artifacts_ratio, 10.0 * np.log10(2116.0))
     assert np.isclose(source_to_distortion_ratio, 10.0 * np.log10(32.653061224))
+
 
 def test_pemo_similarity_identity():
     bands, samples, modulations = 4, 200, 1

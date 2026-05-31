@@ -4,18 +4,19 @@ PEASS Test Suite - Subband Least-Squares Decomposition Tests
 
 import pathlib
 from typing import Tuple
+
 import numpy as np
 import pytest
 import scipy.signal as signal
 
-from peass.decomposition import (
-    DecompositionConfiguration,
-    decompose_distortion_components,
-    run_auditory_analysis_filterbank,
-    run_auditory_synthesis_filterbank
-)
+from peass.decomposition import DecompositionConfiguration
+from peass.decomposition import decompose_distortion_components
+from peass.decomposition import run_auditory_analysis_filterbank
+from peass.decomposition import run_auditory_synthesis_filterbank
 
-def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10.0, shade_out: float = 10.0) -> np.ndarray:
+
+def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10.0,
+                                shade_out: float = 10.0) -> np.ndarray:
     sig_shaded = sig.copy()
     if shade_in > 0:
         win_len = 2 * int(round(shade_in / 1000.0 * fs + 1))
@@ -30,8 +31,9 @@ def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10
             sig_shaded[-len(wShadeOut):, c] *= wShadeOut
     return sig_shaded
 
+
 def test_decomposition_algebraic_reconstruction(
-    synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Mathematically verifies that the decomposition satisfies the fundamental
@@ -70,10 +72,9 @@ def test_decomposition_algebraic_reconstruction(
         est_reconstructed[:, channel_idx] = fit_to_length(synth_signal, len(estimate_shaded))
 
     summed_sub_components = (
-        waveforms.true_target + waveforms.target_distortion + waveforms.interference + waveforms.artifacts
+            waveforms.true_target + waveforms.target_distortion + waveforms.interference + waveforms.artifacts
     )
     np.testing.assert_allclose(est_reconstructed, summed_sub_components, atol=1e-7, rtol=1e-7)
-
 
 
 def test_decomposition_file_generation(
@@ -111,6 +112,7 @@ def test_decomposition_file_generation(
         path_obj = pathlib.Path(file_path)
         assert path_obj.is_file()
         assert path_obj.stat().st_size > 0
+
 
 def test_decomposition_input_validation():
     sampling_frequency_hz = 16000.0
