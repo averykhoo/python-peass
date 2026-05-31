@@ -49,7 +49,7 @@ jobs:
 
       - name: Write Coverage to Job Summary
         run: |
-          cat code-coverage-results.markdown >> $GITHUB_STEP_SUMMARY
+          cat code-coverage-results.md >> $GITHUB_STEP_SUMMARY
 
   publish:
     name: Publish to PyPI
