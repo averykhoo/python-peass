@@ -309,6 +309,19 @@ def run_auditory_analysis_filterbank(
     return decimated_bands, analyzer, modulation_matrix
 
 
+_SYNTHESIS_MATRIX_CACHE = {}
+
+
+def get_synthesis_modulation_matrix(sampling_frequency, max_samples_length, center_frequencies):
+    key = (sampling_frequency, max_samples_length, tuple(center_frequencies))
+    if key in _SYNTHESIS_MATRIX_CACHE:
+        return _SYNTHESIS_MATRIX_CACHE[key]
+    time_steps = np.arange(max_samples_length)
+    matrix = np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
+    _SYNTHESIS_MATRIX_CACHE[key] = matrix
+    return matrix
+
+
 def run_auditory_synthesis_filterbank(
         subband_list: list,
         analyzer: GammatoneAnalyzer
@@ -322,13 +335,13 @@ def run_auditory_synthesis_filterbank(
     )
     processed_subbands = np.zeros((num_bands, max_samples_length), dtype=complex)
 
-    # --- VECTORIZED 2D BLOCK UPSAMPLING (NEW METHOD) ---
-    # Groups, stacks, and upsamples matching subbands in unified 2D blocks
+    # --- VECTORIZED 2D BLOCK UPSAMPLING ---
     unique_factors = np.unique(analyzer.decimation_factors)
 
     for factor in unique_factors:
         band_indices = np.where(analyzer.decimation_factors == factor)[0]
-        block = np.vstack([subband_list[b] for b in band_indices])
+        # Faster stacking than vstack
+        block = np.array([subband_list[b] for b in band_indices])
 
         # Vectorized 2D upsampling along axis=-1
         upsampled_block = fast_resample_poly(block, factor, 1, axis=-1)
@@ -336,20 +349,20 @@ def run_auditory_synthesis_filterbank(
         for idx, band_idx in enumerate(band_indices):
             target_length = len(subband_list[band_idx]) * factor
             upsampled_subband = upsampled_block[idx, :]
+            curr_len = len(upsampled_subband)
 
-            if len(upsampled_subband) > target_length:
-                upsampled_subband = upsampled_subband[:target_length]
-            elif len(upsampled_subband) < target_length:
-                upsampled_subband = np.pad(upsampled_subband, (0, target_length - len(upsampled_subband)),
-                                           mode='constant')
+            # Avoid np.pad allocations; processed_subbands is already zero-initialized
+            if curr_len == target_length:
+                processed_subbands[band_idx, :target_length] = upsampled_subband
+            elif curr_len > target_length:
+                processed_subbands[band_idx, :target_length] = upsampled_subband[:target_length]
+            else:
+                processed_subbands[band_idx, :curr_len] = upsampled_subband
 
-            processed_subbands[band_idx, :target_length] = upsampled_subband
-
-    time_steps = np.arange(max_samples_length)
-    center_frequencies = analyzer.center_frequencies[:, np.newaxis]
-    modulation_matrix_synthesis = np.exp(2j * np.pi / sampling_frequency * center_frequencies * time_steps)
-
-    processed_subbands = processed_subbands * modulation_matrix_synthesis
+    # Retrieve cached modulation matrix to bypass np.exp re-calculations
+    processed_subbands = processed_subbands * get_synthesis_modulation_matrix(
+        sampling_frequency, max_samples_length, analyzer.center_frequencies
+    )
 
     desired_delay_seconds = 1000.0 / sampling_frequency
     synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds)

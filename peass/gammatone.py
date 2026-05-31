@@ -55,6 +55,42 @@ try:
                 output[band_idx, sample_idx] = s3
 
         return output
+
+
+    @numba.njit(cache=True)
+    def _numba_delay_process(
+            input_data: np.ndarray,
+            sample_delays: np.ndarray,
+            phase_alignment_factors: np.ndarray,
+            state_memory: np.ndarray
+    ) -> np.ndarray:
+        num_bands, num_samples = input_data.shape
+        output_matrix = np.empty((num_bands, num_samples), dtype=numba.float64)
+        for band_idx in range(num_bands):
+            delay_value = int(sample_delays[band_idx])
+
+            # Complex multiplication and real part in a single JIT loop
+            phase_factor = phase_alignment_factors[band_idx]
+            phase_real = phase_factor.real
+            phase_imag = phase_factor.imag
+
+            phase_corrected = np.empty(num_samples, dtype=numba.float64)
+            for i in range(num_samples):
+                val = input_data[band_idx, i]
+                phase_corrected[i] = val.real * phase_real - val.imag * phase_imag
+
+            if delay_value == 0:
+                output_matrix[band_idx, :] = phase_corrected
+            else:
+                combined_signal = np.empty(delay_value + num_samples, dtype=numba.float64)
+                combined_signal[:delay_value] = state_memory[band_idx, :delay_value]
+                combined_signal[delay_value:] = phase_corrected
+
+                state_memory[band_idx, :delay_value] = combined_signal[num_samples:]
+                output_matrix[band_idx, :] = combined_signal[:num_samples]
+        return output_matrix
+
+
 except ImportError:
     _HAS_NUMBA = False
 
@@ -299,18 +335,27 @@ class GammatoneDelay:
         return self.state_memory
 
     def process(self, input_data: np.ndarray) -> np.ndarray:
-        num_bands, num_samples = input_data.shape
-        output_matrix = np.zeros((num_bands, num_samples))
-        for band_idx in range(num_bands):
-            delay_value = int(self.sample_delays[band_idx])
-            phase_corrected_signal = np.real(input_data[band_idx, :] * self.phase_alignment_factors[band_idx])
-            if delay_value == 0:
-                output_matrix[band_idx, :] = phase_corrected_signal
-            else:
-                combined_signal = np.concatenate((self.state_memory[band_idx, :delay_value], phase_corrected_signal))
-                self.state_memory[band_idx, :delay_value] = combined_signal[num_samples:]
-                output_matrix[band_idx, :] = combined_signal[:num_samples]
-        return output_matrix
+        if _HAS_NUMBA:
+            return _numba_delay_process(
+                input_data,
+                self.sample_delays,
+                self.phase_alignment_factors,
+                self.state_memory
+            )
+        else:
+            num_bands, num_samples = input_data.shape
+            output_matrix = np.zeros((num_bands, num_samples))
+            for band_idx in range(num_bands):
+                delay_value = int(self.sample_delays[band_idx])
+                phase_corrected_signal = np.real(input_data[band_idx, :] * self.phase_alignment_factors[band_idx])
+                if delay_value == 0:
+                    output_matrix[band_idx, :] = phase_corrected_signal
+                else:
+                    combined_signal = np.concatenate(
+                        (self.state_memory[band_idx, :delay_value], phase_corrected_signal))
+                    self.state_memory[band_idx, :delay_value] = combined_signal[num_samples:]
+                    output_matrix[band_idx, :] = combined_signal[:num_samples]
+            return output_matrix
 
 
 class GammatoneMixer:
