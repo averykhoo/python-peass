@@ -115,14 +115,29 @@ def calculate_auditory_similarity_metric(
     integration_length = int(1.0 * representation_sampling_frequency)
     squared_test_representation = np.sum(test_view ** 2, axis=(0, 2))
 
+    # --- SYSTEM BENCHMARK: OLD METHOD (Commented out for future comparison) ---
+    # root_mean_square_energy = np.zeros(num_frames)
+    # for frame_idx in range(num_frames):
+    #     frame_center = (frame_idx + 0.5) * frame_length
+    #     start_idx = int(max(0, frame_center - 0.5 * integration_length))
+    #     end_idx = int(min(num_samples, frame_center + 0.5 * integration_length))
+    #
+    #     energy_slice = squared_test_representation[start_idx:end_idx]
+    #     root_mean_square_energy[frame_idx] = np.mean(energy_slice) if len(energy_slice) > 0 else 0.0
+
+    # --- SYSTEM BENCHMARK: NEW METHOD (O(1) cumulative prefix sums) ---
+    cum_sum = np.concatenate(([0.0], np.cumsum(squared_test_representation)))
     root_mean_square_energy = np.zeros(num_frames)
     for frame_idx in range(num_frames):
         frame_center = (frame_idx + 0.5) * frame_length
         start_idx = int(max(0, frame_center - 0.5 * integration_length))
         end_idx = int(min(num_samples, frame_center + 0.5 * integration_length))
 
-        energy_slice = squared_test_representation[start_idx:end_idx]
-        root_mean_square_energy[frame_idx] = np.mean(energy_slice) if len(energy_slice) > 0 else 0.0
+        slice_len = end_idx - start_idx
+        if slice_len > 0:
+            root_mean_square_energy[frame_idx] = (cum_sum[end_idx] - cum_sum[start_idx]) / slice_len
+        else:
+            root_mean_square_energy[frame_idx] = 0.0
 
     sorted_indices = np.argsort(local_perceptual_similarity_measures)
     sorted_similarity_measures = local_perceptual_similarity_measures[sorted_indices]
@@ -156,6 +171,9 @@ def calculate_auditory_quality_features(
     channel_artifacts_quality = np.zeros(num_channels)
     channel_global_quality = np.zeros(num_channels)
 
+    # --- FUTURE WORK: Potential Parallelization Bottleneck ---
+    # These sequential generate_auditory_internal_representation calls are independent.
+    # To optimize multi-core throughput, offload these tasks to a concurrent.futures.ThreadPoolExecutor.
     for channel_idx in range(num_channels):
         mtest, fr = generate_auditory_internal_representation(composite_estimate[:, channel_idx], sampling_frequency_hz)
 

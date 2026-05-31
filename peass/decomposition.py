@@ -54,12 +54,17 @@ def perform_least_squares_projection(
     # Direct horizontal stack to C-contiguous buffer
     toeplitz_matrix = np.hstack(strided_views)
 
-    weighted_sources = analysis_window[:, np.newaxis] * toeplitz_matrix
-    weighted_estimates = analysis_window[:, np.newaxis] * source_estimates
+    # --- SYSTEM BENCHMARK: OLD METHOD (Commented out for future comparison) ---
+    # weighted_sources = analysis_window[:, np.newaxis] * toeplitz_matrix
+    # weighted_estimates = analysis_window[:, np.newaxis] * source_estimates
+    # gram_matrix = weighted_sources.conj().T @ weighted_sources
+    # rhs_vector = weighted_sources.conj().T @ weighted_estimates
 
-    # Compute Gram matrix using high-speed BLAS dgemm
-    gram_matrix = weighted_sources.conj().T @ weighted_sources
-    rhs_vector = weighted_sources.conj().T @ weighted_estimates
+    # --- SYSTEM BENCHMARK: NEW METHOD (Memory-efficient Gram calculation) ---
+    # Avoids allocating massive temporary weighted_sources / weighted_estimates matrices in memory
+    window_sq = (analysis_window ** 2)[:, np.newaxis]
+    gram_matrix = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
+    rhs_vector = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
 
     # In-place diagonal regularization
     regularization_lambda = 10.0 ** -15
@@ -70,7 +75,8 @@ def perform_least_squares_projection(
         projection_weights = linalg.solve(gram_matrix, rhs_vector, assume_a='pos')
     except (linalg.LinAlgError, ValueError):
         # Fallback to pseudo-inverse if condition fails
-        projection_weights = linalg.pinv(weighted_sources) @ weighted_estimates
+        projection_weights = linalg.pinv(toeplitz_matrix * analysis_window[:, np.newaxis]) @ (
+                    source_estimates * analysis_window[:, np.newaxis])
 
     projections = np.zeros(
         (num_samples, source_estimates.shape[1], num_sources),
@@ -463,6 +469,10 @@ def decompose_distortion_components(
     window_lengths = np.maximum(3, np.round(reference_frame_length * bandwidth_ratios)).astype(int)
     hop_sizes = np.maximum(1, np.round(reference_hop_length * bandwidth_ratios)).astype(int)
 
+    # --- FUTURE WORK: Potential Parallelization Bottleneck ---
+    # The loop over frequency subbands below is an embarrassingly parallel DSP operation.
+    # To optimize processing speed, parallelize this loop using concurrent.futures.ThreadPoolExecutor,
+    # since the underlying SciPy linear algebraic routines release Python's GIL.
     decomposed_subband_true = []
     decomposed_subband_target_distortion = []
     decomposed_subband_interference = []
