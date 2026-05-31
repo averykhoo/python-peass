@@ -6,6 +6,7 @@ Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
 and zero-copy arrays.
 """
 
+
 import pathlib
 from typing import List
 from typing import Optional
@@ -24,6 +25,7 @@ from .config import DecompositionResult
 from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
 from .gammatone import calculate_equivalent_rectangular_bandwidth
+from .gammatone import fast_resample_poly
 
 
 def perform_least_squares_projection(
@@ -76,7 +78,7 @@ def perform_least_squares_projection(
     except (linalg.LinAlgError, ValueError):
         # Fallback to pseudo-inverse if condition fails
         projection_weights = linalg.pinv(toeplitz_matrix * analysis_window[:, np.newaxis]) @ (
-                    source_estimates * analysis_window[:, np.newaxis])
+                source_estimates * analysis_window[:, np.newaxis])
 
     projections = np.zeros(
         (num_samples, source_estimates.shape[1], num_sources),
@@ -255,7 +257,8 @@ def run_auditory_analysis_filterbank(
     original_fs = sampling_frequency_hz
     if sampling_frequency_hz / 2.0 < 1.5 * maximum_frequency:
         new_fs = int(round(1.5 * sampling_frequency_hz))
-        signal_waveform = signal.resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+        # signal_waveform = signal.resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+        signal_waveform = fast_resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
         sampling_frequency_hz = new_fs
 
     analyzer = GammatoneAnalyzer(
@@ -285,7 +288,8 @@ def run_auditory_analysis_filterbank(
 
     decimated_bands = []
     for band_idx in range(num_bands):
-        decimated_subband = signal.resample_poly(subbands_output[band_idx, :], 1, decimation_factors[band_idx])
+        # decimated_subband = signal.resample_poly(subbands_output[band_idx, :], 1, decimation_factors[band_idx])
+        decimated_subband = fast_resample_poly(subbands_output[band_idx, :], 1, decimation_factors[band_idx])
         decimated_bands.append(decimated_subband)
 
     return decimated_bands, analyzer, modulation_matrix
@@ -306,7 +310,8 @@ def run_auditory_synthesis_filterbank(
 
     for band_idx in range(num_bands):
         target_length = len(subband_list[band_idx]) * analyzer.decimation_factors[band_idx]
-        upsampled_subband = signal.resample_poly(subband_list[band_idx], analyzer.decimation_factors[band_idx], 1)
+        # upsampled_subband = signal.resample_poly(subband_list[band_idx], analyzer.decimation_factors[band_idx], 1)
+        upsampled_subband = fast_resample_poly(subband_list[band_idx], analyzer.decimation_factors[band_idx], 1)
         if len(upsampled_subband) > target_length:
             upsampled_subband = upsampled_subband[:target_length]
         elif len(upsampled_subband) < target_length:

@@ -306,3 +306,54 @@ class GammatoneSynthesizer:
     def process(self, input_data: np.ndarray) -> np.ndarray:
         delayed_signal = self.delay_unit.process(input_data)
         return self.mixer_unit.process(delayed_signal)
+
+
+_RESAMPLE_FILTER_CACHE = {}
+
+
+def get_resample_filter(up: int, down: int) -> tuple:
+    key = (up, down)
+    if key in _RESAMPLE_FILTER_CACHE:
+        return _RESAMPLE_FILTER_CACHE[key]
+
+    import math
+    g = math.gcd(up, down)
+    up_reduced = up // g
+    down_reduced = down // g
+
+    max_len = max(up_reduced, down_reduced)
+    half_len = 10 * max_len
+    n_filt = 2 * half_len + 1
+
+    # 1. Design standard Kaiser FIR filter
+    h = signal.firwin(n_filt, 1.0 / max_len, window=('kaiser', 5.0))
+    h *= up_reduced
+
+    # 2. Perfect replication of SciPy's zero-phase centering padding
+    n_pre_pad = (down_reduced - half_len % down_reduced)
+    h_padded = np.pad(h, (n_pre_pad, 0))
+
+    # 3. Calculate cropping offset
+    n_pre_remove = (half_len + n_pre_pad) // down_reduced
+
+    _RESAMPLE_FILTER_CACHE[key] = (h_padded, up_reduced, down_reduced, n_pre_remove)
+    return h_padded, up_reduced, down_reduced, n_pre_remove
+
+
+def fast_resample_poly(x: np.ndarray, up: int, down: int, axis: int = -1) -> np.ndarray:
+    if up == 1 and down == 1:
+        return x.copy()
+
+    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down)
+
+    in_len = x.shape[axis]
+    out_len = int(np.ceil(in_len * up_reduced / down_reduced))
+
+    # Run high-speed upfirdn
+    y = signal.upfirdn(h_padded, x, up_reduced, down_reduced, axis=axis)
+
+    # Slice the output to keep only the centered portion of out_len samples
+    keep = [slice(None)] * y.ndim
+    keep[axis] = slice(n_pre_remove, n_pre_remove + out_len)
+
+    return y[tuple(keep)]

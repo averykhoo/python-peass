@@ -14,6 +14,7 @@ import scipy.signal as signal
 
 from .config import ModulationProcessingType
 from .gammatone import GammatoneAnalyzer
+from .gammatone import fast_resample_poly
 
 # -----------------------------------------------------------------------------
 # NUMBA JIT COMPILATION (WITH SAFE IMPORT FALLBACK)
@@ -295,7 +296,8 @@ def generate_auditory_internal_representation(
     # Decimate using polyphase FIR (avoids global FFT memory spikes)
     if sampling_frequency_hz < 3.0 * maximum_frequency:
         new_sampling_frequency = int(round(1.5 * sampling_frequency_hz))
-        scaled_signal_data = signal.resample_poly(
+        # scaled_signal_data = signal.resample_poly(scaled_signal_data, new_sampling_frequency, int(sampling_frequency_hz))
+        scaled_signal_data = fast_resample_poly(
             scaled_signal_data, new_sampling_frequency, int(sampling_frequency_hz)
         )
         sampling_frequency_hz = float(new_sampling_frequency)
@@ -330,12 +332,14 @@ def generate_auditory_internal_representation(
 
     # 4. Modulation Filtering & Polyphase Decimation
     if modulation_processing_type == ModulationProcessingType.FILTERBANK:
-        downsampled_adapted = signal.resample_poly(adapted_signals, 800, int(sampling_frequency_hz), axis=-1)
+        # downsampled_adapted = signal.resample_poly(adapted_signals, 800, int(sampling_frequency_hz), axis=-1)
+        downsampled_adapted = fast_resample_poly(adapted_signals, 800, int(sampling_frequency_hz), axis=-1)
         sampling_frequency_hz = 800.0
         modulation_center_frequencies = np.concatenate(([0.0, 5.0], 10.0 * (5.0 / 3.0) ** np.arange(6)))
         modulation_bandwidths = np.concatenate(([5.0, 5.0], 5.0 * (5.0 / 3.0) ** np.arange(6)))
     else:
-        downsampled_adapted = signal.resample_poly(adapted_signals, 100, int(sampling_frequency_hz), axis=-1)
+        # downsampled_adapted = signal.resample_poly(adapted_signals, 100, int(sampling_frequency_hz), axis=-1)
+        downsampled_adapted = fast_resample_poly(adapted_signals, 100, int(sampling_frequency_hz), axis=-1)
         sampling_frequency_hz = 100.0
         modulation_center_frequencies = np.array([0.0])
         modulation_bandwidths = np.array([15.92])
