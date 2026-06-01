@@ -27,7 +27,7 @@ classifiers = [
 ]
 dependencies = [
     "numpy >= 1.19.0",
-    "scipy >= 1.5.0",
+    "scipy >= 1.6.0",
     "soundfile >= 0.10.0"
 ]
 
