@@ -36,8 +36,17 @@ However, human hearing relies on non-linear auditory transduction, temporal mask
 
 ## Installation
 
+For standard execution, you can install the package directly:
+
 ```bash
-pip install python-peass
+pip install "python-peass[numba]"
+```
+
+If you require high-speed execution (using optimized vector libraries like Intel MKL or Apple Accelerate), it is recommended to install NumPy and SciPy via Conda first, and then install the package:
+
+```bash
+conda install --update numpy scipy
+pip install "python-peass[numba]"
 ```
 
 ## Quick Start Examples
