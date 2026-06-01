@@ -89,7 +89,10 @@ def perform_least_squares_projection(
 
     # --- SILENCE BYPASS OPTIMIZATION ---
     # If reference sources are silent in this frame, bypass the solver entirely
-    source_energy = np.sum(true_sources.real ** 2 + true_sources.imag ** 2)
+    if np.iscomplexobj(true_sources):
+        source_energy = np.sum(true_sources.real ** 2 + true_sources.imag ** 2)
+    else:
+        source_energy = np.sum(true_sources ** 2)
     if source_energy < 1e-13:
         return np.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype)
 

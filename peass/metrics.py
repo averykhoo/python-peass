@@ -89,7 +89,8 @@ def calculate_auditory_similarity_metric(
     """
     num_bands, num_samples, num_modulations = internal_reference_representation.shape
 
-    internal_test_representation = internal_test_representation.copy()
+    internal_reference_representation = np.real(internal_reference_representation)
+    internal_test_representation = np.real(internal_test_representation).copy()
     assimilation_mask = (np.abs(internal_test_representation) < np.abs(internal_reference_representation))
     internal_test_representation[assimilation_mask] = (
             0.25 * internal_reference_representation[assimilation_mask] +
