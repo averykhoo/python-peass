@@ -40,7 +40,7 @@ def evaluate_neural_network_mapping(
     output_layer_activation = output_layer_weights.T @ hidden_layer_output + output_layer_bias
     final_score = 100.0 / (1.0 + np.exp(-output_layer_activation))
 
-    return float(final_score[0, 0])
+    return float(final_score.item())
 
 
 def predict_perceptual_evaluation_scores(
