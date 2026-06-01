@@ -395,6 +395,9 @@ def decompose_distortion_components(
     if configuration is None:
         configuration = DecompositionConfiguration()
 
+    if not source_files:
+        raise ValueError("source_files list cannot be empty.")
+
     is_file_mode = isinstance(estimate_file, (str, pathlib.Path))
 
     if is_file_mode:
