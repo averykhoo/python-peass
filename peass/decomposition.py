@@ -448,11 +448,11 @@ def decompose_distortion_components(
         fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
         
         # Explicitly validate signal length against configured shading windows
-        if (fade_in_samples > 0 and num_samples < fade_in_samples) or \
-           (fade_out_samples > 0 and num_samples < fade_out_samples):
+        # Explicitly validate signal length against configured shading windows
+        if fade_in_samples + fade_out_samples > num_samples:
             raise ValueError(
-                f"Signal length ({num_samples}) is shorter than the configured "
-                f"shading length (fade_in: {fade_in_samples}, fade_out: {fade_out_samples})."
+                f"Combined shading length ({fade_in_samples + fade_out_samples} samples) "
+                f"exceeds the signal length ({num_samples} samples)."
             )
             
         if fade_in_samples > 1:
