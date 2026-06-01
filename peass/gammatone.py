@@ -197,14 +197,23 @@ class GammatoneFilter:
         return self.filter_order
 
     def process(self, input_signal: np.ndarray) -> np.ndarray:
-        # Offload the entire N-th order filter mathematically to SciPy's C backend
-        output_signal, self.filter_state = signal.lfilter(
-            self.numerator_coefficients,
-            self.denominator_coefficients,
-            input_signal,
-            zi=self.filter_state
-        )
-        return output_signal
+        factor = self.normalization_factor
+        coeff = self.complex_filter_coefficient
+        filter_state = self.filter_state * coeff
+
+        y = input_signal.copy()
+        b_stage = np.array([factor], dtype=complex)
+        a_stage = np.array([1.0, -coeff], dtype=complex)
+
+        new_state = np.zeros(self.filter_order, dtype=complex)
+        for i in range(self.filter_order):
+            b_coef = b_stage if i == 0 else np.array([1.0], dtype=complex)
+            zi = np.array([filter_state[i]], dtype=complex)
+            y, zf = signal.lfilter(b_coef, a_stage, y, zi=zi)
+            new_state[i] = zf[0]
+
+        self.filter_state = new_state / coeff
+        return y
 
     def clear_filter_state(self) -> None:
         self.filter_state = np.zeros(self.filter_order, dtype=complex)
