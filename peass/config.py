@@ -8,6 +8,8 @@ from enum import Enum
 from enum import auto
 from typing import Optional
 
+import numpy as np
+
 # Dynamically enable slots only on Python 3.10+
 # TODO: drop py3.9 support and just always include slots
 _DATACLASS_KWARGS = {"slots": True} if sys.version_info >= (3, 10) else {}
