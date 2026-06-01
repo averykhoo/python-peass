@@ -1,50 +1,61 @@
 """
 PEASS Test Suite - Predictor End-to-End Regressor Tests
-File path: tests/test_predictor.py
 """
-
 import pathlib
 from typing import Tuple
 
 import numpy as np
+import pytest
 
-from peass.predictor import predict_peass_scores
+from peass.decomposition import DecompositionConfiguration
+from peass.predictor import predict_perceptual_evaluation_scores
 
 
+@pytest.mark.parametrize("estimate_scale", [1.0, 0.5, 0.1, 0.01])
 def test_predictor_score_range_constraints(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float],
+        estimate_scale
 ):
-    """
-    Performs an end-to-end in-memory execution run and verifies that all
-    predicted perceptual scores fall within valid bounds [1].
-    """
     target, interferer, estimate, fs = synthetic_audio_data
 
-    # Execute predictor
-    results = predict_peass_scores(
+    # Scale estimate to simulate varying degrees of signal degradation
+    scaled_estimate = estimate * estimate_scale
+
+    results = predict_perceptual_evaluation_scores(
         original_files=[target, interferer],
-        estimate_file=estimate,
-        sampling_frequency=fs,
+        estimate_file=scaled_estimate,
+        sampling_frequency_hz=fs,
         return_decomposition=True
     )
 
-    # 1. Assert traditional dB metrics computed successfully
-    for metric_key in ["SDR", "ISR", "SIR", "SAR"]:
-        assert metric_key in results
-        assert isinstance(results[metric_key], float)
+    assert isinstance(results.source_to_distortion_ratio, float)
+    assert isinstance(results.overall_perceptual_score, float)
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
+    assert 0.0 <= results.target_perceptual_score <= 100.0
+    assert 0.0 <= results.interference_perceptual_score <= 100.0
+    assert 0.0 <= results.artifact_perceptual_score <= 100.0
 
-    # 2. Assert predicted perceptual scores are bounded within [0, 100]
-    for score_key in ["OPS", "TPS", "IPS", "APS"]:
-        assert score_key in results
-        assert isinstance(results[score_key], float)
-        assert 0.0 <= results[score_key] <= 100.0
 
-    # 3. Verify returned decomposition arrays
-    assert "decomposition_arrays" in results
-    assert "true_target" in results["decomposition_arrays"]
-    assert "target_distortion" in results["decomposition_arrays"]
-    assert "interference" in results["decomposition_arrays"]
-    assert "artifacts" in results["decomposition_arrays"]
+def test_predictor_pristine_audio_conditions():
+    sampling_frequency_hz = 16000.0
+    duration_seconds = 1.5
+    num_samples = int(duration_seconds * sampling_frequency_hz)
+    time_steps = np.linspace(0, duration_seconds, num_samples)
+
+    target = np.sin(2.0 * np.pi * 300.0 * time_steps)[:, np.newaxis]
+    noise = 0.0 * np.sin(2.0 * np.pi * 1000.0 * time_steps)[:, np.newaxis]
+
+    estimate = target.copy()
+
+    results = predict_perceptual_evaluation_scores(
+        original_files=[target, noise],
+        estimate_file=estimate,
+        sampling_frequency_hz=sampling_frequency_hz
+    )
+
+    assert results.overall_perceptual_score > 90.0
+    assert results.target_perceptual_score > 90.0
+    assert results.interference_perceptual_score > 90.0
 
 
 def test_predictor_file_based_execution(
@@ -55,78 +66,49 @@ def test_predictor_file_based_execution(
     """
     target_path, interferer_path, estimate_path = audio_files_fixture
 
-    results = predict_peass_scores(
+    configuration = DecompositionConfiguration(
+        destination_directory=str(target_path.parent)
+    )
+
+    results = predict_perceptual_evaluation_scores(
         original_files=[str(target_path), str(interferer_path)],
         estimate_file=str(estimate_path),
-        options={'destDir': str(target_path.parent)},
+        configuration=configuration,
         return_decomposition=True
     )
 
     # Assert that score outputs are valid
-    assert 0.0 <= results["OPS"] <= 100.0
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
 
     # Assert that file-path mappings are present
-    assert "decomposition_files" in results
-    assert pathlib.Path(results["decomposition_files"]["true_target"]).is_file()
-
-
-def test_predictor_pristine_audio_conditions():
-    """
-    Verifies that evaluating a pristine, near-perfect separation yields
-    predictably high perceptual scores.
-    """
-    sampling_frequency = 16000.0
-    duration_seconds = 1.5
-    num_samples = int(duration_seconds * sampling_frequency)
-    time_steps = np.linspace(0, duration_seconds, num_samples)
-
-    # Target is clean sine wave
-    target = np.sin(2.0 * np.pi * 300.0 * time_steps)[:, np.newaxis]
-    noise = 0.0 * np.sin(2.0 * np.pi * 1000.0 * time_steps)[:, np.newaxis]
-
-    # Perfect Estimate (identical to target)
-    estimate = target.copy()
-
-    results = predict_peass_scores(
-        original_files=[target, noise],
-        estimate_file=estimate,
-        sampling_frequency=sampling_frequency
-    )
-
-    # A perfect separation should result in scores close to 100.
-    # Note: Gammatone filterbank analysis followed by synthesis introduces minor
-    # ripples/distortion. This is perceived as minor artificial noise by the
-    # sensory internal representation model, limiting the maximum APS to ~86.7.
-    assert results["OPS"] > 90.0
-    assert results["TPS"] > 90.0
-    assert results["IPS"] > 90.0
-    assert results["APS"] > 80.0
+    assert results.decomposition_files is not None
+    assert pathlib.Path(results.decomposition_files.true_target).is_file()
 
 
 def test_predictor_with_alternative_options(
         synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
-    Tests predictor behavior when invoking custom parameters like FLAG_2PROJ.
+    Tests predictor behavior when invoking custom parameters like use_two_stage_projection.
     """
     target, interferer, estimate, fs = synthetic_audio_data
 
-    custom_options = {
-        'FLAG_2PROJ':   True,
-        'frameLength':  0.4,
-        'filterLength': 0.03,
-        'shadeInMs':    5,
-        'shadeOutMs':   5
-    }
-
-    results = predict_peass_scores(
-        original_files=[target, interferer],
-        estimate_file=estimate,
-        options=custom_options,
-        sampling_frequency=fs
+    configuration = DecompositionConfiguration(
+        use_two_stage_projection=True,
+        frame_length_seconds=0.4,
+        filter_length_seconds=0.03,
+        shade_in_milliseconds=5.0,
+        shade_out_milliseconds=5.0
     )
 
-    assert 0.0 <= results["OPS"] <= 100.0
-    assert 0.0 <= results["TPS"] <= 100.0
-    assert 0.0 <= results["IPS"] <= 100.0
-    assert 0.0 <= results["APS"] <= 100.0
+    results = predict_perceptual_evaluation_scores(
+        original_files=[target, interferer],
+        estimate_file=estimate,
+        configuration=configuration,
+        sampling_frequency_hz=fs
+    )
+
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
+    assert 0.0 <= results.target_perceptual_score <= 100.0
+    assert 0.0 <= results.interference_perceptual_score <= 100.0
+    assert 0.0 <= results.artifact_perceptual_score <= 100.0

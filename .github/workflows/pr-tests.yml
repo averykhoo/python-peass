@@ -1,0 +1,28 @@
+name: Pull Request Tests
+
+on:
+  pull_request:
+    branches: [ "main" ]
+    types: [ opened, synchronize, reopened, ready_for_review ]
+
+# Cancel running workflows on the same PR when new commits are pushed
+concurrency:
+  group: pr-test-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    if: github.event.pull_request.draft == false
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ ubuntu-latest ]
+        python-version: [ "3.9", "3.10", "3.12", "3.14" ]  # TODO: remove 3.9
+        include:
+          - os: windows-latest
+            python-version: "3.14"
+
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}

@@ -1,0 +1,17 @@
+name: Main Post-Merge Check
+
+on:
+  push:
+    branches: [ "main" ]
+
+jobs:
+  post-merge-check:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest ]
+        python-version: [ "3.14" ]
+
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}

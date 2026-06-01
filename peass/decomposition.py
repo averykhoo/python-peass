@@ -1,14 +1,15 @@
 """
-PEASS Decomposition Package - Least-Squares Distortion Decomposer [1]
+PEASS Decomposition Package - Least-Squares Distortion Decomposer
 
-This module decomposes the separation error of a source estimate into:
-  1. Target distortion (filter-induced alterations)
-  2. Interference (leakage from overlapping sources)
-  3. Artifacts (artificial noise / musical noise components)
+Decomposes the separation error of a source estimate into Target distortion,
+Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
+and zero-copy arrays.
 """
 
 import pathlib
+from functools import lru_cache
 from typing import List
+from typing import Optional
 from typing import Tuple
 from typing import Union
 
@@ -17,68 +18,145 @@ import scipy.linalg as linalg
 import scipy.signal as signal
 import soundfile as sf
 
+from .config import DecomposedFilePaths
+from .config import DecomposedWaveforms
+from .config import DecompositionConfiguration
+from .config import DecompositionResult
 from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
+from .gammatone import calculate_equivalent_rectangular_bandwidth
+from .gammatone import fast_resample_poly
 
 
-def least_squares_decompose(
+def validate_and_normalize_audio(
+        data: np.ndarray,
+        sampling_frequency_hz: float,
+        name: str = "audio_data"
+) -> np.ndarray:
+    """
+    Validates and normalizes 1D/2D NumPy audio arrays to strictly enforce
+    the SciPy/NumPy layout convention: (samples, channels).
+
+    Enforces:
+    - Standard 2D shape (samples, channels).
+    - Maximum of 32 channels.
+    - Minimum duration of 50ms to safely satisfy the boundary shading
+      windows and subband frame decimation limits.
+    """
+    # Force at least 2D array representation
+    normalized = np.atleast_2d(data)
+
+    # Standardize 1D signals (1, samples) to column vectors (samples, 1)
+    if data.ndim == 1:
+        normalized = normalized.T
+
+    num_samples, num_channels = normalized.shape
+
+    # 1. Enforce strict spatial channel limit (< 32 channels)
+    if num_channels > 32:
+        raise ValueError(
+            f"Layout violation for '{name}'. Expected (samples, channels) "
+            f"with channels <= 32. Detected shape: {data.shape}. "
+            f"If your signal is (channels, samples), please transpose your input array."
+        )
+
+    # Dynamically enforce a minimum physical duration of 50 ms
+    min_duration_ms = 50
+    min_samples = int(min_duration_ms * sampling_frequency_hz / 1000)
+    if num_samples < min_samples:
+        raise ValueError(
+            f"Signal duration for '{name}' is too short ({num_samples} samples). "
+            f"PEASS requires a minimum of {min_samples} samples to perform "
+            f"the subband least-squares and overlap-add decomposition safely."
+        )
+
+    return normalized
+
+
+def perform_least_squares_projection(
         source_estimates: np.ndarray,
         true_sources: np.ndarray,
         filter_half_length: int,
         analysis_window: np.ndarray
 ) -> np.ndarray:
-    """
-    Weighted least-squares projection of source estimate on the source subspaces.
-    Equivalent of LSDecompose.m [1].
+    r"""
+    Weighted least-squares projection of source estimate onto source subspaces.
+    Executes entirely in BLAS/LAPACK without explicitly allocating massive memory blocks.
     """
     filter_length = 2 * filter_half_length + 1
     num_sources = true_sources.shape[1]
     num_samples = source_estimates.shape[0]
 
-    toeplitz_matrix = np.zeros((num_samples, num_sources * filter_length), dtype=true_sources.dtype)
-    for j in range(num_sources):
-        col = true_sources[filter_length - 1:, j]
-        row = true_sources[filter_length - 1::-1, j]
-        toeplitz_matrix[:, j * filter_length: (j + 1) * filter_length] = linalg.toeplitz(col, row)
-
-    weighted_sources = analysis_window[:, np.newaxis] * toeplitz_matrix
-    weighted_estimates = analysis_window[:, np.newaxis] * source_estimates
-
-    gram_matrix = weighted_sources.conj().T @ weighted_sources
-    reg_lambda = 10.0 ** -15
-
-    try:
-        cholesky_factor = linalg.cholesky(gram_matrix + reg_lambda * np.eye(gram_matrix.shape[0]), lower=False)
-        test_condition = False
-    except (linalg.LinAlgError, ValueError):
-        test_condition = True
-
-    if test_condition:
-        projection_weights = np.linalg.pinv(weighted_sources) @ weighted_estimates
+    # --- SILENCE BYPASS OPTIMIZATION ---
+    # If reference sources are silent in this frame, bypass the solver entirely
+    if np.iscomplexobj(true_sources):
+        source_energy = np.sum(true_sources.real ** 2 + true_sources.imag ** 2)
     else:
-        b = weighted_sources.conj().T @ weighted_estimates
-        tmp = linalg.solve_triangular(cholesky_factor.conj().T, b, lower=True)
-        projection_weights = linalg.solve_triangular(cholesky_factor, tmp, lower=False)
+        source_energy = np.sum(true_sources ** 2)
+    if source_energy < 1e-13:
+        return np.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype)
 
-    projections = np.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype)
-    weighted_diag = analysis_window[:, np.newaxis]
-    for j in range(num_sources):
-        projections[:, :, j] = weighted_diag * (toeplitz_matrix[:, j * filter_length: (j + 1) * filter_length] @
-                                                projection_weights[j * filter_length: (j + 1) * filter_length, :])
+    # Stride tricks for zero-copy view of the Toeplitz bands
+    strided_views = []
+    for source_idx in range(num_sources):
+        source_signal = true_sources[:, source_idx]
+        shape = (num_samples, filter_length)
+        strides = (source_signal.strides[0], source_signal.strides[0])
+
+        view = np.lib.stride_tricks.as_strided(source_signal, shape=shape, strides=strides, writeable=False)
+        # Reverse each row to match toeplitz(col, row) semantics perfectly
+        strided_views.append(view[:, ::-1])
+
+    # Direct horizontal stack to C-contiguous buffer
+    toeplitz_matrix = np.hstack(strided_views)
+
+    # --- SYSTEM BENCHMARK: OLD METHOD (Commented out for future comparison) ---
+    # weighted_sources = analysis_window[:, np.newaxis] * toeplitz_matrix
+    # weighted_estimates = analysis_window[:, np.newaxis] * source_estimates
+    # gram_matrix = weighted_sources.conj().T @ weighted_sources
+    # rhs_vector = weighted_sources.conj().T @ weighted_estimates
+
+    # --- SYSTEM BENCHMARK: NEW METHOD (Memory-efficient Gram calculation) ---
+    # Avoids allocating massive temporary weighted_sources / weighted_estimates matrices in memory
+    window_sq = (analysis_window ** 2)[:, np.newaxis]
+    gram_matrix = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
+    rhs_vector = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
+
+    # In-place diagonal regularization
+    regularization_lambda = 10.0 ** -15
+    gram_matrix.flat[::gram_matrix.shape[0] + 1] += regularization_lambda
+
+    # Offload directly to LAPACK posv (Cholesky solve in compiled C/Fortran)
+    try:
+        projection_weights = linalg.solve(gram_matrix, rhs_vector, assume_a='pos')
+    except (linalg.LinAlgError, ValueError):
+        # Fallback to pseudo-inverse if condition fails
+        projection_weights = linalg.pinv(toeplitz_matrix * analysis_window[:, np.newaxis]) @ (
+                source_estimates * analysis_window[:, np.newaxis])
+
+    projections = np.zeros(
+        (num_samples, source_estimates.shape[1], num_sources),
+        dtype=source_estimates.dtype
+    )
+    weighted_diagonal = analysis_window[:, np.newaxis]
+    for source_idx in range(num_sources):
+        projections[:, :, source_idx] = weighted_diagonal * (
+                toeplitz_matrix[:, source_idx * filter_length: (source_idx + 1) * filter_length] @
+                projection_weights[source_idx * filter_length: (source_idx + 1) * filter_length, :]
+        )
 
     return projections
 
 
-def least_squares_decompose_time_varying(
+def perform_time_varying_least_squares_projection(
         source_estimates: np.ndarray,
         true_sources: np.ndarray,
         filter_length: int,
         window_length: int,
         hop_size: int
 ) -> np.ndarray:
-    """
+    r"""
     Time-varying least-squares subband decomposer.
-    Equivalent of LSDecompose_tv.m [1].
     """
     filter_half_length = (filter_length - 1) // 2
     if (filter_length - 1) % 2 != 0:
@@ -91,31 +169,33 @@ def least_squares_decompose_time_varying(
     total_samples, num_sources = true_sources.shape
     num_channels = source_estimates.shape[1]
 
-    # Periodic Hann windows
-    hann_win = signal.windows.hann(window_length, sym=False)
-    analysis_window = np.sqrt(np.flipud(hann_win))
-    synthesis_window = np.sqrt(np.flipud(hann_win))
+    hann_window = signal.windows.hann(window_length, sym=False)
+    analysis_window = np.sqrt(np.flipud(hann_window))
+    synthesis_window = np.sqrt(np.flipud(hann_window))
 
     synthesis_weights = np.zeros((window_length, num_channels, num_sources))
-    for chan in range(num_channels):
-        for j in range(num_sources):
-            synthesis_weights[:, chan, j] = synthesis_window
+    for channel_idx in range(num_channels):
+        for source_idx in range(num_sources):
+            synthesis_weights[:, channel_idx, source_idx] = synthesis_window
 
-    w_begin = 0
-    w_end = w_begin + window_length
+    window_begin = 0
+    window_end = window_begin + window_length
 
-    projections_accum = np.zeros((total_samples, num_channels, num_sources), dtype=true_sources.dtype)
-    window_accum = np.zeros((total_samples, 1))
+    projections_accumulation = np.zeros(
+        (total_samples, num_channels, num_sources),
+        dtype=true_sources.dtype
+    )
+    window_gain_accumulation = np.zeros((total_samples, 1))
 
-    while w_end - window_length / 2.0 <= projections_accum.shape[0] - window_length + 1:
-        frame_estimates = source_estimates[w_begin:w_end, :]
+    while window_end - window_length / 2.0 <= projections_accumulation.shape[0] - window_length + 1:
+        frame_estimates = source_estimates[window_begin:window_end, :]
 
-        sw_start = w_begin - filter_half_length
-        sw_end = w_end + filter_half_length
-        pad_left = max(0, -sw_start)
-        pad_right = max(0, sw_end - true_sources.shape[0])
-        slice_start = max(0, sw_start)
-        slice_end = min(true_sources.shape[0], sw_end)
+        source_window_start = window_begin - filter_half_length
+        source_window_end = window_end + filter_half_length
+        pad_left = max(0, -source_window_start)
+        pad_right = max(0, source_window_end - true_sources.shape[0])
+        slice_start = max(0, source_window_start)
+        slice_end = min(true_sources.shape[0], source_window_end)
 
         frame_sources_slice = true_sources[slice_start:slice_end, :]
         frame_sources = np.vstack([
@@ -124,32 +204,35 @@ def least_squares_decompose_time_varying(
             np.zeros((pad_right, num_sources), dtype=true_sources.dtype)
         ])
 
-        frame_projections = least_squares_decompose(frame_estimates, frame_sources, filter_half_length, analysis_window)
+        frame_projections = perform_least_squares_projection(
+            frame_estimates, frame_sources, filter_half_length, analysis_window
+        )
 
-        projections_accum[w_begin:w_end, :, :] += frame_projections[:window_length, :, :] * synthesis_weights
-        window_accum[w_begin:w_end, 0] += synthesis_window * analysis_window
+        projections_accumulation[window_begin:window_end, :, :] += (
+                frame_projections[:window_length, :, :] * synthesis_weights
+        )
+        window_gain_accumulation[window_begin:window_end, 0] += synthesis_window * analysis_window
 
-        w_begin += hop_size
-        w_end += hop_size
+        window_begin += hop_size
+        window_end += hop_size
 
-    valid_indices = (window_accum[:, 0] != 0)
-    for j in range(num_sources):
-        projections_accum[valid_indices, :, j] /= window_accum[valid_indices, :]
+    valid_indices = (window_gain_accumulation[:, 0] != 0)
+    for source_idx in range(num_sources):
+        projections_accumulation[valid_indices, :, source_idx] /= window_gain_accumulation[valid_indices, :]
 
-    return projections_accum[:-(window_length - 1), :, :]
+    return projections_accumulation[:-(window_length - 1), :, :]
 
 
-def extract_target_spatial_interference_artifacts(
+def extract_target_spatial_distortion_interference_artifacts(
         true_sources: np.ndarray,
         source_estimates: np.ndarray,
         filter_length: int,
         window_length: int,
         hop_size: int,
-        flag_two_projections: bool = False
+        use_two_stage_projection: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """
-    Splits multi-source signal mixtures into Target, Spatial Distortion,
-    Interference, and Artifact components. Replaces extractTSIA.m [1].
+    r"""
+    Splits multi-source signal mixtures into physical sub-components.
     """
     total_samples, num_channels, num_sources = true_sources.shape
     num_estimates = source_estimates.shape[2] if len(source_estimates.shape) > 2 else 1
@@ -159,40 +242,51 @@ def extract_target_spatial_interference_artifacts(
     sources_reshaped = true_sources.reshape((total_samples, num_sources * num_channels), order='F')
     estimates_reshaped = source_estimates.reshape((total_samples, num_estimates * num_channels), order='F')
 
-    projections_all = least_squares_decompose_time_varying(estimates_reshaped, sources_reshaped, filter_length,
-                                                           window_length, hop_size)
+    projections_all = perform_time_varying_least_squares_projection(
+        estimates_reshaped, sources_reshaped, filter_length, window_length, hop_size
+    )
 
-    y_projected = np.zeros((total_samples, num_channels * num_estimates, num_sources), dtype=true_sources.dtype)
-    for nSource in range(num_sources):
-        start_idx = nSource * num_channels
-        end_idx = (nSource + 1) * num_channels
-        y_projected[:, :, nSource] = np.sum(projections_all[:total_samples, :, start_idx:end_idx], axis=2)
+    projected_signals = np.zeros(
+        (total_samples, num_channels * num_estimates, num_sources),
+        dtype=true_sources.dtype
+    )
+    for source_idx in range(num_sources):
+        start_channel_idx = source_idx * num_channels
+        end_channel_idx = (source_idx + 1) * num_channels
+        projected_signals[:, :, source_idx] = np.sum(
+            projections_all[:total_samples, :, start_channel_idx:end_channel_idx], axis=2
+        )
 
     spatial_distortion = np.zeros((total_samples, num_estimates * num_channels), dtype=source_estimates.dtype)
-    if flag_two_projections:
-        for nEst in range(num_estimates):
-            start_est = nEst * num_channels
-            end_est = (nEst + 1) * num_channels
-            spatial_proj = least_squares_decompose_time_varying(
-                estimates_reshaped[:, start_est:end_est],
+    if use_two_stage_projection:
+        for estimate_idx in range(num_estimates):
+            start_estimate_idx = estimate_idx * num_channels
+            end_estimate_idx = (estimate_idx + 1) * num_channels
+            spatial_projection = perform_time_varying_least_squares_projection(
+                estimates_reshaped[:, start_estimate_idx:end_estimate_idx],
                 sources_reshaped[:, :num_channels],
                 filter_length, window_length, hop_size
             )
-            spatial_distortion[:, start_est:end_est] = np.sum(spatial_proj[:total_samples, :, :], axis=2)
+            spatial_distortion[:, start_estimate_idx:end_estimate_idx] = np.sum(
+                spatial_projection[:total_samples, :, :], axis=2
+            )
 
     true_reference = np.zeros((total_samples, num_channels * num_estimates), dtype=true_sources.dtype)
-    for nEst in range(num_estimates):
-        start_est = nEst * num_channels
-        end_est = (nEst + 1) * num_channels
-        true_reference[:, start_est:end_est] = sources_reshaped[:, :num_channels]
+    for estimate_idx in range(num_estimates):
+        start_estimate_idx = estimate_idx * num_channels
+        end_estimate_idx = (estimate_idx + 1) * num_channels
+        true_reference[:, start_estimate_idx:end_estimate_idx] = sources_reshaped[:, :num_channels]
 
-    if flag_two_projections:
+    if use_two_stage_projection:
         spatial_distortion = spatial_distortion - true_reference
     else:
-        spatial_distortion = y_projected[:, :, :num_estimates].reshape((total_samples, num_estimates * num_channels),
-                                                                       order='F') - true_reference
+        spatial_distortion = (
+                projected_signals[:, :, :num_estimates].reshape((total_samples, num_estimates * num_channels),
+                                                                order='F') -
+                true_reference
+        )
 
-    interference = np.sum(y_projected, axis=2) - spatial_distortion - true_reference
+    interference = np.sum(projected_signals, axis=2) - spatial_distortion - true_reference
     artifacts = estimates_reshaped - true_reference - spatial_distortion - interference
 
     true_reference_3d = true_reference.reshape((total_samples, num_channels, num_estimates), order='F')
@@ -203,268 +297,393 @@ def extract_target_spatial_interference_artifacts(
     return true_reference_3d, spatial_distortion_3d, interference_3d, artifacts_3d
 
 
-def extract_distortion_components(
-        src_files: List[Union[str, np.ndarray]],
-        est_file: Union[str, np.ndarray],
-        options: dict = None,
-        sampling_frequency: float = None
-) -> Tuple[List[str], List[np.ndarray]]:
-    """
-    Subband least-squares decomposes estimates into distinct physical components.
-    Replaces extractDistortionComponents.m [1].
-    """
-    default_options = {
-        'destDir':            './',
-        'FLAG_2PROJ':         False,
-        'frameLength':        0.5,
-        'filterLength':       0.04,
-        'shadeInMs':          10,
-        'shadeOutMs':         10,
-        'segmentationFactor': 1
-    }
+def run_auditory_analysis_filterbank(
+        signal_waveform: np.ndarray,
+        sampling_frequency_hz: float,
+        modulation_matrix: Optional[np.ndarray] = None
+) -> Tuple[List[np.ndarray], GammatoneAnalyzer, np.ndarray]:
+    """Helper executing Gammatone Analysis subband decomposition."""
+    minimum_frequency = 20.0
+    maximum_frequency = sampling_frequency_hz / 2.0
+    base_frequency = 1000.0
+    filters_per_erb = 1.0
 
-    if options is None:
-        options = default_options
-    else:
-        for k, v in default_options.items():
-            if k not in options or options[k] is None:
-                options[k] = v
+    original_fs = sampling_frequency_hz
+    if sampling_frequency_hz / 2.0 < 1.5 * maximum_frequency:
+        new_fs = int(round(1.5 * sampling_frequency_hz))
+        # signal_waveform = signal.resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+        signal_waveform = fast_resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+        sampling_frequency_hz = new_fs
 
-    is_file_mode = isinstance(est_file, (str, pathlib.Path))
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz, minimum_frequency, base_frequency, maximum_frequency, filters_per_erb
+    )
+    analyzer.original_sampling_frequency_hz = original_fs
+
+    subbands_output = analyzer.process(signal_waveform)
+    num_bands = subbands_output.shape[0]
+
+    if modulation_matrix is None:
+        time_steps = np.arange(subbands_output.shape[1])
+        center_frequencies = analyzer.center_frequencies[:, np.newaxis]
+        modulation_matrix = np.exp(-2j * np.pi / sampling_frequency_hz * center_frequencies * time_steps)
+
+    subbands_output = subbands_output * modulation_matrix
+
+    equivalent_bandwidths = calculate_equivalent_rectangular_bandwidth(analyzer.center_frequencies)
+    decimation_alpha = 2.0
+    decimation_factors = np.maximum(
+        1, np.floor(sampling_frequency_hz / (equivalent_bandwidths * decimation_alpha))
+    ).astype(int)
+
+    analyzer.decimation_factors = decimation_factors
+    analyzer.sampling_frequency_hz = sampling_frequency_hz
+    analyzer.bandwidths = equivalent_bandwidths
+
+    # --- VECTORIZED 2D BLOCK RESAMPLING (NEW METHOD) ---
+    # Group bands with identical decimation factors and process them in contiguous 2D blocks
+    decimated_bands = [None] * num_bands
+    unique_factors = np.unique(decimation_factors)
+
+    for factor in unique_factors:
+        band_indices = np.where(decimation_factors == factor)[0]
+        block = subbands_output[band_indices, :]
+
+        # Vectorized 2D resampling along the last axis (-1) in a single C-backend execution pass
+        resampled_block = fast_resample_poly(block, 1, factor, axis=-1)
+
+        for idx, band_idx in enumerate(band_indices):
+            decimated_bands[band_idx] = resampled_block[idx, :]
+
+    return decimated_bands, analyzer, modulation_matrix
+
+
+# -----------------------------------------------------------------------------
+# SYNTHESIS MODULATION MATRIX CACHE (Using functools.lru_cache)
+# -----------------------------------------------------------------------------
+
+@lru_cache
+def _get_synthesis_modulation_matrix_cached(
+        sampling_frequency: float,
+        max_samples_length: int,
+        center_frequencies_tuple: tuple
+) -> np.ndarray:
+    center_frequencies = np.array(center_frequencies_tuple)
+    time_steps = np.arange(max_samples_length)
+    return np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
+
+
+def get_synthesis_modulation_matrix(
+        sampling_frequency: float,
+        max_samples_length: int,
+        center_frequencies: np.ndarray
+) -> np.ndarray:
+    """Helper to lazily compute and cache the synthesis modulation matrix."""
+    return _get_synthesis_modulation_matrix_cached(
+        sampling_frequency,
+        max_samples_length,
+        tuple(center_frequencies)
+    )
+
+
+def run_auditory_synthesis_filterbank(
+        subband_list: list,
+        analyzer: GammatoneAnalyzer
+) -> Tuple[np.ndarray, GammatoneSynthesizer]:
+    """Helper executing Gammatone synthesis reconstruction."""
+    num_bands = len(subband_list)
+    sampling_frequency = analyzer.sampling_frequency_hz
+
+    max_samples_length = max(
+        len(subband_list[band_idx]) * analyzer.decimation_factors[band_idx] for band_idx in range(num_bands)
+    )
+    processed_subbands = np.zeros((num_bands, max_samples_length), dtype=complex)
+
+    # --- VECTORIZED 2D BLOCK UPSAMPLING ---
+    unique_factors = np.unique(analyzer.decimation_factors)
+
+    for factor in unique_factors:
+        band_indices = np.where(analyzer.decimation_factors == factor)[0]
+        # Faster stacking than vstack
+        block = np.array([subband_list[b] for b in band_indices])
+
+        # Vectorized 2D upsampling along axis=-1
+        upsampled_block = fast_resample_poly(block, factor, 1, axis=-1)
+
+        for idx, band_idx in enumerate(band_indices):
+            target_length = len(subband_list[band_idx]) * factor
+            upsampled_subband = upsampled_block[idx, :]
+            curr_len = len(upsampled_subband)
+
+            # Avoid np.pad allocations; processed_subbands is already zero-initialized
+            if curr_len == target_length:
+                processed_subbands[band_idx, :target_length] = upsampled_subband
+            elif curr_len > target_length:
+                processed_subbands[band_idx, :target_length] = upsampled_subband[:target_length]
+            else:
+                processed_subbands[band_idx, :curr_len] = upsampled_subband
+
+    # Retrieve cached modulation matrix to bypass np.exp re-calculations
+    processed_subbands = processed_subbands * get_synthesis_modulation_matrix(
+        sampling_frequency, max_samples_length, analyzer.center_frequencies
+    )
+
+    desired_delay_seconds = 1000.0 / sampling_frequency
+    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds)
+
+    reconstructed_signal = synthesizer.process(processed_subbands)
+
+    original_sampling_frequency = analyzer.original_sampling_frequency_hz
+    reconstructed_signal = fast_resample_poly(
+        reconstructed_signal,
+        int(original_sampling_frequency),
+        int(sampling_frequency)
+    )
+    delay_offset_samples = int(round(desired_delay_seconds * original_sampling_frequency))
+    reconstructed_signal = reconstructed_signal[delay_offset_samples:]
+
+    return reconstructed_signal, synthesizer
+
+
+def decompose_distortion_components(
+        source_files: List[Union[str, np.ndarray]],
+        estimate_file: Union[str, np.ndarray],
+        configuration: Optional[DecompositionConfiguration] = None,
+        sampling_frequency_hz: Optional[float] = None
+) -> DecompositionResult:
+    r"""
+    Decomposes an estimated source signal into physical distortion components.
+    """
+    if configuration is None:
+        configuration = DecompositionConfiguration()
+
+    if not source_files:
+        raise ValueError("source_files list cannot be empty.")
+
+    is_file_mode = isinstance(estimate_file, (str, pathlib.Path))
 
     if is_file_mode:
-        est_data, sampling_frequency = sf.read(est_file)
-        if len(est_data.shape) == 1:
-            est_data = est_data[:, np.newaxis]
+        # File-based mode (handled by soundfile, which defaults to samples-first)
+        estimate_audio_data, sampling_frequency_hz = sf.read(estimate_file)
+        # Normalize file inputs
+        estimate_audio_data = validate_and_normalize_audio(
+            estimate_audio_data, sampling_frequency_hz, name="estimate_file"
+        )
 
-        src_data_list = []
-        for src_path in src_files:
-            data, fs_s = sf.read(src_path)
-            if fs_s != sampling_frequency:
+        source_data_list = []
+        for idx, source_path in enumerate(source_files):
+            if not isinstance(source_path, (str, pathlib.Path)):
+                raise ValueError("All source inputs must be file paths in file-based mode.")
+            data, source_fs = sf.read(source_path)
+            if source_fs != sampling_frequency_hz:
                 raise ValueError("Sampling rates of all files must match.")
-            if len(data.shape) == 1:
-                data = data[:, np.newaxis]
-            src_data_list.append(data)
+
+            data = validate_and_normalize_audio(
+                data, sampling_frequency_hz, name=f"source_files[{idx}]"
+            )
+            source_data_list.append(data)
     else:
-        est_data = np.atleast_2d(est_file)
-        if est_data.shape[0] < est_data.shape[1]:
-            est_data = est_data.T
+        # Array-based mode (enforces strict NumPy/SciPy convention)
+        if sampling_frequency_hz is None:
+            raise ValueError("In-memory mode requires explicit sampling rate 'sampling_frequency_hz'.")
 
-        src_data_list = []
-        for s_arr in src_files:
-            s_arr = np.atleast_2d(s_arr)
-            if s_arr.shape[0] < s_arr.shape[1]:
-                s_arr = s_arr.T
-            src_data_list.append(s_arr)
+        estimate_audio_data = validate_and_normalize_audio(
+            estimate_file, sampling_frequency_hz, name="estimate_file"
+        )
 
-        if sampling_frequency is None:
-            raise ValueError("In-memory mode requires explicit sampling rate 'fs'.")
+        source_data_list = []
+        for idx, source_array in enumerate(source_files):
+            if isinstance(source_array, (str, pathlib.Path)):
+                raise ValueError("All source inputs must be numpy arrays in array-based mode.")
 
-    J = len(src_data_list)
-    L_original = est_data.shape[0]
-    NChan = est_data.shape[1]
+            data = validate_and_normalize_audio(
+                source_array, sampling_frequency_hz, name=f"source_files[{idx}]"
+            )
+            source_data_list.append(data)
 
-    for j, s_data in enumerate(src_data_list):
-        if s_data.shape != est_data.shape:
+    number_of_sources = len(source_data_list)
+    original_samples_length = estimate_audio_data.shape[0]
+    number_of_channels = estimate_audio_data.shape[1]
+
+    for source_data in source_data_list:
+        if source_data.shape != estimate_audio_data.shape:
             raise ValueError("All source signals must be of matching dimensions.")
 
-    def apply_shading(sig, fs, shade_in, shade_out):
-        sig_shaded = sig.copy()
-        if shade_in > 0:
-            win_len = 2 * int(round(shade_in / 1000.0 * fs + 1))
-            wShadeIn = signal.windows.hann(win_len, sym=False)[:win_len // 2]
-            for c in range(sig_shaded.shape[1]):
-                sig_shaded[:len(wShadeIn), c] *= wShadeIn
-        if shade_out > 0:
-            win_len = 2 * int(round(shade_out / 1000.0 * fs + 1))
-            wShadeOut = signal.windows.hann(win_len, sym=False)[:win_len // 2]
-            wShadeOut = np.flip(wShadeOut)
-            for c in range(sig_shaded.shape[1]):
-                sig_shaded[-len(wShadeOut):, c] *= wShadeOut
-        return sig_shaded
+    def apply_window_shading(sig: np.ndarray, fs: float, shade_in: float, shade_out: float) -> np.ndarray:
+        shaded_signal = sig.copy()
+        num_samples = shaded_signal.shape[0]
 
-    src_shaded = [apply_shading(s, sampling_frequency, options['shadeInMs'], options['shadeOutMs']) for s in
-                  src_data_list]
-    est_shaded = apply_shading(est_data, sampling_frequency, options['shadeInMs'], options['shadeOutMs'])
+        fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
+        fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
 
-    # Analysis Gammatone Filterbank
-    sj_gamma = [[None for _ in range(NChan)] for _ in range(J)]
-    Mmod = None
-    analyzer = None
+        # Explicitly validate signal length against configured shading windows
+        if fade_in_samples + fade_out_samples > num_samples:
+            raise ValueError(
+                f"Combined shading length ({fade_in_samples + fade_out_samples} samples) "
+                f"exceeds the signal length ({num_samples} samples)."
+            )
 
-    for j in range(J):
-        for nChan in range(NChan):
-            sj_gamma[j][nChan], analyzer, Mmod = my_analysis_filter_bank(src_shaded[j][:, nChan], sampling_frequency,
-                                                                         Mmod)
+        if fade_in_samples > 1:
+            time_steps = np.arange(fade_in_samples)
+            shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
+            # Vectorized channel multiplication
+            shaded_signal[:fade_in_samples, :] *= shade_in_window[:, np.newaxis]
 
-    sj_est_gamma = [None for _ in range(NChan)]
-    for nChan in range(NChan):
-        sj_est_gamma[nChan], analyzer, _ = my_analysis_filter_bank(est_shaded[:, nChan], sampling_frequency, Mmod)
+        if fade_out_samples > 1:
+            time_steps = np.arange(fade_out_samples)
+            shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
+            # Vectorized channel multiplication
+            shaded_signal[-fade_out_samples:, :] *= shade_out_window[:, np.newaxis]
 
-    # Convert to subband blocks
-    Nb = len(sj_gamma[0][0])
-    s = []
-    sEst = []
-    for b in range(Nb):
-        L_band = len(sj_gamma[0][0][b])
-        s_band = np.zeros((L_band, NChan, J), dtype=complex)
-        sEst_band = np.zeros((L_band, NChan, 1), dtype=complex)
-        for nChan in range(NChan):
-            sEst_band[:, nChan, 0] = sj_est_gamma[nChan][b]
-            for j in range(J):
-                s_band[:, nChan, j] = sj_gamma[j][nChan][b]
-        s.append(s_band)
-        sEst.append(sEst_band)
+        return shaded_signal
 
-    fRef = 1000.0
-    TframeFRef = options['frameLength']
-    ThopFRef = TframeFRef / 4.0
-    idx_fref = np.argmin(np.abs(analyzer.center_frequencies - fRef))
-    bwRef = analyzer.bandwidths[idx_fref]
+    shaded_sources = [
+        apply_window_shading(
+            src, sampling_frequency_hz, configuration.shade_in_milliseconds, configuration.shade_out_milliseconds
+        ) for src in source_data_list
+    ]
+    shaded_estimate = apply_window_shading(
+        estimate_audio_data,
+        sampling_frequency_hz,
+        configuration.shade_in_milliseconds,
+        configuration.shade_out_milliseconds
+    )
 
-    # Corrected object-subscripting glitch:
-    fsb = analyzer.sampling_frequency / analyzer.Ndec
+    subband_source_signals = [[None for _ in range(number_of_channels)] for _ in range(number_of_sources)]
+    modulation_matrix = None
+    analyzer_instance = None
 
-    TfilterFRef = min(options['filterLength'], TframeFRef / NChan / J / 3.0)
-    flens = np.maximum(3, 2 * np.round((TfilterFRef * bwRef / analyzer.bw * fsb - 1) / 2.0) + 1).astype(int)
-    Lws = np.maximum(3, np.round(TframeFRef * bwRef / analyzer.bw * fsb)).astype(int)
-    hops = np.maximum(1, np.round(ThopFRef * bwRef / analyzer.bw * fsb)).astype(int)
+    for source_idx in range(number_of_sources):
+        for channel_idx in range(number_of_channels):
+            subband_source_signals[source_idx][channel_idx], analyzer_instance, modulation_matrix = (
+                run_auditory_analysis_filterbank(
+                    shaded_sources[source_idx][:, channel_idx], sampling_frequency_hz, modulation_matrix
+                )
+            )
 
-    sgTrue, egTarget, egInterf, egArtif = [], [], [], []
-    for b in range(Nb):
-        sTrue_b, eSpat_b, eInterf_b, eArtif_b = extract_target_spatial_interference_artifacts(
-            s[b], sEst[b], flens[b], Lws[b], hops[b], flag_two_projections=options['FLAG_2PROJ']
+    subband_estimate_signals = [None for _ in range(number_of_channels)]
+    for channel_idx in range(number_of_channels):
+        subband_estimate_signals[channel_idx], analyzer_instance, _ = run_auditory_analysis_filterbank(
+            shaded_estimate[:, channel_idx], sampling_frequency_hz, modulation_matrix
         )
-        sgTrue.append(sTrue_b)
-        egTarget.append(eSpat_b)
-        egInterf.append(eInterf_b)
-        egArtif.append(eArtif_b)
 
-    s_gamma_true = [[None for _ in range(Nb)] for _ in range(NChan)]
-    s_gamma_target = [[None for _ in range(Nb)] for _ in range(NChan)]
-    s_gamma_interf = [[None for _ in range(Nb)] for _ in range(NChan)]
-    s_gamma_artif = [[None for _ in range(Nb)] for _ in range(NChan)]
+    number_of_bands = len(subband_source_signals[0][0])
+    subband_sources_composite = []
+    subband_estimates_composite = []
 
-    for nChan in range(NChan):
-        for b in range(Nb):
-            s_gamma_true[nChan][b] = sgTrue[b][:, nChan, 0]
-            s_gamma_target[nChan][b] = egTarget[b][:, nChan, 0]
-            s_gamma_interf[nChan][b] = egInterf[b][:, nChan, 0]
-            s_gamma_artif[nChan][b] = egArtif[b][:, nChan, 0]
+    for band_idx in range(number_of_bands):
+        # Fully vectorized block construction using transpose, stacking, and list comprehensions
+        estimates_block = np.array([subband_estimate_signals[c][band_idx] for c in range(number_of_channels)]).T[
+            :, :, np.newaxis]
+        sources_block = np.array([
+            [subband_source_signals[s][c][band_idx] for s in range(number_of_sources)]
+            for c in range(number_of_channels)
+        ]).transpose(2, 0, 1)
 
-    trueSynth = np.zeros((L_original, NChan))
-    targetSynth = np.zeros((L_original, NChan))
-    interfSynth = np.zeros((L_original, NChan))
-    artifSynth = np.zeros((L_original, NChan))
+        subband_sources_composite.append(sources_block)
+        subband_estimates_composite.append(estimates_block)
 
-    def fit_to_length(sig, target_len):
-        if len(sig) >= target_len:
-            return sig[:target_len]
-        return np.pad(sig, (0, target_len - len(sig)), mode='constant')
+    reference_frequency = 1000.0
+    reference_frame_length = configuration.frame_length_seconds
+    reference_hop_length = reference_frame_length / 4.0
+    f_ref_idx = np.argmin(np.abs(analyzer_instance.center_frequencies - reference_frequency))
+    reference_bandwidth = analyzer_instance.bandwidths[f_ref_idx]
 
-    for nChan in range(NChan):
-        synth_t, _ = my_synthesis_filter_bank(s_gamma_true[nChan], analyzer)
-        synth_s, _ = my_synthesis_filter_bank(s_gamma_target[nChan], analyzer)
-        synth_i, _ = my_synthesis_filter_bank(s_gamma_interf[nChan], analyzer)
-        synth_a, _ = my_synthesis_filter_bank(s_gamma_artif[nChan], analyzer)
+    decimated_sampling_frequency = analyzer_instance.sampling_frequency_hz / analyzer_instance.decimation_factors
 
-        trueSynth[:, nChan] = fit_to_length(synth_t, L_original)
-        targetSynth[:, nChan] = fit_to_length(synth_s, L_original)
-        interfSynth[:, nChan] = fit_to_length(synth_i, L_original)
-        artifSynth[:, nChan] = fit_to_length(synth_a, L_original)
+    reference_filter_length = min(
+        configuration.filter_length_seconds, reference_frame_length / number_of_channels / number_of_sources / 3.0
+    )
+
+    bandwidth_ratios = reference_bandwidth / analyzer_instance.bandwidths * decimated_sampling_frequency
+    filter_lengths = np.maximum(3, 2 * np.round((reference_filter_length * bandwidth_ratios - 1) / 2.0) + 1).astype(int)
+    window_lengths = np.maximum(3, np.round(reference_frame_length * bandwidth_ratios)).astype(int)
+    hop_sizes = np.maximum(1, np.round(reference_hop_length * bandwidth_ratios)).astype(int)
+
+    decomposed_subband_true = []
+    decomposed_subband_target_distortion = []
+    decomposed_subband_interference = []
+    decomposed_subband_artifacts = []
+    for band_idx in range(number_of_bands):
+        true_b, target_dist_b, interference_b, artifacts_b = (
+            extract_target_spatial_distortion_interference_artifacts(
+                subband_sources_composite[band_idx],
+                subband_estimates_composite[band_idx],
+                filter_lengths[band_idx],
+                window_lengths[band_idx],
+                hop_sizes[band_idx],
+                use_two_stage_projection=configuration.use_two_stage_projection
+            )
+        )
+        decomposed_subband_true.append(true_b)
+        decomposed_subband_target_distortion.append(target_dist_b)
+        decomposed_subband_interference.append(interference_b)
+        decomposed_subband_artifacts.append(artifacts_b)
+
+    # Clean and vectorized subband list reformatting
+    reformatted_subband_true = [
+        [decomposed_subband_true[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_target_distortion = [
+        [decomposed_subband_target_distortion[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_interference = [
+        [decomposed_subband_interference[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_artifacts = [
+        [decomposed_subband_artifacts[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+
+    synthesized_true_target = np.zeros((original_samples_length, number_of_channels))
+    synthesized_target_distortion = np.zeros((original_samples_length, number_of_channels))
+    synthesized_interference = np.zeros((original_samples_length, number_of_channels))
+    synthesized_artifacts = np.zeros((original_samples_length, number_of_channels))
+
+    def clip_or_pad_to_target_length(signal_array: np.ndarray, target_length: int) -> np.ndarray:
+        if len(signal_array) >= target_length:
+            return signal_array[:target_length]
+        return np.pad(signal_array, (0, target_length - len(signal_array)), mode='constant')
+
+    for channel_idx in range(number_of_channels):
+        synth_t, _ = run_auditory_synthesis_filterbank(reformatted_subband_true[channel_idx], analyzer_instance)
+        synth_td, _ = run_auditory_synthesis_filterbank(
+            reformatted_subband_target_distortion[channel_idx], analyzer_instance
+        )
+        synth_i, _ = run_auditory_synthesis_filterbank(reformatted_subband_interference[channel_idx], analyzer_instance)
+        synth_a, _ = run_auditory_synthesis_filterbank(reformatted_subband_artifacts[channel_idx], analyzer_instance)
+
+        synthesized_true_target[:, channel_idx] = clip_or_pad_to_target_length(synth_t, original_samples_length)
+        synthesized_target_distortion[:, channel_idx] = (
+            clip_or_pad_to_target_length(synth_td, original_samples_length)
+        )
+        synthesized_interference[:, channel_idx] = clip_or_pad_to_target_length(synth_i, original_samples_length)
+        synthesized_artifacts[:, channel_idx] = clip_or_pad_to_target_length(synth_a, original_samples_length)
+
+    waveforms = DecomposedWaveforms(
+        true_target=synthesized_true_target,
+        target_distortion=synthesized_target_distortion,
+        interference=synthesized_interference,
+        artifacts=synthesized_artifacts
+    )
 
     if is_file_mode:
-        dest_path = pathlib.Path(options['destDir'])
-        filename = pathlib.Path(est_file).stem
-        out_filenames = [
-            str(dest_path / f"{filename}_true.wav"),
-            str(dest_path / f"{filename}_eTarget.wav"),
-            str(dest_path / f"{filename}_eInterf.wav"),
-            str(dest_path / f"{filename}_eArtif.wav")
-        ]
-        sf.write(out_filenames[0], trueSynth, int(sampling_frequency))
-        sf.write(out_filenames[1], targetSynth, int(sampling_frequency))
-        sf.write(out_filenames[2], interfSynth, int(sampling_frequency))
-        sf.write(out_filenames[3], artifSynth, int(sampling_frequency))
-        return out_filenames, [trueSynth, targetSynth, interfSynth, artifSynth]
-    else:
-        return [], [trueSynth, targetSynth, interfSynth, artifSynth]
+        destination_path = pathlib.Path(configuration.destination_directory)
+        destination_path.mkdir(parents=True, exist_ok=True)
+        estimate_stem = pathlib.Path(estimate_file).stem
+        out_filenames = DecomposedFilePaths(
+            true_target=str(destination_path / f"{estimate_stem}_true.wav"),
+            target_distortion=str(destination_path / f"{estimate_stem}_eTarget.wav"),
+            interference=str(destination_path / f"{estimate_stem}_eInterf.wav"),
+            artifacts=str(destination_path / f"{estimate_stem}_eArtif.wav")
+        )
+        sf.write(out_filenames.true_target, synthesized_true_target, int(sampling_frequency_hz))
+        sf.write(out_filenames.target_distortion, synthesized_target_distortion, int(sampling_frequency_hz))
+        sf.write(out_filenames.interference, synthesized_interference, int(sampling_frequency_hz))
+        sf.write(out_filenames.artifacts, synthesized_artifacts, int(sampling_frequency_hz))
+        return DecompositionResult(waveforms=waveforms, file_paths=out_filenames)
 
-
-def my_analysis_filter_bank(x: np.ndarray, fs: float, Mmod: np.ndarray = None):
-    """Temporary local alias for packaging isolation."""
-    from .gammatone import calculate_erb_bandwidth
-    MinCF = 20.0
-    MaxCF = fs / 2.0
-    base_freq = 1000.0
-    filters_per_ERB = 1.0
-
-    fsOrig = fs
-    if fs / 2.0 < 1.5 * MaxCF:
-        new_fs = int(round(1.5 * fs))
-        x = signal.resample(x, int(round(len(x) * new_fs / fs)))
-        fs = new_fs
-
-    analyzer = GammatoneAnalyzer(fs, MinCF, base_freq, MaxCF, filters_per_ERB)
-    analyzer.fsOrig = fsOrig
-
-    gfb_out = analyzer.process(x)
-    Nb = gfb_out.shape[0]
-
-    if Mmod is None:
-        time_steps = np.arange(gfb_out.shape[1])
-        cfs = analyzer.center_frequencies[:, np.newaxis]
-        Mmod = np.exp(-2j * np.pi / fs * cfs * time_steps)
-
-    gfb_out = gfb_out * Mmod
-
-    bw = calculate_erb_bandwidth(analyzer.center_frequencies)
-    alpha_dec = 2.0
-    Ndec = np.maximum(1, np.floor(fs / (bw * alpha_dec))).astype(int)
-
-    analyzer.Ndec = Ndec
-    analyzer.fs = fs
-    analyzer.bw = bw
-
-    gfb_out_dec = []
-    for k in range(Nb):
-        decimated = signal.resample_poly(gfb_out[k, :], 1, Ndec[k])
-        gfb_out_dec.append(decimated)
-
-    return gfb_out_dec, analyzer, Mmod
-
-
-def my_synthesis_filter_bank(xFB: list, analyzer: GammatoneAnalyzer):
-    """Temporary local alias for packaging isolation."""
-    Nb = len(xFB)
-    fs = analyzer.fs
-
-    max_len = max(len(xFB[k]) * analyzer.Ndec[k] for k in range(Nb))
-    gfb_out_proc = np.zeros((Nb, max_len), dtype=complex)
-    for k in range(Nb):
-        target_len = len(xFB[k]) * analyzer.Ndec[k]
-        upsampled = signal.resample_poly(xFB[k], analyzer.Ndec[k], 1)
-        if len(upsampled) > target_len:
-            upsampled = upsampled[:target_len]
-        elif len(upsampled) < target_len:
-            upsampled = np.pad(upsampled, (0, target_len - len(upsampled)), mode='constant')
-        gfb_out_proc[k, :target_len] = upsampled
-
-    time_steps = np.arange(max_len)
-    cfs = analyzer.center_frequencies[:, np.newaxis]
-    Mmod_synth = np.exp(2j * np.pi / fs * cfs * time_steps)
-
-    gfb_out_proc = gfb_out_proc * Mmod_synth
-
-    desired_delay_in_seconds = 1000.0 / fs
-    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_in_seconds)
-
-    # Corrected object-oriented process execution directly matching interface definitions:
-    output = synthesizer.process(gfb_out_proc)
-
-    fsOrig = analyzer.fsOrig
-    output = signal.resample(output, int(round(len(output) * fsOrig / fs)))
-    delay_samples = int(round(desired_delay_in_seconds * fsOrig))
-    output = output[delay_samples:]
-
-    return output, synthesizer
+    return DecompositionResult(waveforms=waveforms, file_paths=None)

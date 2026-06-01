@@ -1,0 +1,82 @@
+name: Release and Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # STAGE 1: Validate Tag (Runs first on a single, fast Linux instance)
+  # ---------------------------------------------------------------------------
+  validate-tag:
+    name: Validate Tag Branch
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Required to retrieve the full branch history for verification
+
+      # Aborts the entire workflow immediately if the tag is not in main's history
+      - name: Verify tag commit is merged into main branch
+        run: |
+          git fetch origin main:main
+          if ! git merge-base --is-ancestor ${{ github.ref_name }} main; then
+            echo "Error: Tag ${{ github.ref_name }} is not located in the 'main' branch history."
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # STAGE 2: Comprehensive Verification (Only runs if Stage 1 passes)
+  # TODO: drop python 3.9 support
+  # ---------------------------------------------------------------------------
+  comprehensive-verify:
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+
+  # ---------------------------------------------------------------------------
+  # STAGE 3: Deploy (Only runs if Stage 2 passes)
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to PyPI
+    needs: comprehensive-verify
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    permissions:
+      id-token: write  # Mandatory OIDC write permission
+      contents: read   # Access to checkout the code
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build package distribution (sdist and wheel)
+        run: |
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

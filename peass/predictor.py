@@ -1,131 +1,148 @@
 """
-PEASS Predictor Package - Multi-Criteria Neural Network Regressor [1]
+PEASS Predictor Package - Multi-Criteria Neural Network Regressor
 
-This module maps raw auditory similarity scores (qTarget, qInterf, qArtif, qGlobal)
-to Predicted Perceptual Scores (OPS, TPS, IPS, APS) on a scale from 0 to 100
-using modern .npz parameter loading [1].
+Maps raw auditory similarity scores to Predicted Perceptual Scores
+(OPS, TPS, IPS, APS) on a scale from 0 to 100.
 """
 
 import os
 import pathlib
-from typing import Any
-from typing import Dict
+from functools import lru_cache
+from typing import List
+from typing import Optional
 from typing import Union
 
 import numpy as np
 import soundfile as sf
 
-from .decomposition import extract_distortion_components
-from .metrics import audio_quality_features
-from .metrics import calculate_energy_ratios
+from .config import DecompositionConfiguration
+from .config import PerceptualSeparationScores
+from .decomposition import decompose_distortion_components
+from .metrics import calculate_auditory_quality_features
+from .metrics import calculate_bss_eval_energy_ratios
+
+MODEL_WEIGHTS_DIRECTORY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "parameters")
 
 
-def my_mapping(features: np.ndarray, weights: np.ndarray, bias: np.ndarray, output_weights: np.ndarray,
-               output_bias: np.ndarray) -> float:
+@lru_cache
+def _get_model_parameters(task_idx: int) -> dict:
+    parameters_path = os.path.join(MODEL_WEIGHTS_DIRECTORY, f"paramTask{task_idx + 1}.npz")
+    with np.load(parameters_path) as parameters_data:
+        return {
+            'w':     parameters_data['W'],  # hidden_layer_weights
+            'b':     parameters_data['b'],  # hidden_layer_bias
+            'v':     parameters_data['v'],  # output_layer_weights
+            'a':     parameters_data['a'],  # output_layer_bias
+            'selec': parameters_data['selec']
+        }
+
+
+def evaluate_neural_network_mapping(
+        features: np.ndarray,
+        w: np.ndarray,  # hidden_layer_weights
+        b: np.ndarray,  # hidden_layer_bias
+        v: np.ndarray,  # output_layer_weights
+        a: np.ndarray,  # output_layer_bias
+) -> float:
     """
     Evaluates forward propagation through the two-layer perceptron.
-    Replaces myMapping.m [1].
     """
     if len(features.shape) == 1:
         features = features[:, np.newaxis]
 
-    # Hidden layer
-    s1 = weights @ features + bias
-    o1 = 1.0 / (1.0 + np.exp(-s1))
+    hidden_layer_activation = w @ features + b
+    hidden_layer_output = 1.0 / (1.0 + np.exp(-hidden_layer_activation))
 
-    # Output layer
-    s2 = output_weights.T @ o1 + output_bias
-    y = 100.0 / (1.0 + np.exp(-s2))
+    output_layer_activation = v.T @ hidden_layer_output + a
+    final_score = 100.0 / (1.0 + np.exp(-output_layer_activation))
 
-    return float(y[0, 0])
+    return float(final_score.item())
 
 
-def predict_peass_scores(
-        original_files: list[Union[str, np.ndarray]],
+def predict_perceptual_evaluation_scores(
+        original_files: List[Union[str, np.ndarray]],
         estimate_file: Union[str, np.ndarray],
-        options: dict = None,
-        sampling_frequency: float = None,
+        configuration: Optional[DecompositionConfiguration] = None,
+        sampling_frequency_hz: Optional[float] = None,
         return_decomposition: bool = False
-) -> Dict[str, Any]:
+) -> PerceptualSeparationScores:
+    r"""
+    Performs least-squares decomposition, generates auditory features,
+    and predicts Perceptual Evaluation scores on a 0-100 scale.
     """
-    Wrapper entry point. Performs least-squares decomposition, generates auditory features,
-    and predicts Perceptual Evaluation scores [1].
+    if configuration is None:
+        configuration = DecompositionConfiguration()
 
-    Replaces PEASS_ObjectiveMeasure.m and map2SubjScale.m [1].
+    decomposition_result = decompose_distortion_components(
+        source_files=original_files,
+        estimate_file=estimate_file,
+        configuration=configuration,
+        sampling_frequency_hz=sampling_frequency_hz
+    )
+    waveforms = decomposition_result.waveforms
 
-    Args:
-        original_files: List of file paths or NumPy arrays of reference sources.
-        estimate_file: File path or NumPy array of the separated estimate.
-        options: Algorithmic tuning parameters dictionary.
-        sampling_frequency: Rate in Hz (required for in-memory array arrays).
-        return_decomposition: If True, returns the calculated waveform arrays/saved filepaths.
-
-    Returns:
-        dict: Containing OPS, TPS, IPS, APS and decibel criteria.
-              If return_decomposition=True, includes "decomposition_arrays" (and
-              "decomposition_files" if inputting file paths).
-    """
-    # 1. Physical Decomposition
-    file_paths, decomposed_arrays = extract_distortion_components(original_files, estimate_file, options,
-                                                                  sampling_frequency)
-    s_true, e_target, e_interf, e_artif = decomposed_arrays
-
-    if sampling_frequency is None:
+    if sampling_frequency_hz is None:
         if isinstance(estimate_file, (str, pathlib.Path)):
-            _, sampling_frequency = sf.read(estimate_file)
+            _, sampling_frequency_hz = sf.read(estimate_file)
         else:
-            sampling_frequency = 16000.0
+            sampling_frequency_hz = 16000.0
 
-    # 2. Traditional Energy Ratios
-    ISR, SIR, SAR, SDR = calculate_energy_ratios(s_true, e_target, e_interf, e_artif)
+    (
+        source_to_spatial_distortion_ratio,
+        source_to_interference_ratio,
+        source_to_artifacts_ratio,
+        source_to_distortion_ratio
+    ) = calculate_bss_eval_energy_ratios(
+        waveforms.true_target,
+        waveforms.target_distortion,
+        waveforms.interference,
+        waveforms.artifacts
+    )
 
-    # 3. Auditory Feature Extraction
-    q_target, q_interf, q_artif, q_global = audio_quality_features(decomposed_arrays, sampling_frequency)
+    decomposition_tuple = (
+        waveforms.true_target,
+        waveforms.target_distortion,
+        waveforms.interference,
+        waveforms.artifacts
+    )
+    q_target, q_interf, q_artif, q_global = calculate_auditory_quality_features(
+        decomposition_tuple, sampling_frequency_hz
+    )
 
-    # 4. Neural Network Scoring Regressions
-    q_features = np.array([q_global, q_target, q_interf, q_artif])
-    q_mapped = np.clip(np.log((1.0 + q_features) / (1.0 - q_features)), -5.5, 5.5)
+    auditory_quality_features = np.array([q_global, q_target, q_interf, q_artif])
+
+    # Protect against floating-point boundary violations before log-mapping
+    eps = np.finfo(float).eps
+    clamped_quality_features = np.clip(auditory_quality_features, -1.0 + eps, 1.0 - eps)
+    log_mapped_quality_features = np.clip(
+        np.log((1.0 + clamped_quality_features) / (1.0 - clamped_quality_features)),
+        -5.5,
+        5.5
+    )
 
     scores = np.zeros(4)
-    # Dynamically locate local parameters folder absolute path
-    pkg_dir = os.path.dirname(os.path.realpath(__file__))
 
-    for nTask in range(4):
-        npz_path = os.path.join(pkg_dir, "parameters", f"paramTask{nTask + 1}.npz")
-        mat_data = np.load(npz_path)
+    for task_idx in range(4):
+        params = _get_model_parameters(task_idx)
+        selected_features = log_mapped_quality_features[params['selec']]
 
-        W = mat_data['W']
-        b = mat_data['b']
-        v = mat_data['v']
-        a = mat_data['a']
-        selec = mat_data['selec']
+        # Filter out 'selec' and unpack the rest (w, b, v, a) as keyword arguments
+        model_weights = {k: v for k, v in params.items() if k != 'selec'}
+        scores[task_idx] = evaluate_neural_network_mapping(selected_features, **model_weights)
 
-        scores[nTask] = my_mapping(q_mapped[selec], W, b, v, a)
-
-    results = {
-        "OPS": float(scores[0]), # Overall Perceptual Score
-        "TPS": float(scores[1]), # Target-related Perceptual Score
-        "IPS": float(scores[2]), # Interference-related Perceptual Score
-        "APS": float(scores[3]), # Artifact-related Perceptual Score
-        "SDR": SDR,
-        "ISR": ISR,
-        "SIR": SIR,
-        "SAR": SAR
-    }
+    perceptual_scores = PerceptualSeparationScores(
+        overall_perceptual_score=float(scores[0]),
+        target_perceptual_score=float(scores[1]),
+        interference_perceptual_score=float(scores[2]),
+        artifact_perceptual_score=float(scores[3]),
+        source_to_distortion_ratio=source_to_distortion_ratio,
+        source_to_spatial_distortion_ratio=source_to_spatial_distortion_ratio,
+        source_to_interference_ratio=source_to_interference_ratio,
+        source_to_artifacts_ratio=source_to_artifacts_ratio
+    )
 
     if return_decomposition:
-        results["decomposition_arrays"] = {
-            "true_target":       s_true,
-            "target_distortion": e_target,
-            "interference":      e_interf,
-            "artifacts":         e_artif
-        }
-        if file_paths:
-            results["decomposition_files"] = {
-                "true_target":       file_paths[0],
-                "target_distortion": file_paths[1],
-                "interference":      file_paths[2],
-                "artifacts":         file_paths[3]
-            }
+        perceptual_scores.decomposition_waveforms = waveforms
+        perceptual_scores.decomposition_files = decomposition_result.file_paths
 
-    return results
+    return perceptual_scores

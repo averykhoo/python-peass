@@ -14,18 +14,14 @@ import scipy.signal as signal
 import soundfile as sf
 
 
-@pytest.fixture(scope="module")
-def synthetic_audio_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+@pytest.fixture(scope="module", params=[(16000.0, 2.0), (32000.0, 1.0)])
+def synthetic_audio_data(request) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Generates synthetic target, interferer, and estimate signals for DSP testing.
-
-    Target: 440 Hz Sine wave (representing clear speech)
-    Interferer: 1200 Hz Sine wave (representing background acoustic noise)
-    Estimate: Distorted version with lowpass-filtered target (spatial/filtering distortion),
-              remaining interference leakage, and additive white noise (artifacts).
+    Parameterized over (sampling_frequency, duration_seconds) to automatically
+    test all downstream consumer tests at different sample rates and lengths.
     """
-    sampling_frequency = 16000.0  # 16 kHz
-    duration_seconds = 2.0
+    sampling_frequency, duration_seconds = request.param
     num_samples = int(duration_seconds * sampling_frequency)
     time_steps = np.linspace(0.0, duration_seconds, num_samples, endpoint=False)
 
@@ -36,7 +32,6 @@ def synthetic_audio_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     interferer_waveform = np.sin(2.0 * np.pi * 1200.0 * time_steps)[:, np.newaxis]
 
     # 3. Simulate Target/Spatial Distortion by lowpassing the target
-    # Recreates a typical acoustic channel filtering alteration
     butterworth_b, butterworth_a = signal.butter(4, 800.0 / (sampling_frequency / 2.0), btype='low')
     target_distorted = signal.lfilter(butterworth_b, butterworth_a, target_waveform, axis=0)
 
@@ -44,7 +39,6 @@ def synthetic_audio_data() -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     artifact_noise = 0.01 * np.random.randn(num_samples, 1)
 
     # 5. Compile simulated Separation Estimate
-    # Recreates: s_estimate = s_distorted_target + e_interference + e_artifacts
     estimate_waveform = target_distorted + 0.15 * interferer_waveform + artifact_noise
 
     return target_waveform, interferer_waveform, estimate_waveform, sampling_frequency
