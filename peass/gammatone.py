@@ -66,28 +66,33 @@ try:
     ) -> np.ndarray:
         num_bands, num_samples = input_data.shape
         output_matrix = np.empty((num_bands, num_samples), dtype=numba.float64)
+
         for band_idx in range(num_bands):
             delay_value = int(sample_delays[band_idx])
 
-            # Complex multiplication and real part in a single JIT loop
+            # Complex multiplication real part variables
             phase_factor = phase_alignment_factors[band_idx]
             phase_real = phase_factor.real
             phase_imag = phase_factor.imag
 
-            phase_corrected = np.empty(num_samples, dtype=numba.float64)
-            for i in range(num_samples):
-                val = input_data[band_idx, i]
-                phase_corrected[i] = val.real * phase_real - val.imag * phase_imag
-
             if delay_value == 0:
-                output_matrix[band_idx, :] = phase_corrected
+                # Write directly to the output matrix, avoiding temporary allocations
+                for i in range(num_samples):
+                    val = input_data[band_idx, i]
+                    output_matrix[band_idx, i] = val.real * phase_real - val.imag * phase_imag
             else:
+                # Direct allocation for the combined queue shift
                 combined_signal = np.empty(delay_value + num_samples, dtype=numba.float64)
                 combined_signal[:delay_value] = state_memory[band_idx, :delay_value]
-                combined_signal[delay_value:] = phase_corrected
+
+                # Write phase-rotated values directly into the combined buffer
+                for i in range(num_samples):
+                    val = input_data[band_idx, i]
+                    combined_signal[delay_value + i] = val.real * phase_real - val.imag * phase_imag
 
                 state_memory[band_idx, :delay_value] = combined_signal[num_samples:]
                 output_matrix[band_idx, :] = combined_signal[:num_samples]
+
         return output_matrix
 
 
@@ -291,6 +296,7 @@ class GammatoneAnalyzer:
     def clear_state(self) -> None:
         self.clear_filterbank_states()
 
+
 # Caches to avoid redundant synthesis computations
 _DELAY_UNIT_CACHE = {}
 _MIXER_GAINS_CACHE = {}
@@ -332,7 +338,8 @@ def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples:
     return params
 
 
-def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay", optimization_iterations: int) -> np.ndarray:
+def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
+                    optimization_iterations: int) -> np.ndarray:
     """Helper to lazily optimize and cache synthesis mixer gains."""
     key = (
         analyzer.sampling_frequency_hz,
