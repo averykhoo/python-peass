@@ -446,6 +446,8 @@ def test_gammatone_fallback_vs_jit_equivalence():
     to run on the fallback path and produces identical outputs down to float precision.
     """
     import peass.gammatone as gammatone
+    if not gammatone._HAS_NUMBA:
+        pytest.skip("Numba is not installed or enabled in this environment.")
     from peass.gammatone import GammatoneAnalyzer
 
     # Generate a random signal

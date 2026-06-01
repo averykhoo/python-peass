@@ -7,6 +7,7 @@ and zero-copy arrays.
 """
 
 import pathlib
+from functools import lru_cache
 from typing import List
 from typing import Optional
 from typing import Tuple
@@ -354,19 +355,32 @@ def run_auditory_analysis_filterbank(
     return decimated_bands, analyzer, modulation_matrix
 
 
-_SYNTHESIS_MATRIX_CACHE = {}
+# -----------------------------------------------------------------------------
+# SYNTHESIS MODULATION MATRIX CACHE (Using functools.lru_cache)
+# -----------------------------------------------------------------------------
 
-
-def get_synthesis_modulation_matrix(sampling_frequency, max_samples_length, center_frequencies):
-    key = (sampling_frequency, max_samples_length, tuple(center_frequencies))
-    if key in _SYNTHESIS_MATRIX_CACHE:
-        return _SYNTHESIS_MATRIX_CACHE[key]
-    if len(_SYNTHESIS_MATRIX_CACHE) >= 16:
-        _SYNTHESIS_MATRIX_CACHE.clear()
+@lru_cache
+def _get_synthesis_modulation_matrix_cached(
+        sampling_frequency: float,
+        max_samples_length: int,
+        center_frequencies_tuple: tuple
+) -> np.ndarray:
+    center_frequencies = np.array(center_frequencies_tuple)
     time_steps = np.arange(max_samples_length)
-    matrix = np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
-    _SYNTHESIS_MATRIX_CACHE[key] = matrix
-    return matrix
+    return np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
+
+
+def get_synthesis_modulation_matrix(
+        sampling_frequency: float,
+        max_samples_length: int,
+        center_frequencies: np.ndarray
+) -> np.ndarray:
+    """Helper to lazily compute and cache the synthesis modulation matrix."""
+    return _get_synthesis_modulation_matrix_cached(
+        sampling_frequency,
+        max_samples_length,
+        tuple(center_frequencies)
+    )
 
 
 def run_auditory_synthesis_filterbank(

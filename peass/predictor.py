@@ -7,6 +7,7 @@ Maps raw auditory similarity scores to Predicted Perceptual Scores
 
 import os
 import pathlib
+from functools import lru_cache
 from typing import List
 from typing import Optional
 from typing import Union
@@ -20,26 +21,20 @@ from .decomposition import decompose_distortion_components
 from .metrics import calculate_auditory_quality_features
 from .metrics import calculate_bss_eval_energy_ratios
 
-# Dynamic, in-memory cache for pre-loaded parameters
-_MODEL_PARAMETERS_CACHE = {}
+MODEL_WEIGHTS_DIRECTORY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "parameters")
 
 
-def _get_model_parameters(package_directory: str, task_idx: int) -> dict:
-    """Helper to lazily load and cache model weights from disk exactly once."""
-    if task_idx in _MODEL_PARAMETERS_CACHE:
-        return _MODEL_PARAMETERS_CACHE[task_idx]
-
-    parameters_path = os.path.join(package_directory, "parameters", f"paramTask{task_idx + 1}.npz")
+@lru_cache
+def _get_model_parameters(task_idx: int) -> dict:
+    parameters_path = os.path.join(MODEL_WEIGHTS_DIRECTORY, f"paramTask{task_idx + 1}.npz")
     with np.load(parameters_path) as parameters_data:
-        params = {
+        return {
             'W':     parameters_data['W'],
             'b':     parameters_data['b'],
             'v':     parameters_data['v'],
             'a':     parameters_data['a'],
             'selec': parameters_data['selec']
         }
-    _MODEL_PARAMETERS_CACHE[task_idx] = params
-    return params
 
 
 def evaluate_neural_network_mapping(
@@ -126,11 +121,10 @@ def predict_perceptual_evaluation_scores(
     )
 
     scores = np.zeros(4)
-    package_directory = os.path.dirname(os.path.realpath(__file__))
 
     for task_idx in range(4):
         # Fetch pre-loaded parameters instantly from cache
-        parameters_data = _get_model_parameters(package_directory, task_idx)
+        parameters_data = _get_model_parameters(task_idx)
         W = parameters_data['W']
         b = parameters_data['b']
         v = parameters_data['v']

@@ -6,6 +6,7 @@ of frequency analysis, delay/phase alignment, and synthesis reconstruction.
 """
 
 import math
+from functools import lru_cache
 from typing import List
 
 import numpy as np
@@ -310,18 +311,31 @@ class GammatoneAnalyzer:
         self.clear_filterbank_states()
 
 
-# Caches to avoid redundant synthesis computations
-_DELAY_UNIT_CACHE = {}
-_MIXER_GAINS_CACHE = {}
+# -----------------------------------------------------------------------------
+# CACHED HELPER FUNCTIONS (Using functools.lru_cache with hashable primitives)
+# -----------------------------------------------------------------------------
 
+@lru_cache
+def _get_delay_unit_parameters_cached(
+        sampling_frequency_hz: float,
+        target_delay_samples: int,
+        center_frequencies_tuple: tuple
+) -> tuple:
+    # Recreate a lightweight local analyzer to perform the impulse response processing.
+    # This prevents mutating the state of the active filterbank and ensures cache stability
+    # across different physical instances with identical parameters.
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=sampling_frequency_hz,
+        lower_cutoff_frequency_hz=center_frequencies_tuple[0],
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=center_frequencies_tuple[-1],
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+    # Force exact match of center frequencies to avoid floating-point tolerances
+    analyzer.center_frequencies = np.array(center_frequencies_tuple)
+    for i, freq in enumerate(center_frequencies_tuple):
+        analyzer.filters[i].center_frequency_hz = freq
 
-def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples: int) -> tuple:
-    """Helper to lazily compute and cache impulse response delays and phase factors."""
-    key = (analyzer.sampling_frequency_hz, target_delay_samples, tuple(analyzer.center_frequencies))
-    if key in _DELAY_UNIT_CACHE:
-        return _DELAY_UNIT_CACHE[key]
-
-    analyzer.clear_filterbank_states()
     impulse_signal = np.zeros(target_delay_samples + 2)
     impulse_signal[0] = 1.0
 
@@ -342,31 +356,37 @@ def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples:
     frequency_slopes = frequency_slopes / (np.abs(frequency_slopes) + np.finfo(float).eps)
     phase_alignment_factors = 1j / frequency_slopes
 
-    params = (sample_delays, phase_alignment_factors)
-
-    # Bounded cache clear
-    if len(_DELAY_UNIT_CACHE) >= 16:
-        _DELAY_UNIT_CACHE.clear()
-    _DELAY_UNIT_CACHE[key] = params
-    return params
+    return sample_delays, phase_alignment_factors
 
 
-def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
-                    optimization_iterations: int) -> np.ndarray:
-    """Helper to lazily optimize and cache synthesis mixer gains."""
-    key = (
+def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples: int) -> tuple:
+    """Helper to lazily compute and cache impulse response delays and phase factors."""
+    return _get_delay_unit_parameters_cached(
         analyzer.sampling_frequency_hz,
-        tuple(analyzer.center_frequencies),
-        tuple(delay_unit.sample_delays),
-        tuple(delay_unit.phase_alignment_factors),
-        optimization_iterations
+        target_delay_samples,
+        tuple(analyzer.center_frequencies)
     )
-    if key in _MIXER_GAINS_CACHE:
-        return _MIXER_GAINS_CACHE[key]
 
-    center_frequencies = analyzer.center_frequencies
+
+@lru_cache
+def _get_mixer_gains_cached(
+        sampling_rate: float,
+        center_frequencies_tuple: tuple,
+        sample_delays_tuple: tuple,
+        phase_alignment_factors_tuple: tuple,
+        optimization_iterations: int
+) -> np.ndarray:
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=sampling_rate,
+        lower_cutoff_frequency_hz=center_frequencies_tuple[0],
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=center_frequencies_tuple[-1],
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+    analyzer.center_frequencies = np.array(center_frequencies_tuple)
+
+    center_frequencies = np.array(center_frequencies_tuple)
     num_bands = len(center_frequencies)
-    sampling_rate = analyzer.sampling_frequency_hz
 
     z_center = np.exp(2j * np.pi * center_frequencies / sampling_rate)
     synthesis_gains = np.ones(num_bands)
@@ -377,13 +397,13 @@ def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
     for band_idx in range(num_bands):
         positive_response[:, band_idx] = (
                 positive_response[:, band_idx] *
-                delay_unit.phase_alignment_factors[band_idx] *
-                (z_center ** -delay_unit.sample_delays[band_idx])
+                phase_alignment_factors_tuple[band_idx] *
+                (z_center ** -sample_delays_tuple[band_idx])
         )
         negative_response[:, band_idx] = (
                 negative_response[:, band_idx] *
-                delay_unit.phase_alignment_factors[band_idx] *
-                (np.conj(z_center) ** -delay_unit.sample_delays[band_idx])
+                phase_alignment_factors_tuple[band_idx] *
+                (np.conj(z_center) ** -sample_delays_tuple[band_idx])
         )
 
     combined_frequency_response = (positive_response + np.conj(negative_response)) / 2.0
@@ -392,11 +412,19 @@ def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
         composite_spectrum = combined_frequency_response @ synthesis_gains
         synthesis_gains = synthesis_gains / (np.abs(composite_spectrum) + np.finfo(float).eps)
 
-    # Bounded cache clear
-    if len(_MIXER_GAINS_CACHE) >= 16:
-        _MIXER_GAINS_CACHE.clear()
-    _MIXER_GAINS_CACHE[key] = synthesis_gains
     return synthesis_gains
+
+
+def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
+                    optimization_iterations: int) -> np.ndarray:
+    """Helper to lazily optimize and cache synthesis mixer gains."""
+    return _get_mixer_gains_cached(
+        analyzer.sampling_frequency_hz,
+        tuple(analyzer.center_frequencies),
+        tuple(delay_unit.sample_delays),
+        tuple(delay_unit.phase_alignment_factors),
+        optimization_iterations
+    )
 
 
 class GammatoneDelay:
@@ -490,15 +518,8 @@ class GammatoneSynthesizer:
         return self.mixer_unit.process(delayed_signal)
 
 
-_RESAMPLE_FILTER_CACHE = {}
-
-
+@lru_cache(maxsize=256)
 def get_resample_filter(up: int, down: int) -> tuple:
-    key = (up, down)
-    if key in _RESAMPLE_FILTER_CACHE:
-        return _RESAMPLE_FILTER_CACHE[key]
-
-    import math
     g = math.gcd(up, down)
     up_reduced = up // g
     down_reduced = down // g
@@ -523,7 +544,6 @@ def get_resample_filter(up: int, down: int) -> tuple:
     # 3. Calculate cropping offset
     n_pre_remove = (half_len + n_pre_pad) // down_reduced
 
-    _RESAMPLE_FILTER_CACHE[key] = (h_padded, up_reduced, down_reduced, n_pre_remove)
     return h_padded, up_reduced, down_reduced, n_pre_remove
 
 

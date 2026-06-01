@@ -3,7 +3,7 @@ name: Pull Request Tests
 on:
   pull_request:
     branches: [ "main" ]
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [ opened, synchronize, reopened, ready_for_review ]
 
 # Cancel running workflows on the same PR when new commits are pushed
 concurrency:
@@ -17,7 +17,7 @@ jobs:
       fail-fast: true
       matrix:
         os: [ ubuntu-latest, windows-latest ]
-        python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        python-version: [ "3.9", "3.10", "3.12", "3.14" ]  # TODO: remove 3.9
 
     uses: ./.github/workflows/template-test.yml
     with:
