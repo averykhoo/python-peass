@@ -239,6 +239,15 @@ class GammatoneAnalyzer:
             bandwidth_factor: float = 1.0
     ):
         self._sampling_frequency_hz: float = sampling_frequency_hz
+
+        # Save instantiation parameters as instance attributes to prevent re-instantiation mismatches
+        self.lower_cutoff_frequency_hz: float = lower_cutoff_frequency_hz
+        self.specified_center_frequency_hz: float = specified_center_frequency_hz
+        self.upper_cutoff_frequency_hz: float = upper_cutoff_frequency_hz
+        self.filters_per_equivalent_rectangular_bandwidth: float = filters_per_equivalent_rectangular_bandwidth
+        self.filter_order: int = filter_order
+        self.bandwidth_factor: float = bandwidth_factor
+
         self.center_frequencies: np.ndarray = get_equivalent_rectangular_bandwidth_center_frequencies(
             filters_per_equivalent_rectangular_bandwidth,
             lower_cutoff_frequency_hz,
@@ -318,18 +327,24 @@ class GammatoneAnalyzer:
 @lru_cache
 def _get_delay_unit_parameters_cached(
         sampling_frequency_hz: float,
+        lower_cutoff_frequency_hz: float,
+        specified_center_frequency_hz: float,
+        upper_cutoff_frequency_hz: float,
+        filters_per_equivalent_rectangular_bandwidth: float,
+        filter_order: int,
+        bandwidth_factor: float,
         target_delay_samples: int,
         center_frequencies_tuple: tuple
 ) -> tuple:
-    # Recreate a lightweight local analyzer to perform the impulse response processing.
-    # This prevents mutating the state of the active filterbank and ensures cache stability
-    # across different physical instances with identical parameters.
+    # Reconstruct the analyzer with identical parameter signatures
     analyzer = GammatoneAnalyzer(
         sampling_frequency_hz=sampling_frequency_hz,
-        lower_cutoff_frequency_hz=center_frequencies_tuple[0],
-        specified_center_frequency_hz=1000.0,
-        upper_cutoff_frequency_hz=center_frequencies_tuple[-1],
-        filters_per_equivalent_rectangular_bandwidth=1.0
+        lower_cutoff_frequency_hz=lower_cutoff_frequency_hz,
+        specified_center_frequency_hz=specified_center_frequency_hz,
+        upper_cutoff_frequency_hz=upper_cutoff_frequency_hz,
+        filters_per_equivalent_rectangular_bandwidth=filters_per_equivalent_rectangular_bandwidth,
+        filter_order=filter_order,
+        bandwidth_factor=bandwidth_factor
     )
     # Force exact match of center frequencies to avoid floating-point tolerances
     analyzer.center_frequencies = np.array(center_frequencies_tuple)
@@ -363,6 +378,12 @@ def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples:
     """Helper to lazily compute and cache impulse response delays and phase factors."""
     return _get_delay_unit_parameters_cached(
         analyzer.sampling_frequency_hz,
+        analyzer.lower_cutoff_frequency_hz,
+        analyzer.specified_center_frequency_hz,
+        analyzer.upper_cutoff_frequency_hz,
+        analyzer.filters_per_equivalent_rectangular_bandwidth,
+        analyzer.filter_order,
+        analyzer.bandwidth_factor,
         target_delay_samples,
         tuple(analyzer.center_frequencies)
     )
@@ -371,17 +392,26 @@ def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples:
 @lru_cache
 def _get_mixer_gains_cached(
         sampling_rate: float,
+        lower_cutoff_frequency_hz: float,
+        specified_center_frequency_hz: float,
+        upper_cutoff_frequency_hz: float,
+        filters_per_equivalent_rectangular_bandwidth: float,
+        filter_order: int,
+        bandwidth_factor: float,
         center_frequencies_tuple: tuple,
         sample_delays_tuple: tuple,
         phase_alignment_factors_tuple: tuple,
         optimization_iterations: int
 ) -> np.ndarray:
+    # Reconstruct the analyzer with identical parameter signatures
     analyzer = GammatoneAnalyzer(
         sampling_frequency_hz=sampling_rate,
-        lower_cutoff_frequency_hz=center_frequencies_tuple[0],
-        specified_center_frequency_hz=1000.0,
-        upper_cutoff_frequency_hz=center_frequencies_tuple[-1],
-        filters_per_equivalent_rectangular_bandwidth=1.0
+        lower_cutoff_frequency_hz=lower_cutoff_frequency_hz,
+        specified_center_frequency_hz=specified_center_frequency_hz,
+        upper_cutoff_frequency_hz=upper_cutoff_frequency_hz,
+        filters_per_equivalent_rectangular_bandwidth=filters_per_equivalent_rectangular_bandwidth,
+        filter_order=filter_order,
+        bandwidth_factor=bandwidth_factor
     )
     analyzer.center_frequencies = np.array(center_frequencies_tuple)
 
@@ -420,6 +450,12 @@ def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay",
     """Helper to lazily optimize and cache synthesis mixer gains."""
     return _get_mixer_gains_cached(
         analyzer.sampling_frequency_hz,
+        analyzer.lower_cutoff_frequency_hz,
+        analyzer.specified_center_frequency_hz,
+        analyzer.upper_cutoff_frequency_hz,
+        analyzer.filters_per_equivalent_rectangular_bandwidth,
+        analyzer.filter_order,
+        analyzer.bandwidth_factor,
         tuple(analyzer.center_frequencies),
         tuple(delay_unit.sample_delays),
         tuple(delay_unit.phase_alignment_factors),
