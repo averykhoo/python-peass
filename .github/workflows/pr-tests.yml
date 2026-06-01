@@ -5,10 +5,10 @@ on:
     branches: [ "main" ]
     types: [opened, synchronize, reopened, ready_for_review]
 
-## Automatically cancels the active branch push test in favor of the PR test
-#concurrency:
-#  group: peass-test-${{ github.head_ref || github.ref_name }}
-#  cancel-in-progress: false
+# Cancel running workflows on the same PR when new commits are pushed
+concurrency:
+  group: pr-test-${{ github.workflow }}-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
   validate:
