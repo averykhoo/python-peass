@@ -54,7 +54,7 @@ def perform_least_squares_projection(
         shape = (num_samples, filter_length)
         strides = (source_signal.strides[0], source_signal.strides[0])
 
-        view = np.lib.stride_tricks.as_strided(source_signal, shape=shape, strides=strides)
+        view = np.lib.stride_tricks.as_strided(source_signal, shape=shape, strides=strides, writeable=False)
         # Reverse each row to match toeplitz(col, row) semantics perfectly
         strided_views.append(view[:, ::-1])
 
