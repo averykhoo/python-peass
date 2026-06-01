@@ -109,13 +109,12 @@ def predict_perceptual_evaluation_scores(
 
     for task_idx in range(4):
         parameters_path = os.path.join(package_directory, "parameters", f"paramTask{task_idx + 1}.npz")
-        parameters_data = np.load(parameters_path)
-
-        W = parameters_data['W']
-        b = parameters_data['b']
-        v = parameters_data['v']
-        a = parameters_data['a']
-        selected_feature_indices = parameters_data['selec']
+        with np.load(parameters_path) as parameters_data:
+            W = parameters_data['W']
+            b = parameters_data['b']
+            v = parameters_data['v']
+            a = parameters_data['a']
+            selected_feature_indices = parameters_data['selec']
 
         scores[task_idx] = evaluate_neural_network_mapping(
             log_mapped_quality_features[selected_feature_indices], W, b, v, a
