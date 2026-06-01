@@ -438,3 +438,44 @@ def test_regression_against_matlab_references():
             else:
                 corr = np.corrcoef(py_val[:, ch], mat_val[:, ch])[0, 1]
                 assert corr > 0.95, f"Correlation too low for {name} channel {ch}: {corr:.4f}"
+
+
+def test_gammatone_fallback_vs_jit_equivalence():
+    """
+    Verifies that disabling Numba JIT acceleration forces the filterbank
+    to run on the fallback path and produces identical outputs down to float precision.
+    """
+    import peass.gammatone as gammatone
+    from peass.gammatone import GammatoneAnalyzer
+
+    # Generate a random signal
+    rng = np.random.default_rng(seed=123)
+    signal_input = rng.normal(0.0, 0.5, 1000)
+    fs = 16000.0
+
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=fs,
+        lower_cutoff_frequency_hz=80.0,
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=4000.0,
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+
+    # 1. Run with JIT active
+    original_has_numba = gammatone._HAS_NUMBA
+    try:
+        gammatone._HAS_NUMBA = True
+        analyzer.clear_state()
+        jit_output = analyzer.process(signal_input)
+
+        # 2. Force fallback path by mocking _HAS_NUMBA as False
+        gammatone._HAS_NUMBA = False
+        analyzer.clear_state()
+        fallback_output = analyzer.process(signal_input)
+
+        # Assert mathematical parity down to machine precision
+        np.testing.assert_allclose(jit_output, fallback_output, rtol=1e-12, atol=1e-12)
+        
+    finally:
+        # Restore original setting
+        gammatone._HAS_NUMBA = original_has_numba
