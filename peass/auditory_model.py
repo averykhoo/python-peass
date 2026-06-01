@@ -142,15 +142,11 @@ try:
             stage_thresholds[stage_idx] = current_threshold
             stage_gains[stage_idx] = math.exp(-math.pi * adaptation_bandwidths[stage_idx] / sampling_frequency_hz)
 
-        for band_idx in range(num_bands):
-            # --- SYSTEM BENCHMARK: OLD METHOD ---
-            # adaptation_factors = stage_thresholds.copy()
-
-            # --- SYSTEM BENCHMARK: NEW METHOD (Allocation-free array initialization) ---
-            adaptation_factors = np.empty_like(stage_thresholds)
-            for stage_idx in range(5):
-                adaptation_factors[stage_idx] = stage_thresholds[stage_idx]
-
+    adaptation_factors = np.empty_like(stage_thresholds)
+    for band_idx in range(num_bands):
+        # --- SYSTEM BENCHMARK: NEW METHOD (Allocation-free array initialization) ---
+        for stage_idx in range(5):
+            adaptation_factors[stage_idx] = stage_thresholds[stage_idx]
             for sample_idx in range(num_samples):
                 current_value = subband_signals[band_idx, sample_idx]
                 if current_value < absolute_hearing_threshold:
