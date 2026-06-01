@@ -291,6 +291,93 @@ class GammatoneAnalyzer:
     def clear_state(self) -> None:
         self.clear_filterbank_states()
 
+# Caches to avoid redundant synthesis computations
+_DELAY_UNIT_CACHE = {}
+_MIXER_GAINS_CACHE = {}
+
+
+def get_delay_unit_parameters(analyzer: GammatoneAnalyzer, target_delay_samples: int) -> tuple:
+    """Helper to lazily compute and cache impulse response delays and phase factors."""
+    key = (analyzer.sampling_frequency_hz, target_delay_samples, tuple(analyzer.center_frequencies))
+    if key in _DELAY_UNIT_CACHE:
+        return _DELAY_UNIT_CACHE[key]
+
+    analyzer.clear_filterbank_states()
+    impulse_signal = np.zeros(target_delay_samples + 2)
+    impulse_signal[0] = 1.0
+
+    impulse_response = analyzer.process(impulse_signal)
+    num_bands = impulse_response.shape[0]
+
+    slice_duration = np.abs(impulse_response[:, :target_delay_samples + 1])
+    max_amplitude_indices = np.argmax(slice_duration, axis=1)
+
+    sample_delays = target_delay_samples - max_amplitude_indices
+    frequency_slopes = np.zeros(num_bands, dtype=complex)
+    for band_idx in range(num_bands):
+        max_idx = max_amplitude_indices[band_idx]
+        prev_val = impulse_response[band_idx, max_idx - 1] if max_idx > 0 else 0.0j
+        next_val = impulse_response[band_idx, max_idx + 1] if max_idx + 1 < impulse_response.shape[1] else 0.0j
+        frequency_slopes[band_idx] = next_val - prev_val
+
+    frequency_slopes = frequency_slopes / (np.abs(frequency_slopes) + np.finfo(float).eps)
+    phase_alignment_factors = 1j / frequency_slopes
+
+    params = (sample_delays, phase_alignment_factors)
+
+    # Bounded cache clear
+    if len(_DELAY_UNIT_CACHE) >= 16:
+        _DELAY_UNIT_CACHE.clear()
+    _DELAY_UNIT_CACHE[key] = params
+    return params
+
+
+def get_mixer_gains(analyzer: GammatoneAnalyzer, delay_unit: "GammatoneDelay", optimization_iterations: int) -> np.ndarray:
+    """Helper to lazily optimize and cache synthesis mixer gains."""
+    key = (
+        analyzer.sampling_frequency_hz,
+        tuple(analyzer.center_frequencies),
+        tuple(delay_unit.sample_delays),
+        tuple(delay_unit.phase_alignment_factors),
+        optimization_iterations
+    )
+    if key in _MIXER_GAINS_CACHE:
+        return _MIXER_GAINS_CACHE[key]
+
+    center_frequencies = analyzer.center_frequencies
+    num_bands = len(center_frequencies)
+    sampling_rate = analyzer.sampling_frequency_hz
+
+    z_center = np.exp(2j * np.pi * center_frequencies / sampling_rate)
+    synthesis_gains = np.ones(num_bands)
+
+    positive_response = analyzer.get_z_plane_frequency_response(z_center)
+    negative_response = analyzer.get_z_plane_frequency_response(np.conj(z_center))
+
+    for band_idx in range(num_bands):
+        positive_response[:, band_idx] = (
+                positive_response[:, band_idx] *
+                delay_unit.phase_alignment_factors[band_idx] *
+                (z_center ** -delay_unit.sample_delays[band_idx])
+        )
+        negative_response[:, band_idx] = (
+                negative_response[:, band_idx] *
+                delay_unit.phase_alignment_factors[band_idx] *
+                (np.conj(z_center) ** -delay_unit.sample_delays[band_idx])
+        )
+
+    combined_frequency_response = (positive_response + np.conj(negative_response)) / 2.0
+
+    for _ in range(optimization_iterations):
+        composite_spectrum = combined_frequency_response @ synthesis_gains
+        synthesis_gains = synthesis_gains / (np.abs(composite_spectrum) + np.finfo(float).eps)
+
+    # Bounded cache clear
+    if len(_MIXER_GAINS_CACHE) >= 16:
+        _MIXER_GAINS_CACHE.clear()
+    _MIXER_GAINS_CACHE[key] = synthesis_gains
+    return synthesis_gains
+
 
 class GammatoneDelay:
     """
@@ -298,28 +385,14 @@ class GammatoneDelay:
     """
 
     def __init__(self, analyzer: GammatoneAnalyzer, target_delay_samples: int):
-        analyzer.clear_filterbank_states()
-        impulse_signal = np.zeros(target_delay_samples + 2)
-        impulse_signal[0] = 1.0
+        # Fetch pre-calculated delay parameters instantly from cache
+        sample_delays, phase_alignment_factors = get_delay_unit_parameters(
+            analyzer, target_delay_samples
+        )
 
-        impulse_response = analyzer.process(impulse_signal)
-        num_bands = impulse_response.shape[0]
-
-        slice_duration = np.abs(impulse_response[:, :target_delay_samples + 1])
-        max_amplitude_indices = np.argmax(slice_duration, axis=1)
-
-        self.sample_delays: np.ndarray = target_delay_samples - max_amplitude_indices
-        frequency_slopes = np.zeros(num_bands, dtype=complex)
-        for band_idx in range(num_bands):
-            max_idx = max_amplitude_indices[band_idx]
-            # Respect causality (t < 0 is zero) and prevent index wrap-around to -1
-            prev_val = impulse_response[band_idx, max_idx - 1] if max_idx > 0 else 0.0j
-            # Guard against max_idx + 1 exceeding array bounds
-            next_val = impulse_response[band_idx, max_idx + 1] if max_idx + 1 < impulse_response.shape[1] else 0.0j
-            frequency_slopes[band_idx] = next_val - prev_val
-
-        frequency_slopes = frequency_slopes / (np.abs(frequency_slopes) + np.finfo(float).eps)
-        self.phase_alignment_factors: np.ndarray = 1j / frequency_slopes
+        self.sample_delays: np.ndarray = sample_delays
+        self.phase_alignment_factors: np.ndarray = phase_alignment_factors
+        num_bands = len(sample_delays)
         self.state_memory: np.ndarray = np.zeros((num_bands, int(np.max(self.sample_delays))), dtype=float)
 
     @property
@@ -364,33 +437,8 @@ class GammatoneMixer:
     """
 
     def __init__(self, analyzer: GammatoneAnalyzer, delay_unit: GammatoneDelay, optimization_iterations: int = 100):
-        center_frequencies = analyzer.center_frequencies
-        num_bands = len(center_frequencies)
-        sampling_rate = analyzer.sampling_frequency_hz
-
-        z_center = np.exp(2j * np.pi * center_frequencies / sampling_rate)
-        self.synthesis_gains: np.ndarray = np.ones(num_bands)
-
-        positive_response = analyzer.get_z_plane_frequency_response(z_center)
-        negative_response = analyzer.get_z_plane_frequency_response(np.conj(z_center))
-
-        for band_idx in range(num_bands):
-            positive_response[:, band_idx] = (
-                    positive_response[:, band_idx] *
-                    delay_unit.phase_alignment_factors[band_idx] *
-                    (z_center ** -delay_unit.sample_delays[band_idx])
-            )
-            negative_response[:, band_idx] = (
-                    negative_response[:, band_idx] *
-                    delay_unit.phase_alignment_factors[band_idx] *
-                    (np.conj(z_center) ** -delay_unit.sample_delays[band_idx])
-            )
-
-        combined_frequency_response = (positive_response + np.conj(negative_response)) / 2.0
-
-        for _ in range(optimization_iterations):
-            composite_spectrum = combined_frequency_response @ self.synthesis_gains
-            self.synthesis_gains = self.synthesis_gains / (np.abs(composite_spectrum) + np.finfo(float).eps)
+        # Fetch pre-calculated synthesis gains instantly from cache
+        self.synthesis_gains: np.ndarray = get_mixer_gains(analyzer, delay_unit, optimization_iterations)
 
     @property
     def gains(self) -> np.ndarray:

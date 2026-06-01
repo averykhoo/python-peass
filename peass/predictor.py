@@ -20,6 +20,27 @@ from .decomposition import decompose_distortion_components
 from .metrics import calculate_auditory_quality_features
 from .metrics import calculate_bss_eval_energy_ratios
 
+# Dynamic, in-memory cache for pre-loaded parameters
+_MODEL_PARAMETERS_CACHE = {}
+
+
+def _get_model_parameters(package_directory: str, task_idx: int) -> dict:
+    """Helper to lazily load and cache model weights from disk exactly once."""
+    if task_idx in _MODEL_PARAMETERS_CACHE:
+        return _MODEL_PARAMETERS_CACHE[task_idx]
+
+    parameters_path = os.path.join(package_directory, "parameters", f"paramTask{task_idx + 1}.npz")
+    with np.load(parameters_path) as parameters_data:
+        params = {
+            'W':     parameters_data['W'],
+            'b':     parameters_data['b'],
+            'v':     parameters_data['v'],
+            'a':     parameters_data['a'],
+            'selec': parameters_data['selec']
+        }
+    _MODEL_PARAMETERS_CACHE[task_idx] = params
+    return params
+
 
 def evaluate_neural_network_mapping(
         features: np.ndarray,
@@ -108,13 +129,13 @@ def predict_perceptual_evaluation_scores(
     package_directory = os.path.dirname(os.path.realpath(__file__))
 
     for task_idx in range(4):
-        parameters_path = os.path.join(package_directory, "parameters", f"paramTask{task_idx + 1}.npz")
-        with np.load(parameters_path) as parameters_data:
-            W = parameters_data['W']
-            b = parameters_data['b']
-            v = parameters_data['v']
-            a = parameters_data['a']
-            selected_feature_indices = parameters_data['selec']
+        # Fetch pre-loaded parameters instantly from cache
+        parameters_data = _get_model_parameters(package_directory, task_idx)
+        W = parameters_data['W']
+        b = parameters_data['b']
+        v = parameters_data['v']
+        a = parameters_data['a']
+        selected_feature_indices = parameters_data['selec']
 
         scores[task_idx] = evaluate_neural_network_mapping(
             log_mapped_quality_features[selected_feature_indices], W, b, v, a
