@@ -672,6 +672,7 @@ def decompose_distortion_components(
 
     if is_file_mode:
         destination_path = pathlib.Path(configuration.destination_directory)
+        destination_path.mkdir(parents=True, exist_ok=True)
         estimate_stem = pathlib.Path(estimate_file).stem
         out_filenames = DecomposedFilePaths(
             true_target=str(destination_path / f"{estimate_stem}_true.wav"),
