@@ -41,18 +41,22 @@ try:
                 s2 = states[band_idx, 2]
                 s3 = states[band_idx, 3]
 
-                # 4th-order cascaded state update (fully unrolled)
-                s0 = s0 * coef + val * norm
-                s1 = s1 * coef + s0
-                s2 = s2 * coef + s1
-                s3 = s3 * coef + s2
+                # 4th-order cascaded state update (fully unrolled matching SciPy lfilter)
+                y0 = val * norm + s0
+                s0 = y0 * coef
+                y1 = y0 + s1
+                s1 = y1 * coef
+                y2 = y1 + s2
+                s2 = y2 * coef
+                y3 = y2 + s3
+                s3 = y3 * coef
 
                 states[band_idx, 0] = s0
                 states[band_idx, 1] = s1
                 states[band_idx, 2] = s2
                 states[band_idx, 3] = s3
 
-                output[band_idx, sample_idx] = s3
+                output[band_idx, sample_idx] = y3
 
         return output
 
