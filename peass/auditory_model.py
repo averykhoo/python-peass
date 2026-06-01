@@ -360,4 +360,5 @@ def generate_auditory_internal_representation(
         internal_representation[:, :, channels_above_10_hz]
     )
 
-    return internal_representation, sampling_frequency_hz
+    # Cast to real float64 since all imaginary parts have been discarded
+    return np.real(internal_representation), sampling_frequency_hz
