@@ -394,7 +394,7 @@ def decompose_distortion_components(
 
     if not source_files:
         raise ValueError("source_files list cannot be empty.")
-    """
+    
     if configuration is None:
         configuration = DecompositionConfiguration()
 
