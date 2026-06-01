@@ -51,17 +51,13 @@ try:
 
         haircell_factor = 1.0 - haircell_filter_gain
 
-        for band_idx in range(num_bands):
-            last_haircell_state = 0.0
+    adaptation_factors = np.empty_like(stage_thresholds)
+    for band_idx in range(num_bands):
+        last_haircell_state = 0.0
 
-            # --- SYSTEM BENCHMARK: OLD METHOD ---
-            # adaptation_factors = stage_thresholds.copy()
-
-            # --- SYSTEM BENCHMARK: NEW METHOD (Allocation-free array initialization) ---
-            adaptation_factors = np.empty_like(stage_thresholds)
-            for stage_idx in range(5):
-                adaptation_factors[stage_idx] = stage_thresholds[stage_idx]
-
+        # --- SYSTEM BENCHMARK: NEW METHOD (Allocation-free array initialization) ---
+        for stage_idx in range(5):
+            adaptation_factors[stage_idx] = stage_thresholds[stage_idx]
             for sample_idx in range(num_samples):
                 # 1. Half-wave rectification
                 current_value = subband_signals[band_idx, sample_idx]
