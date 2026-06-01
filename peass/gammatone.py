@@ -517,7 +517,7 @@ def get_resample_filter(up: int, down: int) -> tuple:
     h *= up_reduced
 
     # 2. Perfect replication of SciPy's zero-phase centering padding
-    n_pre_pad = (down_reduced - half_len % down_reduced)
+    n_pre_pad = (down_reduced - half_len % down_reduced) % down_reduced
     h_padded = np.pad(h, (n_pre_pad, 0))
 
     # 3. Calculate cropping offset
