@@ -39,7 +39,7 @@ def validate_and_normalize_audio(
     Enforces:
     - Standard 2D shape (samples, channels).
     - Maximum of 32 channels.
-    - Minimum duration of 2048 samples to safely satisfy the boundary shading
+    - Minimum duration of 50ms to safely satisfy the boundary shading
       windows and subband frame decimation limits.
     """
     # Force at least 2D array representation
@@ -59,12 +59,13 @@ def validate_and_normalize_audio(
             f"If your signal is (channels, samples), please transpose your input array."
         )
 
-    # 2. Enforce minimum duration (2048 samples)
-    MIN_SAMPLES = 1000  # reduced to 1000 because we have a test case with 1010 samples
-    if num_samples < MIN_SAMPLES:
+    # Dynamically enforce a minimum physical duration of 50 ms
+    min_duration_ms = 50
+    min_samples = int(min_duration_ms * sampling_frequency_hz / 1000)
+    if num_samples < min_samples:
         raise ValueError(
             f"Signal duration for '{name}' is too short ({num_samples} samples). "
-            f"PEASS requires a minimum of {MIN_SAMPLES} samples to perform "
+            f"PEASS requires a minimum of {min_samples} samples to perform "
             f"the subband least-squares and overlap-add decomposition safely."
         )
 
@@ -481,9 +482,6 @@ def decompose_distortion_components(
                 source_array, sampling_frequency_hz, name=f"source_files[{idx}]"
             )
             source_data_list.append(data)
-
-        if sampling_frequency_hz is None:
-            raise ValueError("In-memory mode requires explicit sampling rate 'sampling_frequency_hz'.")
 
     number_of_sources = len(source_data_list)
     original_samples_length = estimate_audio_data.shape[0]
