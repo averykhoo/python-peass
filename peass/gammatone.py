@@ -528,7 +528,7 @@ def get_resample_filter(up: int, down: int) -> tuple:
 
 
 def fast_resample_poly(x: np.ndarray, up: int, down: int, axis: int = -1) -> np.ndarray:
-    if up == 1 and down == 1:
+    if up == down:
         return x.copy()
 
     h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down)
