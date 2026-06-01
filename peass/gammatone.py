@@ -267,7 +267,7 @@ class GammatoneAnalyzer:
     def process(self, input_signal: np.ndarray) -> np.ndarray:
         num_bands = len(self.filters)
 
-        if _HAS_NUMBA and self.filters[0].filter_order == 4:
+        if _HAS_NUMBA and self.filters and self.filters[0].filter_order == 4:
             # Vectorized JIT path: Process all bands simultaneously
             coeffs = np.array([f.complex_filter_coefficient for f in self.filters], dtype=complex)
             norms = np.array([f.normalization_factor for f in self.filters], dtype=float)
