@@ -3,6 +3,7 @@ name: Pull Request Tests
 on:
   pull_request:
     branches: [ "main" ]
+    types: [opened, synchronize, reopened, ready_for_review]
 
 ## Automatically cancels the active branch push test in favor of the PR test
 #concurrency:
@@ -11,6 +12,7 @@ on:
 
 jobs:
   validate:
+    if: github.event.pull_request.draft == false
     strategy:
       fail-fast: true
       matrix:
