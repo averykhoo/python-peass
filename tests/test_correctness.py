@@ -475,7 +475,7 @@ def test_gammatone_fallback_vs_jit_equivalence():
 
         # Assert mathematical parity down to machine precision
         np.testing.assert_allclose(jit_output, fallback_output, rtol=1e-12, atol=1e-12)
-        
+
     finally:
         # Restore original setting
         gammatone._HAS_NUMBA = original_has_numba

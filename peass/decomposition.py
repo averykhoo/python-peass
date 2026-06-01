@@ -443,29 +443,29 @@ def decompose_distortion_components(
     def apply_window_shading(sig: np.ndarray, fs: float, shade_in: float, shade_out: float) -> np.ndarray:
         shaded_signal = sig.copy()
         num_samples = shaded_signal.shape[0]
-        
+
         fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
         fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
-        
+
         # Explicitly validate signal length against configured shading windows
         if fade_in_samples + fade_out_samples > num_samples:
             raise ValueError(
                 f"Combined shading length ({fade_in_samples + fade_out_samples} samples) "
                 f"exceeds the signal length ({num_samples} samples)."
             )
-            
+
         if fade_in_samples > 1:
             time_steps = np.arange(fade_in_samples)
             shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
             # Vectorized channel multiplication
             shaded_signal[:fade_in_samples, :] *= shade_in_window[:, np.newaxis]
-                
+
         if fade_out_samples > 1:
             time_steps = np.arange(fade_out_samples)
             shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
             # Vectorized channel multiplication
             shaded_signal[-fade_out_samples:, :] *= shade_out_window[:, np.newaxis]
-                
+
         return shaded_signal
 
     shaded_sources = [
@@ -504,12 +504,13 @@ def decompose_distortion_components(
 
     for band_idx in range(number_of_bands):
         # Fully vectorized block construction using transpose, stacking, and list comprehensions
-        estimates_block = np.array([subband_estimate_signals[c][band_idx] for c in range(number_of_channels)]).T[:, :, np.newaxis]
+        estimates_block = np.array([subband_estimate_signals[c][band_idx] for c in range(number_of_channels)]).T[
+            :, :, np.newaxis]
         sources_block = np.array([
             [subband_source_signals[s][c][band_idx] for s in range(number_of_sources)]
             for c in range(number_of_channels)
         ]).transpose(2, 0, 1)
-        
+
         subband_sources_composite.append(sources_block)
         subband_estimates_composite.append(estimates_block)
 
