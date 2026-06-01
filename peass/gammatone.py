@@ -175,9 +175,10 @@ class GammatoneFilter:
         self.complex_filter_coefficient: complex = self.lambda_decay_factor * np.exp(1j * self.frequency_phase_step)
         self.normalization_factor: float = 2.0 * (1.0 - np.abs(self.complex_filter_coefficient)) ** filter_order
 
-        # Expand the cascade of N 1st-order poles into a single Nth-order denominator polynomial
-        self.numerator_coefficients = np.array([self.normalization_factor], dtype=complex)
-        self.denominator_coefficients = np.poly([self.complex_filter_coefficient] * self.filter_order)
+        # commented out because these aren't used, maybe they were meant to be a cache?
+        # # Expand the cascade of N 1st-order poles into a single Nth-order denominator polynomial
+        # self.numerator_coefficients = np.array([self.normalization_factor], dtype=complex)
+        # self.denominator_coefficients = np.poly([self.complex_filter_coefficient] * self.filter_order)
 
         self.filter_state: np.ndarray = np.zeros(self.filter_order, dtype=complex)
 
