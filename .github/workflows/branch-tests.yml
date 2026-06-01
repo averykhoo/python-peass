@@ -6,10 +6,10 @@ on:
     branches-ignore: [ "main" ]
     tags-ignore: [ "**" ]
 
-# Automatically cancel any active, outdated runs on the same branch
-concurrency:
-  group: peass-test-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: true
+## Automatically cancel any active, outdated runs on the same branch
+#concurrency:
+#  group: peass-test-${{ github.head_ref || github.ref_name }}
+#  cancel-in-progress: true
 
 jobs:
   branch-verify:

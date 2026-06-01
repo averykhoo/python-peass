@@ -4,10 +4,10 @@ on:
   pull_request:
     branches: [ "main" ]
 
-# Automatically cancels the active branch push test in favor of the PR test
-concurrency:
-  group: peass-test-${{ github.head_ref || github.ref_name }}
-  cancel-in-progress: false
+## Automatically cancels the active branch push test in favor of the PR test
+#concurrency:
+#  group: peass-test-${{ github.head_ref || github.ref_name }}
+#  cancel-in-progress: false
 
 jobs:
   validate:
