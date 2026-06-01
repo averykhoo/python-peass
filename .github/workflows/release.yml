@@ -1,0 +1,55 @@
+name: Release and Deploy
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  # Job 1: Run comprehensive tests before deploying
+  comprehensive-verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        python-version: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        include:
+          - os: macos-latest
+            python-version: "3.12"
+
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
+
+  # Job 2: Securely publish to PyPI only after Job 1 passes
+  deploy:
+    name: Deploy to PyPI
+    needs: comprehensive-verify  # Sequential stage gating
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+    permissions:
+      id-token: write  # OIDC write permission (mandatory for Trusted Publishing)
+      contents: read   # Read repository contents to build the distribution
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install build
+
+      - name: Build package distribution (sdist and wheel)
+        run: |
+          python -m build
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

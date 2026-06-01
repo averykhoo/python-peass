@@ -1,0 +1,24 @@
+name: Branch Push Tests
+
+on:
+  push:
+    # Trigger on push to any branch except 'main' and tags (which are covered by release)
+    branches-ignore: [ "main" ]
+    tags-ignore: [ "**" ]
+
+# Automatically cancel any active, outdated runs on the same branch
+concurrency:
+  group: peass-test-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  branch-verify:
+    strategy:
+      matrix:
+        os: [ ubuntu-latest ]
+        python-version: [ "3.14" ]
+
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ${{ matrix.os }}
+      python-version: ${{ matrix.python-version }}
