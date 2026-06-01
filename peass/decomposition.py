@@ -71,6 +71,7 @@ def validate_and_normalize_audio(
 
     return normalized
 
+
 def perform_least_squares_projection(
         source_estimates: np.ndarray,
         true_sources: np.ndarray,
