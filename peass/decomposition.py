@@ -316,6 +316,8 @@ def get_synthesis_modulation_matrix(sampling_frequency, max_samples_length, cent
     key = (sampling_frequency, max_samples_length, tuple(center_frequencies))
     if key in _SYNTHESIS_MATRIX_CACHE:
         return _SYNTHESIS_MATRIX_CACHE[key]
+    if len(_SYNTHESIS_MATRIX_CACHE) >= 16:
+        _SYNTHESIS_MATRIX_CACHE.clear()
     time_steps = np.arange(max_samples_length)
     matrix = np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
     _SYNTHESIS_MATRIX_CACHE[key] = matrix
