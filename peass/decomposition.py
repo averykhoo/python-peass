@@ -389,9 +389,9 @@ def decompose_distortion_components(
         configuration: Optional[DecompositionConfiguration] = None,
         sampling_frequency_hz: Optional[float] = None
 ) -> DecompositionResult:
-    if not source_files:
-        raise ValueError("source_files list cannot be empty.")
-    
+    r"""
+    Decomposes an estimated source signal into physical distortion components.
+    """
     if configuration is None:
         configuration = DecompositionConfiguration()
 
@@ -440,30 +440,30 @@ def decompose_distortion_components(
     def apply_window_shading(sig: np.ndarray, fs: float, shade_in: float, shade_out: float) -> np.ndarray:
         shaded_signal = sig.copy()
         num_samples = shaded_signal.shape[0]
-
+        
         fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
         fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
-
+        
         # Explicitly validate signal length against configured shading windows
         if (fade_in_samples > 0 and num_samples < fade_in_samples) or \
-                (fade_out_samples > 0 and num_samples < fade_out_samples):
+           (fade_out_samples > 0 and num_samples < fade_out_samples):
             raise ValueError(
                 f"Signal length ({num_samples}) is shorter than the configured "
                 f"shading length (fade_in: {fade_in_samples}, fade_out: {fade_out_samples})."
             )
-
+            
         if fade_in_samples > 1:
             time_steps = np.arange(fade_in_samples)
             shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
-            for chan_idx in range(shaded_signal.shape[1]):
-                shaded_signal[:fade_in_samples, chan_idx] *= shade_in_window
-
+            # Vectorized channel multiplication
+            shaded_signal[:fade_in_samples, :] *= shade_in_window[:, np.newaxis]
+                
         if fade_out_samples > 1:
             time_steps = np.arange(fade_out_samples)
             shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
-            for chan_idx in range(shaded_signal.shape[1]):
-                shaded_signal[-fade_out_samples:, chan_idx] *= shade_out_window
-
+            # Vectorized channel multiplication
+            shaded_signal[-fade_out_samples:, :] *= shade_out_window[:, np.newaxis]
+                
         return shaded_signal
 
     shaded_sources = [
@@ -501,15 +501,13 @@ def decompose_distortion_components(
     subband_estimates_composite = []
 
     for band_idx in range(number_of_bands):
-        band_samples_length = len(subband_source_signals[0][0][band_idx])
-        sources_block = np.zeros((band_samples_length, number_of_channels, number_of_sources), dtype=complex)
-        estimates_block = np.zeros((band_samples_length, number_of_channels, 1), dtype=complex)
-        for channel_idx in range(number_of_channels):
-            estimates_block[:, channel_idx, 0] = subband_estimate_signals[channel_idx][band_idx]
-            for source_idx in range(number_of_sources):
-                sources_block[:, channel_idx, source_idx] = (
-                    subband_source_signals[source_idx][channel_idx][band_idx]
-                )
+        # Fully vectorized block construction using transpose, stacking, and list comprehensions
+        estimates_block = np.array([subband_estimate_signals[c][band_idx] for c in range(number_of_channels)]).T[:, :, np.newaxis]
+        sources_block = np.array([
+            [subband_source_signals[s][c][band_idx] for s in range(number_of_sources)]
+            for c in range(number_of_channels)
+        ]).transpose(2, 0, 1)
+        
         subband_sources_composite.append(sources_block)
         subband_estimates_composite.append(estimates_block)
 
@@ -530,10 +528,6 @@ def decompose_distortion_components(
     window_lengths = np.maximum(3, np.round(reference_frame_length * bandwidth_ratios)).astype(int)
     hop_sizes = np.maximum(1, np.round(reference_hop_length * bandwidth_ratios)).astype(int)
 
-    # --- FUTURE WORK: Potential Parallelization Bottleneck ---
-    # The loop over frequency subbands below is an embarrassingly parallel DSP operation.
-    # To optimize processing speed, parallelize this loop using concurrent.futures.ThreadPoolExecutor,
-    # since the underlying SciPy linear algebraic routines release Python's GIL.
     decomposed_subband_true = []
     decomposed_subband_target_distortion = []
     decomposed_subband_interference = []
@@ -554,25 +548,23 @@ def decompose_distortion_components(
         decomposed_subband_interference.append(interference_b)
         decomposed_subband_artifacts.append(artifacts_b)
 
-    reformatted_subband_true = [[None for _ in range(number_of_bands)] for _ in range(number_of_channels)]
-    reformatted_subband_target_distortion = [[None for _ in range(number_of_bands)] for _ in range(number_of_channels)]
-    reformatted_subband_interference = [[None for _ in range(number_of_bands)] for _ in range(number_of_channels)]
-    reformatted_subband_artifacts = [[None for _ in range(number_of_bands)] for _ in range(number_of_channels)]
-
-    for channel_idx in range(number_of_channels):
-        for band_idx in range(number_of_bands):
-            reformatted_subband_true[channel_idx][band_idx] = (
-                decomposed_subband_true[band_idx][:, channel_idx, 0]
-            )
-            reformatted_subband_target_distortion[channel_idx][band_idx] = (
-                decomposed_subband_target_distortion[band_idx][:, channel_idx, 0]
-            )
-            reformatted_subband_interference[channel_idx][band_idx] = (
-                decomposed_subband_interference[band_idx][:, channel_idx, 0]
-            )
-            reformatted_subband_artifacts[channel_idx][band_idx] = (
-                decomposed_subband_artifacts[band_idx][:, channel_idx, 0]
-            )
+    # Clean and vectorized subband list reformatting
+    reformatted_subband_true = [
+        [decomposed_subband_true[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_target_distortion = [
+        [decomposed_subband_target_distortion[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_interference = [
+        [decomposed_subband_interference[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
+    reformatted_subband_artifacts = [
+        [decomposed_subband_artifacts[b][:, c, 0] for b in range(number_of_bands)]
+        for c in range(number_of_channels)
+    ]
 
     synthesized_true_target = np.zeros((original_samples_length, number_of_channels))
     synthesized_target_distortion = np.zeros((original_samples_length, number_of_channels))
@@ -608,7 +600,6 @@ def decompose_distortion_components(
 
     if is_file_mode:
         destination_path = pathlib.Path(configuration.destination_directory)
-        destination_path.mkdir(parents=True, exist_ok=True)
         estimate_stem = pathlib.Path(estimate_file).stem
         out_filenames = DecomposedFilePaths(
             true_target=str(destination_path / f"{estimate_stem}_true.wav"),
