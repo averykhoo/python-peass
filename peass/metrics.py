@@ -40,20 +40,34 @@ def calculate_bss_eval_energy_ratios(
     # Epsilon bounds to prevent division by zero in log scale
     eps = np.finfo(np.float64).eps
 
+    # pre-calculate vector sums to avoid redundant additions
+    sum_target_dist = flat_true_source + flat_target_distortion
+    sum_interf = sum_target_dist + flat_interference
+
+    # Compute sum-of-squares via highly optimized self-dot products
+    energy_true = np.dot(flat_true_source, flat_true_source)
+    energy_dist = np.dot(flat_target_distortion, flat_target_distortion)
+    energy_interf = np.dot(flat_interference, flat_interference)
+    energy_artif = np.dot(flat_artifacts, flat_artifacts)
+
+    energy_true_dist = np.dot(sum_target_dist, sum_target_dist)
+    energy_sum_all = np.dot(sum_interf, sum_interf)
+
+    # Compute overall distortion (eTarget + eInterf + eArtif)
+    sum_all_distortions = flat_target_distortion + flat_interference + flat_artifacts
+    energy_total_distortion = np.dot(sum_all_distortions, sum_all_distortions)
+
     source_to_spatial_distortion_ratio = 10.0 * np.log10(
-        np.maximum(np.sum(flat_true_source ** 2), eps) / np.maximum(np.sum(flat_target_distortion ** 2), eps)
+        np.maximum(energy_true, eps) / np.maximum(energy_dist, eps)
     )
     source_to_interference_ratio = 10.0 * np.log10(
-        np.maximum(np.sum((flat_true_source + flat_target_distortion) ** 2), eps) / np.maximum(
-            np.sum(flat_interference ** 2), eps)
+        np.maximum(energy_true_dist, eps) / np.maximum(energy_interf, eps)
     )
     source_to_artifacts_ratio = 10.0 * np.log10(
-        np.maximum(np.sum((flat_true_source + flat_target_distortion + flat_interference) ** 2), eps) / np.maximum(
-            np.sum(flat_artifacts ** 2), eps)
+        np.maximum(energy_sum_all, eps) / np.maximum(energy_artif, eps)
     )
     source_to_distortion_ratio = 10.0 * np.log10(
-        np.maximum(np.sum(flat_true_source ** 2), eps) / np.maximum(
-            np.sum((flat_target_distortion + flat_interference + flat_artifacts) ** 2), eps)
+        np.maximum(energy_true, eps) / np.maximum(energy_total_distortion, eps)
     )
 
     return (

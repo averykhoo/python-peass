@@ -29,31 +29,31 @@ def _get_model_parameters(task_idx: int) -> dict:
     parameters_path = os.path.join(MODEL_WEIGHTS_DIRECTORY, f"paramTask{task_idx + 1}.npz")
     with np.load(parameters_path) as parameters_data:
         return {
-            'W':     parameters_data['W'],
-            'b':     parameters_data['b'],
-            'v':     parameters_data['v'],
-            'a':     parameters_data['a'],
+            'w':     parameters_data['W'],  # hidden_layer_weights
+            'b':     parameters_data['b'],  # hidden_layer_bias
+            'v':     parameters_data['v'],  # output_layer_weights
+            'a':     parameters_data['a'],  # output_layer_bias
             'selec': parameters_data['selec']
         }
 
 
 def evaluate_neural_network_mapping(
         features: np.ndarray,
-        hidden_layer_weights: np.ndarray,
-        hidden_layer_bias: np.ndarray,
-        output_layer_weights: np.ndarray,
-        output_layer_bias: np.ndarray
+        w: np.ndarray,  # hidden_layer_weights
+        b: np.ndarray,  # hidden_layer_bias
+        v: np.ndarray,  # output_layer_weights
+        a: np.ndarray,  # output_layer_bias
 ) -> float:
-    r"""
+    """
     Evaluates forward propagation through the two-layer perceptron.
     """
     if len(features.shape) == 1:
         features = features[:, np.newaxis]
 
-    hidden_layer_activation = hidden_layer_weights @ features + hidden_layer_bias
+    hidden_layer_activation = w @ features + b
     hidden_layer_output = 1.0 / (1.0 + np.exp(-hidden_layer_activation))
 
-    output_layer_activation = output_layer_weights.T @ hidden_layer_output + output_layer_bias
+    output_layer_activation = v.T @ hidden_layer_output + a
     final_score = 100.0 / (1.0 + np.exp(-output_layer_activation))
 
     return float(final_score.item())
@@ -123,17 +123,12 @@ def predict_perceptual_evaluation_scores(
     scores = np.zeros(4)
 
     for task_idx in range(4):
-        # Fetch pre-loaded parameters instantly from cache
-        parameters_data = _get_model_parameters(task_idx)
-        W = parameters_data['W']
-        b = parameters_data['b']
-        v = parameters_data['v']
-        a = parameters_data['a']
-        selected_feature_indices = parameters_data['selec']
+        params = _get_model_parameters(task_idx)
+        selected_features = log_mapped_quality_features[params['selec']]
 
-        scores[task_idx] = evaluate_neural_network_mapping(
-            log_mapped_quality_features[selected_feature_indices], W, b, v, a
-        )
+        # Filter out 'selec' and unpack the rest (w, b, v, a) as keyword arguments
+        model_weights = {k: v for k, v in params.items() if k != 'selec'}
+        scores[task_idx] = evaluate_neural_network_mapping(selected_features, **model_weights)
 
     perceptual_scores = PerceptualSeparationScores(
         overall_perceptual_score=float(scores[0]),
