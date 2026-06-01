@@ -389,9 +389,6 @@ def decompose_distortion_components(
         configuration: Optional[DecompositionConfiguration] = None,
         sampling_frequency_hz: Optional[float] = None
 ) -> DecompositionResult:
-    if configuration is None:
-        configuration = DecompositionConfiguration()
-
     if not source_files:
         raise ValueError("source_files list cannot be empty.")
     
