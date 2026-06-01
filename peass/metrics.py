@@ -41,17 +41,17 @@ def calculate_bss_eval_energy_ratios(
     eps = np.finfo(np.float64).eps
 
     source_to_spatial_distortion_ratio = 10.0 * np.log10(
-        np.sum(flat_true_source ** 2) / np.maximum(np.sum(flat_target_distortion ** 2), eps)
+        np.maximum(np.sum(flat_true_source ** 2), eps) / np.maximum(np.sum(flat_target_distortion ** 2), eps)
     )
     source_to_interference_ratio = 10.0 * np.log10(
-        np.sum((flat_true_source + flat_target_distortion) ** 2) / np.maximum(np.sum(flat_interference ** 2), eps)
+        np.maximum(np.sum((flat_true_source + flat_target_distortion) ** 2), eps) / np.maximum(np.sum(flat_interference ** 2), eps)
     )
     source_to_artifacts_ratio = 10.0 * np.log10(
-        np.sum((flat_true_source + flat_target_distortion + flat_interference) ** 2) / np.maximum(
+        np.maximum(np.sum((flat_true_source + flat_target_distortion + flat_interference) ** 2), eps) / np.maximum(
             np.sum(flat_artifacts ** 2), eps)
     )
     source_to_distortion_ratio = 10.0 * np.log10(
-        np.sum(flat_true_source ** 2) / np.maximum(
+        np.maximum(np.sum(flat_true_source ** 2), eps) / np.maximum(
             np.sum((flat_target_distortion + flat_interference + flat_artifacts) ** 2), eps)
     )
 
