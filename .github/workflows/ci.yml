@@ -15,7 +15,7 @@ jobs:
     strategy:
       matrix:
         # Dynamically scales the matrix: Full list on main/PRs, only 3.12 on feature branches
-        python-version: ${{ (github.ref_name == 'main' || github.event_name == 'pull_request') && fromJSON('["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]') || fromJSON('["3.12"]') }}
+        python-version: ${{ (github.ref_name == 'main' || github.event_name == 'pull_request') && fromJSON('["3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]') || fromJSON('["3.12"]') }}
 
     steps:
       - name: Check out repository
