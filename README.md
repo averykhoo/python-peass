@@ -1,7 +1,6 @@
 # python-peass
 
-[![Build Status](https://github.com/averykhoo/python-peass/actions/workflows/main-tests.yml/badge.svg?branch=main&label=main)](https://github.com/averykhoo/python-peass/actions)
-[![Test & Release Status](https://github.com/averykhoo/python-peass/actions/workflows/release.yml/badge.svg&label=tests)](https://github.com/averykhoo/python-peass/actions)
+[![Test & Release Status](https://img.shields.io/github/actions/workflow/status/averykhoo/python-peass/release.yml?label=tests)](https://github.com/averykhoo/python-peass/actions)
 [![PyPI version](https://img.shields.io/pypi/v/python-peass.svg)](https://pypi.org/project/python-peass/)
 
 > This project was ported by Gemini 3.5 Flash from
