@@ -4,6 +4,11 @@ on:
   push:
     branches: [ "main" ]
 
+# Cancel any active, outdated runs on the same branch
+concurrency:
+  group: main-test-${{ github.workflow }}-${{ github.ref_name }}
+  cancel-in-progress: true
+
 jobs:
   post-merge-check:
     strategy:
@@ -16,3 +21,4 @@ jobs:
     with:
       os: ${{ matrix.os }}
       python-version: ${{ matrix.python-version }}
+      remove-numba: ${{ matrix.remove-numba }}

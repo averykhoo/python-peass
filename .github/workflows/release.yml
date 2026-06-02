@@ -36,17 +36,21 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Generates Cartesian product of 2 (OS) * 6 (Python) * 2 (remove-numba) = 24 jobs
+        os: [ ubuntu-latest, windows-latest ]
+        python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        remove-numba: [ true, false ]
         include:
-          - os: [ ubuntu-latest, windows-latest ]
-            python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14" ]
-            remove-numba: [ true, false ]
+          # Appends 1 specific macOS job (bringing total to 25 jobs)
           - os: macos-latest
             python-version: "3.12"
+            remove-numba: false
 
     uses: ./.github/workflows/template-test.yml
     with:
       os: ${{ matrix.os }}
       python-version: ${{ matrix.python-version }}
+      remove-numba: ${{ matrix.remove-numba }}
 
   # ---------------------------------------------------------------------------
   # STAGE 3: Deploy (Only runs if Stage 2 passes)

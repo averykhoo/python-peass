@@ -16,11 +16,16 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
+        # Standard PR verification
+        os: [ ubuntu-latest ]
+        python-version: [ "3.9", "3.10", "3.12", "3.14" ]
+        remove-numba: [ false ]
         include:
-          - os: [ ubuntu-latest ]
-            python-version: [ "3.9", "3.10", "3.12", "3.14" ]  # TODO: remove 3.9
+          # Windows verification
           - os: windows-latest
             python-version: "3.14"
+            remove-numba: false
+          # Numba-free verification
           - os: ubuntu-latest
             python-version: "3.14"
             remove-numba: true
@@ -29,3 +34,4 @@ jobs:
     with:
       os: ${{ matrix.os }}
       python-version: ${{ matrix.python-version }}
+      remove-numba: ${{ matrix.remove-numba }}
