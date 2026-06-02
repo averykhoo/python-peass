@@ -1,6 +1,7 @@
 # python-peass
 
-[![Test Suite](https://github.com/averykhoo/python-peass/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/averykhoo/python-peass/actions)
+[![Build Status](https://github.com/averykhoo/python-peass/actions/workflows/main-tests.yml/badge.svg?branch=main)](https://github.com/averykhoo/python-peass/actions)
+[![Release Status](https://github.com/averykhoo/python-peass/actions/workflows/release.yml/badge.svg)](https://github.com/averykhoo/python-peass/actions)
 [![PyPI version](https://img.shields.io/pypi/v/python-peass.svg)](https://pypi.org/project/python-peass/)
 
 > This project was ported by Gemini 3.5 Flash from
@@ -42,7 +43,8 @@ For standard execution, you can install the package directly:
 pip install "python-peass[numba]"
 ```
 
-If you require high-speed execution (using optimized vector libraries like Intel MKL or Apple Accelerate), it is recommended to install NumPy and SciPy via Conda first, and then install the package:
+If you require high-speed execution (using optimized vector libraries like Intel MKL or Apple Accelerate), it is
+recommended to install NumPy and SciPy via Conda first, and then install the package:
 
 ```bash
 conda install --update numpy scipy

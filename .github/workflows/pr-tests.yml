@@ -18,7 +18,7 @@ jobs:
       matrix:
         # Standard PR verification
         os: [ ubuntu-latest ]
-        python-version: [ "3.9", "3.10", "3.12", "3.14" ]
+        python-version: [ 3.10", "3.12", "3.14" ]
         remove-numba: [ false ]
         include:
           # Windows verification

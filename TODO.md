@@ -7,4 +7,3 @@
 - note for gemini: if i forgot to send you the full pdfs, please ask for them so you can refer to the theory
 - note to self: add `-n auto` for pycharm to speed up tests
   as seen here: https://www.jetbrains.com/help/pycharm/performing-tests.html#run-tests-in-parallel
-- drop support for python under 3.10 
