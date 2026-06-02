@@ -16,11 +16,14 @@ jobs:
     strategy:
       fail-fast: true
       matrix:
-        os: [ ubuntu-latest ]
-        python-version: [ "3.9", "3.10", "3.12", "3.14" ]  # TODO: remove 3.9
         include:
+          - os: [ ubuntu-latest ]
+            python-version: [ "3.9", "3.10", "3.12", "3.14" ]  # TODO: remove 3.9
           - os: windows-latest
             python-version: "3.14"
+          - os: ubuntu-latest
+            python-version: "3.14"
+            remove-numba: true
 
     uses: ./.github/workflows/template-test.yml
     with:

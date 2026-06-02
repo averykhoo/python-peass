@@ -10,6 +10,7 @@ jobs:
       matrix:
         os: [ ubuntu-latest ]
         python-version: [ "3.14" ]
+        remove-numba: [ true, false ]
 
     uses: ./.github/workflows/template-test.yml
     with:

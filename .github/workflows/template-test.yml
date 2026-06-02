@@ -9,6 +9,10 @@ on:
       python-version:
         required: true
         type: string
+      remove-numba: # Dynamic trigger to strip Numba from requirements
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-tests:
@@ -23,6 +27,13 @@ jobs:
           python-version: ${{ inputs.python-version }}
           allow-prereleases: true
           cache: 'pip'
+
+      # Dynamically strip Numba from requirements.txt prior to installation
+      - name: Drop Numba from requirements
+        if: ${{ inputs.remove-numba == true }}
+        run: |
+          sed -i '/numba/d' requirements.txt
+        shell: bash
 
       - name: Install MKL mathematical backends (Linux only)
         if: runner.os == 'Linux'
