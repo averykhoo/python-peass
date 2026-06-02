@@ -46,7 +46,7 @@ If you require high-speed execution (using optimized vector libraries like Intel
 recommended to install NumPy and SciPy via Conda first, and then install the package:
 
 ```bash
-conda install --update-all numpy scipy
+conda update numpy scipy
 pip install "python-peass[numba]"
 ```
 
