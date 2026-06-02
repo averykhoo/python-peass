@@ -79,7 +79,7 @@ def predict_perceptual_evaluation_scores(
     waveforms = decomposition_result.waveforms
 
     if sampling_frequency_hz is None:
-        if isinstance(estimate_file, (str, pathlib.Path)):
+        if isinstance(estimate_file, str | pathlib.Path):
             _, sampling_frequency_hz = sf.read(estimate_file)
         else:
             sampling_frequency_hz = 16000.0

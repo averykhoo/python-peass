@@ -2,7 +2,6 @@
 PEASS Test Suite - Auditory Physiological Model Tests
 """
 
-
 import numpy as np
 import pytest
 import scipy.signal as signal
