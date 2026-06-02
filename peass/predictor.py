@@ -57,8 +57,8 @@ def evaluate_neural_network_mapping(
 
 
 def predict_perceptual_evaluation_scores(
-        original_files: list[str | np.ndarray],
-        estimate_file: str | np.ndarray,
+        original_files: list[str | pathlib.Path | np.ndarray],
+        estimate_file: str | pathlib.Path | np.ndarray,
         configuration: DecompositionConfiguration | None = None,
         sampling_frequency_hz: float | None = None,
         return_decomposition: bool = False

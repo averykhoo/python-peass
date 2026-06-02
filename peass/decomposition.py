@@ -442,8 +442,8 @@ def run_auditory_synthesis_filterbank(
 
 
 def decompose_distortion_components(
-        source_files: list[str | np.ndarray],
-        estimate_file: str | np.ndarray,
+        source_files: list[str | pathlib.Path | np.ndarray],
+        estimate_file: str | pathlib.Path | np.ndarray,
         configuration: DecompositionConfiguration | None = None,
         sampling_frequency_hz: float | None = None
 ) -> DecompositionResult:

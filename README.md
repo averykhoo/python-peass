@@ -8,32 +8,6 @@
 
 A Python port of the **PEASS v2.0.1** (Perceptual Evaluation methods for Audio Source Separation) toolkit [1].
 
-This package replaces traditional energy ratio metrics (SDR, SIR, SAR) with perceptually motivated objective scores—
-**OPS, TPS, IPS, and APS**—which align closely with subjective human listening evaluations [1].
-
-## Scientific Highlights
-
-Traditional evaluation metrics rely purely on linear energy ratios [1].
-However, human hearing relies on non-linear auditory transduction, temporal masking, and cognitive thresholds [2].
-`python-peass` executes a multi-stage cognitive simulation pipeline to assess separation quality:
-
-1. **Subband Least-Squares Decomposition:**
-   Signals are divided into subbands using a complex-valued Hohmann Gammatone Filterbank [1, 3].
-   Overlapping temporal frames are projected onto estimated subspaces to isolate physical target distortion,
-   interference, and artifact components [1].
-2. **Inner Hair Cell Transduction:**
-   Approximates the shearing limits of physical hair bundles via half-wave rectification and first-order 1 kHz
-   membrane-limit lowpass filters [1, 2].
-3. **Auditory Nerve Adaptation:**
-   Models physiological forward masking and metabolic neural depletion via five cascaded stages of non-linear feedback
-   loops [2].
-4. **Perceptual Assimilation:**
-   Models cognitive threshold masking where noise below a target reference threshold is partially assimilated or
-   masked [2].
-5. **Score Prediction:**
-   Feeds weighted similarity percentiles into a multi-criteria trained sigmoidal neural network to output scores scaled
-   from `0` to `100` [1].
-
 ## Installation
 
 For standard execution, you can install the package directly:
@@ -140,6 +114,34 @@ true_target, target_distortion, interference, artifacts = (
     waveforms.artifacts
 )
 ```
+
+---
+
+## Scientific Highlights
+
+Traditional evaluation metrics rely purely on linear energy ratios [1].
+However, human hearing relies on non-linear auditory transduction, temporal masking, and cognitive thresholds [2].
+This package replaces traditional energy ratio metrics (SDR, SIR, SAR) with perceptually motivated objective scores—
+**OPS, TPS, IPS, and APS**—which align closely with subjective human listening evaluations [1].
+
+`peass` executes a multi-stage cognitive simulation pipeline to assess separation quality:
+
+1. **Subband Least-Squares Decomposition:**
+   Signals are divided into subbands using a complex-valued Hohmann Gammatone Filterbank [1, 3].
+   Overlapping temporal frames are projected onto estimated subspaces to isolate physical target distortion,
+   interference, and artifact components [1].
+2. **Inner Hair Cell Transduction:**
+   Approximates the shearing limits of physical hair bundles via half-wave rectification and first-order 1 kHz
+   membrane-limit lowpass filters [1, 2].
+3. **Auditory Nerve Adaptation:**
+   Models physiological forward masking and metabolic neural depletion via five cascaded stages of non-linear feedback
+   loops [2].
+4. **Perceptual Assimilation:**
+   Models cognitive threshold masking where noise below a target reference threshold is partially assimilated or
+   masked [2].
+5. **Score Prediction:**
+   Feeds weighted similarity percentiles into a multi-criteria trained sigmoidal neural network to output scores scaled
+   from `0` to `100` [1].
 
 ---
 
