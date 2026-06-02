@@ -7,7 +7,6 @@ and fails over gracefully to a SciPy/NumPy native vectorization.
 """
 
 import math
-from typing import Tuple
 
 import numpy as np
 import scipy.signal as signal
@@ -269,7 +268,7 @@ def generate_auditory_internal_representation(
         signal_data: np.ndarray,
         sampling_frequency_hz: float,
         modulation_processing_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
-) -> Tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
     """Generates the 3D internal auditory representation of a signal."""
     if len(signal_data.shape) > 1:
         if signal_data.shape[0] < signal_data.shape[1]:

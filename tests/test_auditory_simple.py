@@ -2,7 +2,6 @@
 PEASS Test Suite - Auditory Physiological Model Tests
 """
 
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -41,7 +40,7 @@ def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
 
 
 def test_haircell_and_adaptation_properties(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     target, _, _, sampling_frequency_hz = synthetic_audio_data
     subband_signals = target.T
@@ -57,7 +56,7 @@ def test_haircell_and_adaptation_properties(
 
 
 def test_internal_auditory_representation(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     target, _, _, sampling_frequency_hz = synthetic_audio_data
 

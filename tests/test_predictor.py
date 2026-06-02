@@ -2,7 +2,6 @@
 PEASS Test Suite - Predictor End-to-End Regressor Tests
 """
 import pathlib
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -13,7 +12,7 @@ from peass.predictor import predict_perceptual_evaluation_scores
 
 @pytest.mark.parametrize("estimate_scale", [1.0, 0.5, 0.1, 0.01])
 def test_predictor_score_range_constraints(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float],
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float],
         estimate_scale
 ):
     target, interferer, estimate, fs = synthetic_audio_data
@@ -59,7 +58,7 @@ def test_predictor_pristine_audio_conditions():
 
 
 def test_predictor_file_based_execution(
-        audio_files_fixture: Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
+        audio_files_fixture: tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 ):
     """
     Verifies that the end-to-end predictor runs successfully in file-based mode.
@@ -86,7 +85,7 @@ def test_predictor_file_based_execution(
 
 
 def test_predictor_with_alternative_options(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Tests predictor behavior when invoking custom parameters like use_two_stage_projection.

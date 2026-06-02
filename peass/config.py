@@ -5,7 +5,6 @@ PEASS Configuration and Data Structures
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
-from typing import Optional
 
 import numpy as np
 
@@ -38,7 +37,7 @@ class DecomposedFilePaths:
 class DecompositionResult:
     """Wrapper holding both the arrays and optional file paths of a decomposition."""
     waveforms: DecomposedWaveforms
-    file_paths: Optional[DecomposedFilePaths] = None
+    file_paths: DecomposedFilePaths | None = None
 
 
 @dataclass(slots=True)
@@ -64,5 +63,5 @@ class PerceptualSeparationScores:
     source_to_spatial_distortion_ratio: float
     source_to_interference_ratio: float
     source_to_artifacts_ratio: float
-    decomposition_waveforms: Optional[DecomposedWaveforms] = None
-    decomposition_files: Optional[DecomposedFilePaths] = None
+    decomposition_waveforms: DecomposedWaveforms | None = None
+    decomposition_files: DecomposedFilePaths | None = None

@@ -8,9 +8,6 @@ Maps raw auditory similarity scores to Predicted Perceptual Scores
 import os
 import pathlib
 from functools import lru_cache
-from typing import List
-from typing import Optional
-from typing import Union
 
 import numpy as np
 import soundfile as sf
@@ -60,10 +57,10 @@ def evaluate_neural_network_mapping(
 
 
 def predict_perceptual_evaluation_scores(
-        original_files: List[Union[str, np.ndarray]],
-        estimate_file: Union[str, np.ndarray],
-        configuration: Optional[DecompositionConfiguration] = None,
-        sampling_frequency_hz: Optional[float] = None,
+        original_files: list[str | np.ndarray],
+        estimate_file: str | np.ndarray,
+        configuration: DecompositionConfiguration | None = None,
+        sampling_frequency_hz: float | None = None,
         return_decomposition: bool = False
 ) -> PerceptualSeparationScores:
     r"""

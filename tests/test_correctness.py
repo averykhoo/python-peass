@@ -4,7 +4,6 @@ File path: tests/test_correctness.py
 """
 
 import pathlib
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -39,7 +38,7 @@ INTERFERER_WAV_PATH = PEASS_DATA_DIR / "exp01_InterfSrc1.wav"
 # PYTEST FIXTURES (PARAMETERIZED WAVEFORMS & SEEDED NOISE)
 # -----------------------------------------------------------------------------
 @pytest.fixture(params=["sine", "square", "triangle", "chirp", "noise"])
-def synthetic_signal(request) -> Tuple[np.ndarray, float]:
+def synthetic_signal(request) -> tuple[np.ndarray, float]:
     """
     Generates parameterized waveforms to verify mathematical robustness across
     periodic, discontinuous, and stochastic signal profiles.

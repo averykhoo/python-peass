@@ -5,8 +5,6 @@ Computes perceptual features and linear/energy ratio calculations
 using extreme N-dimensional vectorized broadcasting.
 """
 
-from typing import Tuple
-
 import numpy as np
 
 from .auditory_model import generate_auditory_internal_representation
@@ -17,7 +15,7 @@ def calculate_bss_eval_energy_ratios(
         target_distortion: np.ndarray,
         interference: np.ndarray,
         artifacts: np.ndarray
-) -> Tuple[float, float, float, float]:
+) -> tuple[float, float, float, float]:
     r"""
     Computes standard BSS Eval energy ratio metrics from physically decomposed components.
 
@@ -30,7 +28,7 @@ def calculate_bss_eval_energy_ratios(
     :param artifacts: Non-linear processing artifacts.
     :type artifacts: numpy.ndarray
     :return: A tuple of (ISR, SIR, SAR, SDR) in Decibels (dB).
-    :rtype: Tuple[float, float, float, float]
+    :rtype: tuple[float, float, float, float]
     """
     flat_true_source = true_source.ravel()
     flat_target_distortion = target_distortion.ravel()
@@ -168,9 +166,9 @@ def calculate_auditory_similarity_metric(
 
 
 def calculate_auditory_quality_features(
-        decomposition_signals: Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
+        decomposition_signals: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
         sampling_frequency_hz: float = 16000.0
-) -> Tuple[float, float, float, float]:
+) -> tuple[float, float, float, float]:
     """Computes quality features by sending decomposed signals through the internal auditory model."""
     true_target, target_distortion, interference, artifacts = decomposition_signals
 

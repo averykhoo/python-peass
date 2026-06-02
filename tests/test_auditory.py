@@ -2,7 +2,6 @@
 PEASS Test Suite - Auditory Physiological Model Tests
 """
 
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -66,7 +65,7 @@ def test_gammatone_analysis_reconstruction_fidelity(sampling_frequency_hz):
 
 
 def test_haircell_and_adaptation_properties(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Verifies physiological properties of hair cell transduction and adaptation,
@@ -124,7 +123,7 @@ def test_auditory_numba_fallback_equivalence():
 
 
 def test_internal_auditory_representation_modulation_properties(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Verifies the real/complex modulation property mapping of the internal auditory representation.
