@@ -1,4 +1,4 @@
-name: Branch Push Tests
+name: Branch
 
 on:
   push:

@@ -1,4 +1,4 @@
-name: Main Post-Merge Check
+name: Main
 
 on:
   push:
