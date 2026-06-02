@@ -329,7 +329,7 @@ def generate_auditory_internal_representation(
         modulation_center_frequencies = np.array([0.0])
         modulation_bandwidths = np.array([15.92])
     else:
-        raise RuntimeError(f'Unknown {modulation_processing_type=}')
+        raise ValueError(f"Unknown {modulation_processing_type=}")
 
     num_bands = adapted_signals.shape[0]
     num_modulations = len(modulation_center_frequencies)
