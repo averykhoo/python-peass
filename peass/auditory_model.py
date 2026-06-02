@@ -7,7 +7,6 @@ and fails over gracefully to a SciPy/NumPy native vectorization.
 """
 
 import math
-from typing import Tuple
 
 import numpy as np
 import scipy.signal as signal
@@ -269,7 +268,7 @@ def generate_auditory_internal_representation(
         signal_data: np.ndarray,
         sampling_frequency_hz: float,
         modulation_processing_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
-) -> Tuple[np.ndarray, float]:
+) -> tuple[np.ndarray, float]:
     """Generates the 3D internal auditory representation of a signal."""
     if len(signal_data.shape) > 1:
         if signal_data.shape[0] < signal_data.shape[1]:
@@ -285,7 +284,6 @@ def generate_auditory_internal_representation(
     # Decimate using polyphase FIR (avoids global FFT memory spikes)
     if sampling_frequency_hz < 3.0 * maximum_frequency:
         new_sampling_frequency = int(round(1.5 * sampling_frequency_hz))
-        # scaled_signal_data = signal.resample_poly(scaled_signal_data, new_sampling_frequency, int(sampling_frequency_hz))
         scaled_signal_data = fast_resample_poly(
             scaled_signal_data, new_sampling_frequency, int(sampling_frequency_hz)
         )
@@ -321,17 +319,17 @@ def generate_auditory_internal_representation(
 
     # 4. Modulation Filtering & Polyphase Decimation
     if modulation_processing_type == ModulationProcessingType.FILTERBANK:
-        # downsampled_adapted = signal.resample_poly(adapted_signals, 800, int(sampling_frequency_hz), axis=-1)
         downsampled_adapted = fast_resample_poly(adapted_signals, 800, int(sampling_frequency_hz), axis=-1)
         sampling_frequency_hz = 800.0
         modulation_center_frequencies = np.concatenate(([0.0, 5.0], 10.0 * (5.0 / 3.0) ** np.arange(6)))
         modulation_bandwidths = np.concatenate(([5.0, 5.0], 5.0 * (5.0 / 3.0) ** np.arange(6)))
-    else:
-        # downsampled_adapted = signal.resample_poly(adapted_signals, 100, int(sampling_frequency_hz), axis=-1)
+    elif modulation_processing_type == ModulationProcessingType.LOWPASS:
         downsampled_adapted = fast_resample_poly(adapted_signals, 100, int(sampling_frequency_hz), axis=-1)
         sampling_frequency_hz = 100.0
         modulation_center_frequencies = np.array([0.0])
         modulation_bandwidths = np.array([15.92])
+    else:
+        raise ValueError(f"Unknown {modulation_processing_type=}")
 
     num_bands = adapted_signals.shape[0]
     num_modulations = len(modulation_center_frequencies)

@@ -6,7 +6,6 @@ File path: tests/conftest.py
 import pathlib
 import tempfile
 from typing import Generator
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -15,7 +14,7 @@ import soundfile as sf
 
 
 @pytest.fixture(scope="module", params=[(16000.0, 2.0), (32000.0, 1.0)])
-def synthetic_audio_data(request) -> Tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+def synthetic_audio_data(request) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
     Generates synthetic target, interferer, and estimate signals for DSP testing.
     Parameterized over (sampling_frequency, duration_seconds) to automatically
@@ -46,8 +45,8 @@ def synthetic_audio_data(request) -> Tuple[np.ndarray, np.ndarray, np.ndarray, f
 
 @pytest.fixture(scope="module")
 def audio_files_fixture(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
-) -> Generator[Tuple[pathlib.Path, pathlib.Path, pathlib.Path], None, None]:
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
+) -> Generator[tuple[pathlib.Path, pathlib.Path, pathlib.Path], None, None]:
     """
     Writes synthetic waveforms to temporary WAV files on disk to test file-based modes.
     """

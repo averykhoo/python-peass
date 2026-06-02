@@ -8,10 +8,6 @@ and zero-copy arrays.
 
 import pathlib
 from functools import lru_cache
-from typing import List
-from typing import Optional
-from typing import Tuple
-from typing import Union
 
 import numpy as np
 import scipy.linalg as linalg
@@ -230,7 +226,7 @@ def extract_target_spatial_distortion_interference_artifacts(
         window_length: int,
         hop_size: int,
         use_two_stage_projection: bool = False
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     r"""
     Splits multi-source signal mixtures into physical sub-components.
     """
@@ -300,8 +296,8 @@ def extract_target_spatial_distortion_interference_artifacts(
 def run_auditory_analysis_filterbank(
         signal_waveform: np.ndarray,
         sampling_frequency_hz: float,
-        modulation_matrix: Optional[np.ndarray] = None
-) -> Tuple[List[np.ndarray], GammatoneAnalyzer, np.ndarray]:
+        modulation_matrix: np.ndarray | None = None
+) -> tuple[list[np.ndarray], GammatoneAnalyzer, np.ndarray]:
     """Helper executing Gammatone Analysis subband decomposition."""
     minimum_frequency = 20.0
     maximum_frequency = sampling_frequency_hz / 2.0
@@ -389,7 +385,7 @@ def get_synthesis_modulation_matrix(
 def run_auditory_synthesis_filterbank(
         subband_list: list,
         analyzer: GammatoneAnalyzer
-) -> Tuple[np.ndarray, GammatoneSynthesizer]:
+) -> tuple[np.ndarray, GammatoneSynthesizer]:
     """Helper executing Gammatone synthesis reconstruction."""
     num_bands = len(subband_list)
     sampling_frequency = analyzer.sampling_frequency_hz
@@ -446,10 +442,10 @@ def run_auditory_synthesis_filterbank(
 
 
 def decompose_distortion_components(
-        source_files: List[Union[str, np.ndarray]],
-        estimate_file: Union[str, np.ndarray],
-        configuration: Optional[DecompositionConfiguration] = None,
-        sampling_frequency_hz: Optional[float] = None
+        source_files: list[str | pathlib.Path | np.ndarray],
+        estimate_file: str | pathlib.Path | np.ndarray,
+        configuration: DecompositionConfiguration | None = None,
+        sampling_frequency_hz: float | None = None
 ) -> DecompositionResult:
     r"""
     Decomposes an estimated source signal into physical distortion components.
@@ -460,7 +456,7 @@ def decompose_distortion_components(
     if not source_files:
         raise ValueError("source_files list cannot be empty.")
 
-    is_file_mode = isinstance(estimate_file, (str, pathlib.Path))
+    is_file_mode = isinstance(estimate_file, str | pathlib.Path)
 
     if is_file_mode:
         # File-based mode (handled by soundfile, which defaults to samples-first)

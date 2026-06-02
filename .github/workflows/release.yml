@@ -1,4 +1,4 @@
-name: Release and Deploy
+name: Tag, Test, Release, and Deploy
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           fetch-depth: 0  # Required to retrieve the full branch history for verification
 
@@ -29,7 +29,6 @@ jobs:
 
   # ---------------------------------------------------------------------------
   # STAGE 2: Comprehensive Verification (Only runs if Stage 1 passes)
-  # TODO: drop python 3.9 support
   # ---------------------------------------------------------------------------
   comprehensive-verify:
     needs: validate-tag
@@ -38,7 +37,7 @@ jobs:
       matrix:
         # Generates Cartesian product of 2 (OS) * 6 (Python) * 2 (remove-numba) = 24 jobs
         os: [ ubuntu-latest, windows-latest ]
-        python-version: [ "3.9", "3.10", "3.11", "3.12", "3.13", "3.14" ]
+        python-version: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
         remove-numba: [ true, false ]
         include:
           # Appends 1 specific macOS job (bringing total to 25 jobs)
@@ -67,10 +66,10 @@ jobs:
 
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 

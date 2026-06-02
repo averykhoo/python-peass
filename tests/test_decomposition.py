@@ -3,7 +3,6 @@ PEASS Test Suite - Subband Least-Squares Decomposition Tests
 """
 
 import pathlib
-from typing import Tuple
 
 import numpy as np
 import pytest
@@ -38,7 +37,7 @@ def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10
 
 
 def test_decomposition_algebraic_reconstruction(
-        synthetic_audio_data: Tuple[np.ndarray, np.ndarray, np.ndarray, float]
+        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
 ):
     """
     Mathematically verifies that the decomposition satisfies the fundamental
@@ -83,7 +82,7 @@ def test_decomposition_algebraic_reconstruction(
 
 
 def test_decomposition_file_generation(
-        audio_files_fixture: Tuple[pathlib.Path, pathlib.Path, pathlib.Path]
+        audio_files_fixture: tuple[pathlib.Path, pathlib.Path, pathlib.Path]
 ):
     """
     Verifies that the decomposer successfully writes output WAV files to disk

@@ -7,7 +7,6 @@ of frequency analysis, delay/phase alignment, and synthesis reconstruction.
 
 import math
 from functools import lru_cache
-from typing import List
 
 import numpy as np
 import scipy.signal as signal
@@ -255,7 +254,7 @@ class GammatoneAnalyzer:
             specified_center_frequency_hz,
             upper_cutoff_frequency_hz
         )
-        self.filters: List[GammatoneFilter] = [
+        self.filters: list[GammatoneFilter] = [
             GammatoneFilter(sampling_frequency_hz, freq, filter_order, bandwidth_factor)
             for freq in self.center_frequencies
         ]

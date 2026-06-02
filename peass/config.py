@@ -2,17 +2,11 @@
 PEASS Configuration and Data Structures
 """
 
-import sys
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
-from typing import Optional
 
 import numpy as np
-
-# Dynamically enable slots only on Python 3.10+
-# TODO: drop py3.9 support and just always include slots
-_DATACLASS_KWARGS = {"slots": True} if sys.version_info >= (3, 10) else {}
 
 
 class ModulationProcessingType(Enum):
@@ -21,7 +15,7 @@ class ModulationProcessingType(Enum):
     FILTERBANK = auto()
 
 
-@dataclass(**_DATACLASS_KWARGS)
+@dataclass(slots=True)
 class DecomposedWaveforms:
     """Holds the in-memory NumPy arrays for the decomposed physical components."""
     true_target: np.ndarray
@@ -30,7 +24,7 @@ class DecomposedWaveforms:
     artifacts: np.ndarray
 
 
-@dataclass(**_DATACLASS_KWARGS)
+@dataclass(slots=True)
 class DecomposedFilePaths:
     """Holds the absolute file paths to the generated WAV files on disk."""
     true_target: str
@@ -39,14 +33,14 @@ class DecomposedFilePaths:
     artifacts: str
 
 
-@dataclass(**_DATACLASS_KWARGS)
+@dataclass(slots=True)
 class DecompositionResult:
     """Wrapper holding both the arrays and optional file paths of a decomposition."""
     waveforms: DecomposedWaveforms
-    file_paths: Optional[DecomposedFilePaths] = None
+    file_paths: DecomposedFilePaths | None = None
 
 
-@dataclass(**_DATACLASS_KWARGS)
+@dataclass(slots=True)
 class DecompositionConfiguration:
     """Structural configurations for the subband least-squares windowing."""
     destination_directory: str = "./"
@@ -58,7 +52,7 @@ class DecompositionConfiguration:
     segmentation_factor: int = 1
 
 
-@dataclass(**_DATACLASS_KWARGS)
+@dataclass(slots=True)
 class PerceptualSeparationScores:
     """Final assessment metrics representing the predicted subjective evaluation."""
     overall_perceptual_score: float
@@ -69,5 +63,5 @@ class PerceptualSeparationScores:
     source_to_spatial_distortion_ratio: float
     source_to_interference_ratio: float
     source_to_artifacts_ratio: float
-    decomposition_waveforms: Optional[DecomposedWaveforms] = None
-    decomposition_files: Optional[DecomposedFilePaths] = None
+    decomposition_waveforms: DecomposedWaveforms | None = None
+    decomposition_files: DecomposedFilePaths | None = None
