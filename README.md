@@ -68,10 +68,10 @@ estimate_file = "audio/estimated_target.wav"
 
 scores = predict_perceptual_evaluation_scores(original_files, estimate_file)
 
-print(f"Overall Perceptual Score (OPS): {scores.overall_perceptual_score:.1f}/100")
+print(f"Overall Perceptual Score (OPS):  {scores.overall_perceptual_score:.1f}/100")
 print(f"Target Preservation Score (TPS): {scores.target_perceptual_score:.1f}/100")
-print(f"Interference Rejection (IPS):   {scores.interference_perceptual_score:.1f}/100")
-print(f"Artifact-free Score (APS):      {scores.artifact_perceptual_score:.1f}/100")
+print(f"Interference Rejection (IPS):    {scores.interference_perceptual_score:.1f}/100")
+print(f"Artifact-free Score (APS):       {scores.artifact_perceptual_score:.1f}/100")
 ```
 
 ### 2. Score Evaluation with Waveform and File Expositions
