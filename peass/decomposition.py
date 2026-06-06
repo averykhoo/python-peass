@@ -5,7 +5,8 @@ Decomposes the separation error of a source estimate into Target distortion,
 Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
 and zero-copy arrays.
 """
-
+import warnings
+from scipy.linalg import LinAlgWarning
 import pathlib
 from functools import lru_cache
 
@@ -122,13 +123,17 @@ def perform_least_squares_projection(
     regularization_lambda = 10.0 ** -15
     gram_matrix.flat[::gram_matrix.shape[0] + 1] += regularization_lambda
 
-    # Offload directly to LAPACK posv (Cholesky solve in compiled C/Fortran)
-    try:
-        projection_weights = linalg.solve(gram_matrix, rhs_vector, assume_a='pos')
-    except (linalg.LinAlgError, ValueError):
-        # Fallback to pseudo-inverse if condition fails
-        projection_weights = linalg.pinv(toeplitz_matrix * analysis_window[:, np.newaxis]) @ (
-                source_estimates * analysis_window[:, np.newaxis])
+    # Promote LinAlgWarning to an exception locally so the fallback is triggered
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", LinAlgWarning)
+        # Offload directly to LAPACK posv (Cholesky solve in compiled C/Fortran)
+        try:
+            projection_weights = linalg.solve(gram_matrix, rhs_vector, assume_a='pos')
+        except (linalg.LinAlgError, ValueError, LinAlgWarning):
+            # Fallback to pseudo-inverse if singular or highly ill-conditioned
+            weighted_toeplitz = toeplitz_matrix * analysis_window[:, np.newaxis]
+            weighted_estimates = source_estimates * analysis_window[:, np.newaxis]
+            projection_weights = linalg.pinv(weighted_toeplitz) @ weighted_estimates
 
     projections = np.zeros(
         (num_samples, source_estimates.shape[1], num_sources),
