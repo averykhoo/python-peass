@@ -13,6 +13,34 @@ import scipy.signal as signal
 import soundfile as sf
 
 
+@pytest.fixture(scope="session")
+def project_root():
+    return pathlib.Path(__file__).parent.parent
+
+
+@pytest.fixture(scope="session")
+def resources_dir(project_root):
+    return project_root / "tests" / "resources"
+
+
+@pytest.fixture(scope="session")
+def db_resources(resources_dir):
+    """Path to the consolidated database audio clips."""
+    return resources_dir / "database"
+
+
+@pytest.fixture(scope="session")
+def matlab_ref_resources(resources_dir):
+    """Path to the MATLAB v2.0.1 gold standard reference files."""
+    return resources_dir / "matlab_reference"
+
+
+@pytest.fixture(scope="session")
+def training_dataset_dir(project_root):
+    """Path to the full training dataset (for future model training tests)."""
+    return project_root / "dataset"
+
+
 @pytest.fixture(scope="module", params=[(16000.0, 2.0), (32000.0, 1.0)])
 def synthetic_audio_data(request) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """
