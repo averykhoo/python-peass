@@ -147,8 +147,23 @@ This package replaces traditional energy ratio metrics (SDR, SIR, SAR) with perc
 
 ## Test Suite & CI/CD
 
+### Installation for Development & Testing
+
 The validation suite implements rigorous numerical, physical, and integration checks.
 You will need to `pip install -r requirements.txt` to set up.
+
+You should also install the package in editable mode along with its dependencies:
+
+```bash
+pip install -e .
+pytest -n auto --cov=peass --cov-report=json
+```
+
+Alternatively, if you want to run tests without installing the package, run `pytest` as a Python module:
+
+```bash
+python -m pytest -n auto --cov=peass --cov-report=json
+```
 
 ### Regression Verification
 
