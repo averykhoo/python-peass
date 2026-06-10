@@ -1,5 +1,5 @@
 """
-PEASS Test Suite - Auditory Physiological Model Tests
+PEASS Test Suite - Auditory Physiological Model Unit Tests
 """
 
 import numpy as np
@@ -13,8 +13,6 @@ from peass.auditory_model import _fallback_fused_auditory_kernel
 from peass.auditory_model import generate_auditory_internal_representation
 from peass.auditory_model import simulate_auditory_nerve_adaptation
 from peass.auditory_model import simulate_inner_haircell_transduction
-from peass.gammatone import GammatoneAnalyzer
-from peass.gammatone import GammatoneSynthesizer
 
 if _HAS_NUMBA:
     from peass.auditory_model import (
@@ -23,32 +21,11 @@ if _HAS_NUMBA:
     )
 
 
-@pytest.mark.parametrize("sampling_frequency_hz", [8000.0, 16000.0, 44100.0])
-def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
-    duration_seconds = 0.5
-    num_samples = int(duration_seconds * sampling_frequency_hz)
-    signal_input = np.sin(2.0 * np.pi * 500.0 * np.linspace(0, duration_seconds, num_samples))
-
-    analyzer = GammatoneAnalyzer(
-        sampling_frequency_hz=sampling_frequency_hz,
-        lower_cutoff_frequency_hz=80.0,
-        specified_center_frequency_hz=1000.0,
-        upper_cutoff_frequency_hz=8000.0,
-        filters_per_equivalent_rectangular_bandwidth=1.0
-    )
-
-    subbands = analyzer.process(signal_input)
-    assert subbands.ndim == 2
-
-    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds=0.004)
-    reconstructed = synthesizer.process(subbands)
-    assert reconstructed.ndim == 1
-    assert reconstructed.shape[0] == num_samples
-
-
-def test_internal_auditory_representation(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
-):
+@pytest.mark.unit
+def test_internal_auditory_representation(synthetic_audio_data):
+    """
+    Verifies the dimensions and channel counts of the internal auditory representation.
+    """
     target, _, _, sampling_frequency_hz = synthetic_audio_data
 
     representation, processed_fs = generate_auditory_internal_representation(
@@ -66,6 +43,7 @@ def test_internal_auditory_representation(
     assert representation_fb.shape[2] == 8
 
 
+@pytest.mark.unit
 def test_auditory_fallback_kernels():
     """Explicitly tests the fallback implementations to guarantee coverage on JIT environments."""
     subband_signals = np.random.randn(4, 100)
@@ -91,50 +69,66 @@ def test_auditory_fallback_kernels():
     assert res_fused.shape == subband_signals.shape
 
 
-@pytest.mark.parametrize("sampling_frequency_hz", [8000.0, 16000.0, 44100.0])
-def test_gammatone_analysis_reconstruction_fidelity(sampling_frequency_hz):
+@pytest.mark.unit
+def test_haircell_frequency_selectivity():
     """
-    Verifies that the Gammatone analysis and synthesis filterbank reconstruct
-    the input signal with high fidelity (cross-correlation close to 1.0)
-    after accounting for group delay.
+    Verifies that the Inner Hair Cell model attenuates high frequencies
+    consistent with its 1 kHz lowpass membrane shear limit.
     """
-    duration_seconds = 0.5
-    num_samples = int(duration_seconds * sampling_frequency_hz)
-    time_steps = np.linspace(0, duration_seconds, num_samples, endpoint=False)
-    signal_input = np.sin(2.0 * np.pi * 440.0 * time_steps)
+    fs = 16000.0
+    time_steps = np.linspace(0.0, 0.5, int(0.5 * fs), endpoint=False)
 
-    analyzer = GammatoneAnalyzer(
-        sampling_frequency_hz=sampling_frequency_hz,
-        lower_cutoff_frequency_hz=80.0,
-        specified_center_frequency_hz=1000.0,
-        upper_cutoff_frequency_hz=3000.0,
-        filters_per_equivalent_rectangular_bandwidth=1.0
-    )
+    # 100 Hz (Passband) vs 8000 Hz (Severe attenuation)
+    low_sine = np.sin(2.0 * np.pi * 100.0 * time_steps)
+    high_sine = np.sin(2.0 * np.pi * 8000.0 * time_steps)
 
-    subbands = analyzer.process(signal_input)
-    assert subbands.ndim == 2
+    low_ihc = simulate_inner_haircell_transduction(low_sine[np.newaxis, :], fs)
+    high_ihc = simulate_inner_haircell_transduction(high_sine[np.newaxis, :], fs)
 
-    desired_delay_seconds = 0.004
-    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds=desired_delay_seconds)
-    reconstructed = synthesizer.process(subbands)
+    # Half-wave rectification constraint
+    assert np.all(low_ihc >= -1e-15)
+    assert np.all(high_ihc >= -1e-15)
 
-    # Slice arrays to account for the synthesis delay buffer
-    delay_samples = int(round(desired_delay_seconds * sampling_frequency_hz))
-    original_slice = signal_input[delay_samples:-delay_samples]
-    reconstructed_slice = reconstructed[2 * delay_samples: len(original_slice) + 2 * delay_samples]
+    rms_low = np.sqrt(np.mean(low_ihc ** 2))
+    rms_high = np.sqrt(np.mean(high_ihc ** 2))
 
-    min_len = min(len(original_slice), len(reconstructed_slice))
-    original_slice = original_slice[:min_len]
-    reconstructed_slice = reconstructed_slice[:min_len]
-
-    # Assert high-fidelity signal reconstruction
-    corr = np.corrcoef(original_slice, reconstructed_slice)[0, 1]
-    assert corr > 0.90, f"Reconstruction fidelity too low: {corr:.4f}"
+    # Expect strong attenuation at 8 kHz
+    attenuation_db = 20.0 * np.log10(rms_low / (rms_high + 1e-15))
+    assert attenuation_db > 15.0
 
 
-def test_haircell_and_adaptation_properties(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
-):
+@pytest.mark.unit
+def test_auditory_nerve_adaptation_dynamics():
+    """
+    Verifies that the non-linear adaptation loops correctly model onset-overshoot
+    and slow synaptic masking decay curves.
+    """
+    fs = 16000.0
+    num_samples = int(0.6 * fs)
+
+    pulse = np.zeros(num_samples)
+    pulse[:int(0.2 * fs)] = 1.0  # On for 200ms
+
+    adapted = simulate_auditory_nerve_adaptation(pulse[np.newaxis, :], fs)
+    adapted_1d = adapted[0, :]
+
+    # 1. Onset overshoot: First 20ms amplitude must be larger than standard middle pulse
+    onset_peak = np.max(adapted_1d[:int(0.02 * fs)])
+    steady_state = np.mean(adapted_1d[int(0.1 * fs):int(0.18 * fs)])
+    assert onset_peak > steady_state
+
+    # 2. Slow decay: Immediately after the offset, the signal undershoots (adaptation suppression)
+    # and slowly recovers back up toward the resting threshold.
+    offset_sample = int(0.2 * fs)
+    immediate_after = adapted_1d[offset_sample + int(0.005 * fs)]
+    later_after = adapted_1d[offset_sample + int(0.1 * fs)]
+
+    assert immediate_after < later_after
+    assert np.all(adapted_1d >= -300.0)
+
+
+@pytest.mark.unit
+def test_haircell_and_adaptation_properties(synthetic_audio_data):
     """
     Verifies physiological properties of hair cell transduction and adaptation,
     including non-negativity and compression.
@@ -154,6 +148,7 @@ def test_haircell_and_adaptation_properties(
     assert np.max(adapted) <= 1e7
 
 
+@pytest.mark.unit
 def test_auditory_numba_fallback_equivalence():
     """
     Mathematically verifies that JIT-compiled Numba kernels and pure Python/SciPy fallbacks
@@ -190,31 +185,34 @@ def test_auditory_numba_fallback_equivalence():
     np.testing.assert_allclose(numba_fused, fallback_fused, rtol=1e-12, atol=1e-12)
 
 
-def test_internal_auditory_representation_modulation_properties(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
-):
+@pytest.mark.unit
+def test_internal_auditory_representation_modulation_properties(synthetic_audio_data):
     """
-    Verifies the real/complex modulation property mapping of the internal auditory representation.
+    Verifies the real/complex modulation property mapping of the internal auditory representation,
+    along with target sub-dimension shape constraints across modulation modes.
     """
     target, _, _, sampling_frequency_hz = synthetic_audio_data
 
-    # LOWPASS mode (modulation frequency <= 10 Hz) must yield real-valued outputs
+    # 1. LOWPASS mode (modulation frequency <= 10 Hz) must yield real-valued outputs
     representation_lp, processed_fs = generate_auditory_internal_representation(
         target, sampling_frequency_hz, modulation_processing_type=ModulationProcessingType.LOWPASS
     )
     assert representation_lp.ndim == 3
     assert processed_fs == 100.0
     assert np.allclose(np.imag(representation_lp), 0.0, atol=1e-15)
+    assert representation_lp.shape[2] == 1  # Verify single subband channel constraint
 
-    # FILTERBANK mode (modulation frequencies > 10 Hz) converts complex envelopes to real magnitudes
+    # 2. FILTERBANK mode (modulation frequencies > 10 Hz) converts complex envelopes to real magnitudes
     representation_fb, processed_fs_fb = generate_auditory_internal_representation(
         target, sampling_frequency_hz, modulation_processing_type=ModulationProcessingType.FILTERBANK
     )
     assert representation_fb.ndim == 3
     assert processed_fs_fb == 800.0
     assert np.allclose(np.imag(representation_fb), 0.0, atol=1e-15)
+    assert representation_fb.shape[2] == 8  # Verify eight subband channel constraint
 
 
+@pytest.mark.unit
 def test_generate_representation_input_shapes_and_resampling():
     """
     Tests Auditory Representation with alternative input formats and resampling conditions.

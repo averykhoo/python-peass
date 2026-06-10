@@ -1,5 +1,6 @@
 """
-PEASS Test Suite - Subband Least-Squares Decomposition Tests
+PEASS Test Suite - Subband Least-Squares Decomposition Unit Tests
+File path: tests/unit/test_decomposition.py
 """
 
 import pathlib
@@ -36,9 +37,8 @@ def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10
     return sig_shaded
 
 
-def test_decomposition_algebraic_reconstruction(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
-):
+@pytest.mark.unit
+def test_decomposition_algebraic_reconstruction(synthetic_audio_data):
     """
     Mathematically verifies that the decomposition satisfies the fundamental
     separation error conservation identity:
@@ -81,9 +81,8 @@ def test_decomposition_algebraic_reconstruction(
     np.testing.assert_allclose(est_reconstructed, summed_sub_components, atol=1e-7, rtol=1e-7)
 
 
-def test_decomposition_file_generation(
-        audio_files_fixture: tuple[pathlib.Path, pathlib.Path, pathlib.Path]
-):
+@pytest.mark.unit
+def test_decomposition_file_generation(audio_files_fixture):
     """
     Verifies that the decomposer successfully writes output WAV files to disk
     in file-based execution mode.
@@ -118,7 +117,9 @@ def test_decomposition_file_generation(
         assert path_obj.stat().st_size > 0
 
 
+@pytest.mark.unit
 def test_decomposition_input_validation():
+    """Checks bounds validation during parameter instantiation."""
     sampling_frequency_hz = 16000.0
     signal_length = 1000
     target = np.random.randn(signal_length, 1)
@@ -139,3 +140,64 @@ def test_decomposition_input_validation():
             estimate_file=target,
             sampling_frequency_hz=None
         )
+
+
+@pytest.mark.unit
+def test_decomposition_gain_invariance_parameterized(synthetic_signal):
+    """
+    Verifies that a constant scaling (gain modification) of the target
+    is mapped entirely to Target Distortion, leaving Interference/Artifacts at zero.
+    """
+    waveform, fs = synthetic_signal
+    target = waveform
+    silent_interferer = np.zeros_like(target)
+
+    # 30% reduction in level
+    estimate = 0.7 * target
+
+    config = DecompositionConfiguration()
+    result = decompose_distortion_components(
+        source_files=[target, silent_interferer],
+        estimate_file=estimate,
+        configuration=config,
+        sampling_frequency_hz=fs
+    )
+    waveforms = result.waveforms
+
+    # Compare the synthesized target distortion against the synthesized true target.
+    # Both have passed through the identical filterbank, ensuring exact mathematical parity.
+    np.testing.assert_allclose(waveforms.target_distortion, -0.3 * waveforms.true_target, atol=1e-4, rtol=1e-4)
+
+    # Interferences and Artifacts remain mathematically negligible
+    assert np.max(np.abs(waveforms.interference)) < 1e-4
+    assert np.max(np.abs(waveforms.artifacts)) < 1e-4
+
+
+@pytest.mark.unit
+def test_decomposition_in_bounds_delay_parameterized(synthetic_signal):
+    """
+    Verifies that temporal delays within the window boundaries are absorbed
+    exclusively as Target Distortion.
+    """
+    waveform, fs = synthetic_signal
+    target = waveform
+    silent_interferer = np.zeros_like(target)
+
+    # Small delay (3 samples, well within the 40ms solver limit)
+    shift = 3
+    estimate = np.roll(target, shift, axis=0)
+    estimate[:shift, :] = 0.0
+
+    config = DecompositionConfiguration()
+    result = decompose_distortion_components(
+        source_files=[target, silent_interferer],
+        estimate_file=estimate,
+        configuration=config,
+        sampling_frequency_hz=fs
+    )
+    waveforms = result.waveforms
+
+    # Shift is in-bounds. Subband least-squares modeling allows small numerical leakage
+    # on transient edges, which is physically correct.
+    assert np.max(np.abs(waveforms.interference)) < 5e-2
+    assert np.max(np.abs(waveforms.artifacts)) < 5e-2

@@ -1,20 +1,22 @@
 """
-PEASS Test Suite - Predictor End-to-End Regressor Tests
+PEASS Test Suite - Predictor End-to-End Regressor Unit Tests
+File path: tests/unit/test_predictor.py
 """
+
 import pathlib
 
 import numpy as np
 import pytest
 
 from peass.decomposition import DecompositionConfiguration
+from peass.decomposition import decompose_distortion_components
 from peass.predictor import predict_perceptual_evaluation_scores
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize("estimate_scale", [1.0, 0.5, 0.1, 0.01])
-def test_predictor_score_range_constraints(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float],
-        estimate_scale
-):
+def test_predictor_score_range_constraints(synthetic_audio_data, estimate_scale):
+    """Verifies score scaling holds across different degradation ranges."""
     target, interferer, estimate, fs = synthetic_audio_data
 
     # Scale estimate to simulate varying degrees of signal degradation
@@ -35,7 +37,9 @@ def test_predictor_score_range_constraints(
     assert 0.0 <= results.artifact_perceptual_score <= 100.0
 
 
+@pytest.mark.unit
 def test_predictor_pristine_audio_conditions():
+    """Verifies perfect scores are assigned to pristine identical tracks."""
     sampling_frequency_hz = 16000.0
     duration_seconds = 1.5
     num_samples = int(duration_seconds * sampling_frequency_hz)
@@ -57,9 +61,8 @@ def test_predictor_pristine_audio_conditions():
     assert results.interference_perceptual_score > 90.0
 
 
-def test_predictor_file_based_execution(
-        audio_files_fixture: tuple[pathlib.Path, pathlib.Path, pathlib.Path]
-):
+@pytest.mark.unit
+def test_predictor_file_based_execution(audio_files_fixture):
     """
     Verifies that the end-to-end predictor runs successfully in file-based mode.
     """
@@ -84,9 +87,8 @@ def test_predictor_file_based_execution(
     assert pathlib.Path(results.decomposition_files.true_target).is_file()
 
 
-def test_predictor_with_alternative_options(
-        synthetic_audio_data: tuple[np.ndarray, np.ndarray, np.ndarray, float]
-):
+@pytest.mark.unit
+def test_predictor_with_alternative_options(synthetic_audio_data):
     """
     Tests predictor behavior when invoking custom parameters like use_two_stage_projection.
     """
@@ -111,3 +113,63 @@ def test_predictor_with_alternative_options(
     assert 0.0 <= results.target_perceptual_score <= 100.0
     assert 0.0 <= results.interference_perceptual_score <= 100.0
     assert 0.0 <= results.artifact_perceptual_score <= 100.0
+
+
+@pytest.mark.unit
+def test_stress_and_empty_edge_cases():
+    """
+    Tests edge cases (complete silence, very short inputs) to verify
+    zero-division and dimensionality crash resistance.
+    """
+    fs = 16000.0
+    num_samples = int(1.0 * fs)
+
+    silent_target = np.zeros((num_samples, 1))
+    silent_noise = np.zeros((num_samples, 1))
+    silent_estimate = np.zeros((num_samples, 1))
+
+    # 1. Silent signals should evaluate cleanly without division-by-zero crashes
+    scores = predict_perceptual_evaluation_scores(
+        original_files=[silent_target, silent_noise],
+        estimate_file=silent_estimate,
+        sampling_frequency_hz=fs
+    )
+
+    assert 0.0 <= scores.overall_perceptual_score <= 100.0
+    assert 0.0 <= scores.target_perceptual_score <= 100.0
+
+    # 2. Short signals should raise appropriate value errors rather than unhandled array exceptions
+    short_target = np.random.randn(10, 1)
+    short_noise = np.zeros_like(short_target)
+    short_estimate = short_target.copy()
+
+    with pytest.raises(ValueError):
+        decompose_distortion_components(
+            source_files=[short_target, short_noise],
+            estimate_file=short_estimate,
+            sampling_frequency_hz=fs
+        )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("gain_scaling", [2.0, 1.0, 0.1, 1e-4])  # Amplified, Standard, Quiet, Near-Silent
+def test_predictor_amplitude_robustness(synthetic_audio_data, gain_scaling):
+    """
+    Verifies that scoring and mathematical mappings do not crash or produce NaN values
+    when subjected to high or extremely low signal amplitudes.
+    """
+    target, interferer, estimate, fs = synthetic_audio_data
+
+    scaled_target = target * gain_scaling
+    scaled_interferer = interferer * gain_scaling
+    scaled_estimate = estimate * gain_scaling
+
+    results = predict_perceptual_evaluation_scores(
+        original_files=[scaled_target, scaled_interferer],
+        estimate_file=scaled_estimate,
+        sampling_frequency_hz=fs
+    )
+
+    # Confirm that scores remain numbers rather than NaN or Inf
+    assert not np.isnan(results.overall_perceptual_score)
+    assert not np.isinf(results.overall_perceptual_score)

@@ -1,20 +1,24 @@
 """
 PEASS Test Suite - Pipeline Integration Tests
+File path: tests/integration/test_pipeline.py
 """
 
 import numpy as np
+import pytest
 
 from peass import calculate_auditory_quality_features
 from peass import calculate_bss_eval_energy_ratios
 from peass import predict_perceptual_evaluation_scores
+from peass.decomposition import DecompositionConfiguration
 from peass.decomposition import decompose_distortion_components
 
 
+@pytest.mark.integration
 def test_end_to_end_stereo_separation():
     """
     Integration test using multi-channel (Stereo) inputs.
     Verifies that the entire PEASS pipeline (decomposition, metrics, and prediction)
-    runs with 2-channel stereo arrays, handling the collapsed worst-channel scores correctly.
+    runs with 2-channel stereo arrays, handling the collapsed worst-channel scores.
     """
     sampling_frequency = 16000.0
     duration_seconds = 1.0
@@ -57,10 +61,11 @@ def test_end_to_end_stereo_separation():
     assert decomp_waveforms.artifacts.shape == (num_samples, 2)
 
 
+@pytest.mark.integration
 def test_silent_reference_robustness():
     """
-    Tests edge-case where one of the interfering sources is completely silent (all zeros).
-    Verifies that the decomposition and scoring models do not crash or trigger division-by-zero errors.
+    Tests edge-case where one of the interfering sources is completely silent.
+    Verifies that the decomposition and scoring models do not crash or trigger division-by-zero.
     """
     sampling_frequency = 16000.0
     duration_seconds = 0.5
@@ -81,9 +86,10 @@ def test_silent_reference_robustness():
     assert 0.0 <= results.overall_perceptual_score <= 100.0
 
 
+@pytest.mark.integration
 def test_sequential_component_execution_pipeline():
     """
-    Integration test directly chaining manual outputs of each component.
+    Integration test directly chaining manual outputs of each component:
     Decomposition -> Metrics -> Neural Net Scoring.
     """
     sampling_frequency = 16000.0
@@ -127,3 +133,44 @@ def test_sequential_component_execution_pipeline():
     assert -1.0 <= q_interf <= 1.0
     assert -1.0 <= q_artif <= 1.0
     assert -1.0 <= q_global <= 1.0
+
+
+@pytest.mark.integration
+def test_predictor_pipeline_on_database_assets(database_audio_pair):
+    """Tests the entire neural-network scoring pipeline on real files."""
+    target, interferer, fs, _ = database_audio_pair
+
+    # Simulate a realistic separation estimate (Target + low-level leakage + small noise)
+    estimate = target + 0.05 * interferer + 0.01 * np.random.randn(*target.shape)
+
+    # Execute full scoring pipeline
+    results = predict_perceptual_evaluation_scores(
+        original_files=[target, interferer],
+        estimate_file=estimate,
+        sampling_frequency_hz=fs
+    )
+
+    # Assert physical output bounds are maintained
+    assert 0.0 <= results.overall_perceptual_score <= 100.0
+    assert 0.0 <= results.target_perceptual_score <= 100.0
+    assert 0.0 <= results.interference_perceptual_score <= 100.0
+    assert 0.0 <= results.artifact_perceptual_score <= 100.0
+
+
+@pytest.mark.integration
+def test_decomposition_correctness_on_database_assets(database_audio_pair):
+    """Tests the physical least-squares decomposition on real files."""
+    target, interferer, fs, _ = database_audio_pair
+    estimate = target + 0.1 * interferer
+
+    config = DecompositionConfiguration()
+    result = decompose_distortion_components(
+        source_files=[target, interferer],
+        estimate_file=estimate,
+        configuration=config,
+        sampling_frequency_hz=fs
+    )
+
+    # Assert that the extracted physical interference correlates with the actual source
+    corr_interf = np.corrcoef(result.waveforms.interference.ravel(), interferer.ravel())[0, 1]
+    assert corr_interf > 0.85

@@ -37,7 +37,7 @@ def matlab_ref_resources(resources_dir):
 
 @pytest.fixture(scope="session")
 def training_dataset_dir(project_root):
-    """Path to the full training dataset (for future model training tests)."""
+    """Path to the full training dataset."""
     return project_root / "dataset"
 
 
@@ -92,3 +92,54 @@ def audio_files_fixture(
         sf.write(estimate_path, estimate, int(fs))
 
         yield target_path, interferer_path, estimate_path
+
+
+@pytest.fixture(params=["sine", "square", "triangle", "chirp", "noise"])
+def synthetic_signal(request) -> tuple[np.ndarray, float]:
+    """
+    Generates parameterized waveforms to verify mathematical robustness across
+    periodic, discontinuous, and stochastic signal profiles.
+    """
+    signal_type = request.param
+    sampling_frequency = 16000.0
+    duration = 1.5
+    num_samples = int(duration * sampling_frequency)
+    time_steps = np.linspace(0.0, duration, num_samples, endpoint=False)
+
+    rng = np.random.default_rng(seed=42)
+
+    if signal_type == "sine":
+        data = np.sin(2.0 * np.pi * 440.0 * time_steps)
+    elif signal_type == "square":
+        data = signal.square(2.0 * np.pi * 200.0 * time_steps)
+    elif signal_type == "triangle":
+        data = signal.sawtooth(2.0 * np.pi * 200.0 * time_steps, width=0.5)
+    elif signal_type == "chirp":
+        data = signal.chirp(time_steps, f0=50.0, t1=duration, f1=8000.0, method="linear")
+    elif signal_type == "noise":
+        data = rng.normal(0.0, 0.2, num_samples)
+    else:
+        raise ValueError("Invalid signal type requested.")
+
+    # Normalize to prevent digital clipping
+    data = data / (np.max(np.abs(data)) + 1e-9) * 0.9
+    return data[:, np.newaxis], sampling_frequency
+
+
+@pytest.fixture(params=[
+    ("exp01_target.wav", "exp01_InterfSrc1.wav", "mono_16k"),  # Mono, 16kHz
+    ("exp03_target.wav", "exp03_InterfSrc1.wav", "stereo_16k"),  # Stereo, 16kHz
+])
+def database_audio_pair(request, db_resources) -> tuple[np.ndarray, np.ndarray, float, str]:
+    """
+    Yields real audio pairs from the database covering different channel layouts.
+    Returns: (target, interferer, sampling_rate, identifier_string)
+    """
+    target_filename, interferer_filename, identifier = request.param
+    target_path = db_resources / target_filename
+    interferer_path = db_resources / interferer_filename
+
+    target, fs = sf.read(target_path)
+    interferer, _ = sf.read(interferer_path)
+
+    return target, interferer, float(fs), identifier
