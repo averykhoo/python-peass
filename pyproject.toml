@@ -6,10 +6,10 @@ build-backend = "flit_core.buildapi"
 name = "python-peass"
 dynamic = ["version", "description"]
 authors = [
-    {name = "Avery Khoo", email = "avery.khoo@gmail.com"}
+    { name = "Avery Khoo", email = "avery.khoo@gmail.com" }
 ]
 readme = "README.md"
-license = {file = "LICENSE"}
+license = { file = "LICENSE" }
 requires-python = ">=3.10"
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,4 +48,11 @@ exclude = [
     "references/*",
     "tests/*",
     ".github/*"
+]
+
+[tool.pytest.ini_options]
+markers = [
+    "unit: Isolated fast-running tests targeting single modules.",
+    "integration: Multi-module system pipeline tests.",
+    "regression: Slower validation checks comparing with legacy reference data."
 ]
