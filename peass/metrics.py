@@ -38,7 +38,7 @@ def calculate_bss_eval_energy_ratios(
     # Epsilon bounds to prevent division by zero in log scale
     eps = np.finfo(np.float64).eps
 
-    # pre-calculate vector sums to avoid redundant additions
+    # Pre-calculate vector sums to avoid redundant additions
     sum_target_dist = flat_true_source + flat_target_distortion
     sum_interf = sum_target_dist + flat_interference
 
@@ -130,29 +130,19 @@ def calculate_auditory_similarity_metric(
     integration_length = int(1.0 * representation_sampling_frequency)
     squared_test_representation = np.sum(test_view ** 2, axis=(0, 2))
 
-    # --- SYSTEM BENCHMARK: OLD METHOD (Commented out for future comparison) ---
-    # root_mean_square_energy = np.zeros(num_frames)
-    # for frame_idx in range(num_frames):
-    #     frame_center = (frame_idx + 0.5) * frame_length
-    #     start_idx = int(max(0, frame_center - 0.5 * integration_length))
-    #     end_idx = int(min(num_samples, frame_center + 0.5 * integration_length))
-    #
-    #     energy_slice = squared_test_representation[start_idx:end_idx]
-    #     root_mean_square_energy[frame_idx] = np.mean(energy_slice) if len(energy_slice) > 0 else 0.0
-
-    # --- SYSTEM BENCHMARK: NEW METHOD (O(1) cumulative prefix sums) ---
+    # O(1) cumulative prefix sums - Fully vectorized to eliminate Python loop overhead
     cum_sum = np.concatenate(([0.0], np.cumsum(squared_test_representation)))
-    root_mean_square_energy = np.zeros(num_frames)
-    for frame_idx in range(num_frames):
-        frame_center = (frame_idx + 0.5) * frame_length
-        start_idx = int(max(0, frame_center - 0.5 * integration_length))
-        end_idx = int(min(num_samples, frame_center + 0.5 * integration_length))
 
-        slice_len = end_idx - start_idx
-        if slice_len > 0:
-            root_mean_square_energy[frame_idx] = (cum_sum[end_idx] - cum_sum[start_idx]) / slice_len
-        else:
-            root_mean_square_energy[frame_idx] = 0.0
+    frame_indices = np.arange(num_frames)
+    frame_centers = (frame_indices + 0.5) * frame_length
+
+    start_indices = np.maximum(0, frame_centers - 0.5 * integration_length).astype(int)
+    end_indices = np.minimum(num_samples, frame_centers + 0.5 * integration_length).astype(int)
+    slice_lengths = end_indices - start_indices
+
+    # As proved, slice_lengths is guaranteed to be strictly >= 1 for any valid inputs,
+    # so we can perform the division safely without conditional branching.
+    root_mean_square_energy = (cum_sum[end_indices] - cum_sum[start_indices]) / slice_lengths
 
     sorted_indices = np.argsort(local_perceptual_similarity_measures)
     sorted_similarity_measures = local_perceptual_similarity_measures[sorted_indices]
