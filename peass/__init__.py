@@ -11,10 +11,12 @@ from .config import DecompositionConfiguration
 from .config import DecompositionResult
 from .config import ModulationProcessingType
 from .config import PerceptualSeparationScores
-from .decomposition import decompose_distortion_components
-from .metrics import calculate_auditory_quality_features
-from .metrics import calculate_bss_eval_energy_ratios
-from .predictor import predict_perceptual_evaluation_scores
+
+# Route top-level execution functions through the core dispatcher
+from .core.dispatch import calculate_auditory_quality_features
+from .core.dispatch import calculate_bss_eval_energy_ratios
+from .core.dispatch import decompose_distortion_components
+from .core.dispatch import predict_perceptual_evaluation_scores
 
 __all__ = [
     "DecomposedFilePaths",

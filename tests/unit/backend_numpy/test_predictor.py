@@ -8,9 +8,9 @@ import pathlib
 import numpy as np
 import pytest
 
-from peass.decomposition import DecompositionConfiguration
-from peass.decomposition import decompose_distortion_components
-from peass.predictor import predict_perceptual_evaluation_scores
+from peass.backend_numpy.decomposition import DecompositionConfiguration
+from peass.backend_numpy.decomposition import decompose_distortion_components
+from peass.backend_numpy.predictor import predict_perceptual_evaluation_scores
 
 
 @pytest.mark.unit

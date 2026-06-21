@@ -12,13 +12,14 @@ from functools import lru_cache
 import numpy as np
 import soundfile as sf
 
-from .config import DecompositionConfiguration
-from .config import PerceptualSeparationScores
+from peass.config import DecompositionConfiguration
+from peass.config import PerceptualSeparationScores
 from .decomposition import decompose_distortion_components
 from .metrics import calculate_auditory_quality_features
 from .metrics import calculate_bss_eval_energy_ratios
 
-MODEL_WEIGHTS_DIRECTORY = os.path.join(os.path.dirname(os.path.realpath(__file__)), "parameters")
+# Adjust path up 2 levels to locate peass/parameters/
+MODEL_WEIGHTS_DIRECTORY = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "parameters")
 
 
 @lru_cache

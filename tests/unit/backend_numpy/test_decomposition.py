@@ -8,10 +8,10 @@ import pathlib
 import numpy as np
 import pytest
 
-from peass.decomposition import DecompositionConfiguration
-from peass.decomposition import decompose_distortion_components
-from peass.decomposition import run_auditory_analysis_filterbank
-from peass.decomposition import run_auditory_synthesis_filterbank
+from peass.backend_numpy.decomposition import DecompositionConfiguration
+from peass.backend_numpy.decomposition import decompose_distortion_components
+from peass.backend_numpy.decomposition import run_auditory_analysis_filterbank
+from peass.backend_numpy.decomposition import run_auditory_synthesis_filterbank
 
 
 def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10.0,

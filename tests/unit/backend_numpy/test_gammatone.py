@@ -6,13 +6,13 @@ File path: tests/unit/test_gammatone.py
 import numpy as np
 import pytest
 
-from peass.gammatone import GammatoneAnalyzer
-from peass.gammatone import GammatoneFilter
-from peass.gammatone import GammatoneSynthesizer
-from peass.gammatone import calculate_equivalent_rectangular_bandwidth
-from peass.gammatone import convert_equivalent_rectangular_bandwidth_scale_to_frequency
-from peass.gammatone import convert_frequency_to_equivalent_rectangular_bandwidth_scale
-from peass.gammatone import get_equivalent_rectangular_bandwidth_center_frequencies
+from peass.backend_numpy.gammatone import GammatoneAnalyzer
+from peass.backend_numpy.gammatone import GammatoneFilter
+from peass.backend_numpy.gammatone import GammatoneSynthesizer
+from peass.backend_numpy.gammatone import calculate_equivalent_rectangular_bandwidth
+from peass.backend_numpy.gammatone import convert_equivalent_rectangular_bandwidth_scale_to_frequency
+from peass.backend_numpy.gammatone import convert_frequency_to_equivalent_rectangular_bandwidth_scale
+from peass.backend_numpy.gammatone import get_equivalent_rectangular_bandwidth_center_frequencies
 
 
 @pytest.mark.unit
@@ -152,10 +152,10 @@ def test_gammatone_fallback_vs_jit_equivalence():
     Verifies that disabling Numba JIT acceleration forces the filterbank
     to run on the fallback path and produces identical outputs down to float precision.
     """
-    import peass.gammatone as gammatone
+    import peass.backend_numpy.gammatone as gammatone
     if not gammatone._HAS_NUMBA:
         pytest.skip("Numba is not installed or enabled in this environment.")
-    from peass.gammatone import GammatoneAnalyzer
+    from peass.backend_numpy.gammatone import GammatoneAnalyzer
 
     # Generate a random signal
     rng = np.random.default_rng(seed=123)

@@ -5,20 +5,20 @@ Decomposes the separation error of a source estimate into Target distortion,
 Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
 and zero-copy arrays.
 """
-import warnings
-from scipy.linalg import LinAlgWarning
 import pathlib
+import warnings
 from functools import lru_cache
 
 import numpy as np
 import scipy.linalg as linalg
 import scipy.signal as signal
 import soundfile as sf
+from scipy.linalg import LinAlgWarning
 
-from .config import DecomposedFilePaths
-from .config import DecomposedWaveforms
-from .config import DecompositionConfiguration
-from .config import DecompositionResult
+from peass.config import DecomposedFilePaths
+from peass.config import DecomposedWaveforms
+from peass.config import DecompositionConfiguration
+from peass.config import DecompositionResult
 from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
 from .gammatone import calculate_equivalent_rectangular_bandwidth

@@ -6,8 +6,8 @@ File path: tests/unit/test_metrics.py
 import numpy as np
 import pytest
 
-from peass.metrics import calculate_auditory_similarity_metric
-from peass.metrics import calculate_bss_eval_energy_ratios
+from peass.backend_numpy.metrics import calculate_auditory_similarity_metric
+from peass.backend_numpy.metrics import calculate_bss_eval_energy_ratios
 
 
 @pytest.mark.unit

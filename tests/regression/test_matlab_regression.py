@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 import soundfile as sf
 
-from peass.decomposition import DecompositionConfiguration
-from peass.decomposition import decompose_distortion_components
+from peass import DecompositionConfiguration
+from peass import decompose_distortion_components
 
 
 @pytest.mark.regression

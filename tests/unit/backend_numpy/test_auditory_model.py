@@ -6,16 +6,16 @@ import numpy as np
 import pytest
 import scipy.signal as signal
 
-from peass.auditory_model import ModulationProcessingType
-from peass.auditory_model import _HAS_NUMBA
-from peass.auditory_model import _fallback_adaptation_loops
-from peass.auditory_model import _fallback_fused_auditory_kernel
-from peass.auditory_model import generate_auditory_internal_representation
-from peass.auditory_model import simulate_auditory_nerve_adaptation
-from peass.auditory_model import simulate_inner_haircell_transduction
+from peass.backend_numpy.auditory_model import ModulationProcessingType
+from peass.backend_numpy.auditory_model import _HAS_NUMBA
+from peass.backend_numpy.auditory_model import _fallback_adaptation_loops
+from peass.backend_numpy.auditory_model import _fallback_fused_auditory_kernel
+from peass.backend_numpy.auditory_model import generate_auditory_internal_representation
+from peass.backend_numpy.auditory_model import simulate_auditory_nerve_adaptation
+from peass.backend_numpy.auditory_model import simulate_inner_haircell_transduction
 
 if _HAS_NUMBA:
-    from peass.auditory_model import (
+    from peass.backend_numpy.auditory_model import (
         _numba_adaptation_loops_kernel,
         _numba_fused_auditory_kernel,
     )

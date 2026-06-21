@@ -11,7 +11,7 @@ import math
 import numpy as np
 import scipy.signal as signal
 
-from .config import ModulationProcessingType
+from peass.config import ModulationProcessingType
 from .gammatone import GammatoneAnalyzer
 from .gammatone import fast_resample_poly
 
