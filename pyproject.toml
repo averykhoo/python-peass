@@ -34,6 +34,9 @@ dependencies = [
 numba = [
     "numba >= 0.56.0"
 ]
+torch = [
+    "torch >= 2.0.0"
+]
 
 [project.urls]
 Homepage = "https://github.com/averykhoo/python-peass"
