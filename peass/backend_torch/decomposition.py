@@ -50,14 +50,12 @@ def perform_least_squares_projection_torch(
     if source_energy < 1e-13:
         return torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype, device=source_estimates.device)
 
-    # Build Toeplitz matrix using fast 1D striding
+    # Build Toeplitz matrix using fast 1D striding (unfolded directly without extra F.pad)
     strided_views = []
     for s_idx in range(num_sources):
         source_signal = true_sources[:, s_idx]
-        # Padding for strided sliding window
-        pad_sig = F.pad(source_signal, (filter_length - 1, 0))
-        view = pad_sig.unfold(0, filter_length, 1).flip(-1)
-        strided_views.append(view[:num_samples])
+        view = source_signal.unfold(0, filter_length, 1).flip(-1)
+        strided_views.append(view)
 
     toeplitz_matrix = torch.cat(strided_views, dim=1)
 
@@ -111,7 +109,8 @@ def perform_time_varying_least_squares_projection_torch(
     # Dynamically resolve real-valued dtype to prevent arange complex exception
     real_dtype = get_real_dtype(source_estimates.dtype)
 
-    hann_window = torch.hann_window(window_length, periodic=False, device=source_estimates.device, dtype=real_dtype)
+    # Match SciPy's sym=False with periodic=True
+    hann_window = torch.hann_window(window_length, periodic=True, device=source_estimates.device, dtype=real_dtype)
     analysis_window = torch.sqrt(torch.flip(hann_window, dims=[0]))
     synthesis_window = torch.sqrt(torch.flip(hann_window, dims=[0]))
 
@@ -241,7 +240,26 @@ def run_auditory_analysis_filterbank_torch(
     modulation_matrix: torch.Tensor | None = None
 ) -> tuple[list[torch.Tensor], GammatoneAnalyzerTorch, torch.Tensor]:
     """Runs parallel analytical complex-valued filterbanks."""
-    analyzer = GammatoneAnalyzerTorch(fs, 20.0, 1000.0, fs / 2.0, 1.0, signal_waveform.device, signal_waveform.dtype)
+
+    minimum_frequency = 20.0
+    maximum_frequency = fs / 2.0
+    base_frequency = 1000.0
+    filters_per_erb = 1.0
+
+    # 1. Apply Anti-Aliasing Polyphase Upsampling
+    original_fs = fs
+    if fs / 2.0 < 1.5 * maximum_frequency:
+        new_fs = int(round(1.5 * fs))
+        signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs))
+        fs = float(new_fs)
+
+    analyzer = GammatoneAnalyzerTorch(
+        fs, minimum_frequency, base_frequency, maximum_frequency, filters_per_erb,
+        signal_waveform.device, signal_waveform.dtype
+    )
+
+    # Save the original sample rate onto the analyzer object to match NumPy behavior
+    analyzer.original_sampling_frequency_hz = original_fs
 
     subbands_output = analyzer.process(signal_waveform)
     num_bands = subbands_output.shape[0]
@@ -285,11 +303,19 @@ def run_auditory_synthesis_filterbank_torch(
     mod_matrix = torch.exp(2j * math.pi / analyzer.fs * analyzer.center_frequencies.unsqueeze(1) * time_steps)
     processed = processed * mod_matrix
 
-    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    # -------------------------------------------------------------------------
+    # FIXED: Replaced hardcoded 0.004 (4ms) delay with 1000.0 / analyzer.fs (41.67ms at 24kHz)
+    # -------------------------------------------------------------------------
+    desired_delay_seconds = 1000.0 / analyzer.fs
+    synth = GammatoneSynthesizerTorch(analyzer, desired_delay_seconds)
     reconstructed = synth.process(processed)
 
-    # Account for synthesizer delay offsets
-    delay_samples = int(round(0.004 * analyzer.fs))
+    # 1. Downsample back to the original frequency to prevent duration expansion
+    original_fs = analyzer.original_sampling_frequency_hz
+    reconstructed = fast_resample_poly_torch(reconstructed, int(original_fs), int(analyzer.fs))
+
+    # 2. Account for synthesizer delay offsets AT the original sampling frequency
+    delay_samples = int(round(desired_delay_seconds * original_fs))
     return reconstructed[delay_samples:]
 
 

@@ -57,15 +57,19 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
     x_up = torch.zeros((B, in_len * up), dtype=x.dtype, device=x.device)
     x_up[:, ::up] = x_flat
 
-    # Calculate and apply input tail padding to prevent early Conv1D truncation
-    required_len = n_pre_remove * down + out_len * down + h_padded.shape[0]
-    pad_needed = required_len - x_up.shape[1]
-    if pad_needed > 0:
-        x_up = F.pad(x_up, (0, pad_needed))
+    # Calculate and apply input padding (causal padding at start, remainder at end)
+    K = h_padded.shape[0]
+    pad_left = K - 1
 
-    # Downsampling via Stride Convolution
-    weights = h_padded.view(1, 1, -1)
-    x_conv = F.conv1d(x_up.unsqueeze(1), weights, stride=down).squeeze(1)
+    required_conv_len = n_pre_remove + out_len
+    L_required = (required_conv_len - 1) * down + K
+    pad_right = max(0, L_required - (x_up.shape[1] + pad_left))
+
+    x_up_padded = F.pad(x_up, (pad_left, pad_right))
+
+    # Downsampling via Stride Convolution (Flipped weights for true convolution)
+    weights = h_padded.flip(-1).view(1, 1, -1)
+    x_conv = F.conv1d(x_up_padded.unsqueeze(1), weights, stride=down).squeeze(1)
 
     # Slice and reconstruct shapes
     y_flat = x_conv[:, n_pre_remove: n_pre_remove + out_len]

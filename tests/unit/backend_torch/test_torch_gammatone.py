@@ -1,9 +1,11 @@
 import math
 
-import torch
-import pytest
 import numpy as np
-from peass.backend_torch.gammatone import GammatoneAnalyzerTorch, GammatoneSynthesizerTorch
+import pytest
+import torch
+
+from peass.backend_torch.gammatone import GammatoneAnalyzerTorch
+from peass.backend_torch.gammatone import GammatoneSynthesizerTorch
 from tests.conftest import to_numpy_format
 
 
