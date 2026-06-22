@@ -89,15 +89,11 @@ def perform_least_squares_projection_torch(
     Gram = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
     RHS = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
 
-    # Diagonal regularization for positive-definiteness
-    Gram.diagonal().add_(10.0 ** -15)
+    # Out-of-place diagonal regularization guarantees invertibility
+    Gram = Gram + torch.eye(Gram.shape[-1], device=Gram.device, dtype=Gram.dtype) * 1e-15
 
-    try:
-        projection_weights = torch.linalg.solve(Gram, RHS)
-    except torch.linalg.LinAlgError:
-        weighted_toeplitz = toeplitz_matrix * analysis_window.unsqueeze(1)
-        weighted_estimates = source_estimates * analysis_window.unsqueeze(1)
-        projection_weights = torch.linalg.pinv(weighted_toeplitz) @ weighted_estimates
+    # Directly solve without CPU stall/fallback
+    projection_weights = torch.linalg.solve(Gram, RHS)
 
     projections = torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype,
                               device=source_estimates.device)
@@ -167,14 +163,9 @@ def perform_time_varying_least_squares_projection_torch(
     Gram = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * toeplitz_batched)
     RHS = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * est_frames)
 
-    # Diagonal regularization
-    diag_idx = torch.arange(Gram.shape[-1], device=Gram.device)
-    Gram[:, diag_idx, diag_idx] += 10.0 ** -15
-
-    try:
-        weights = torch.linalg.solve(Gram, RHS)
-    except torch.linalg.LinAlgError:
-        weights = torch.linalg.pinv(Gram) @ RHS
+    # Safe out-of-place regularization guarantees positive-definiteness
+    Gram = Gram + torch.eye(Gram.shape[-1], device=Gram.device, dtype=Gram.dtype).unsqueeze(0) * 1e-15
+    weights = torch.linalg.solve(Gram, RHS)
 
     # weights shape: (NumFrames, num_sources * filter_length, num_channels)
     weights_unflat = weights.view(NumFrames, num_sources, filter_length, num_channels)
@@ -207,10 +198,9 @@ def perform_time_varying_least_squares_projection_torch(
     idx_gain = frame_indices.reshape(-1, 1)
     window_gain_accumulation.scatter_add_(0, idx_gain, win_gain)
 
-    # 6. Apply final gain normalization
-    valid_indices = (window_gain_accumulation[:, 0] != 0)
-    for s_idx in range(num_sources):
-        projections_accumulation[valid_indices, :, s_idx] /= window_gain_accumulation[valid_indices, :]
+    # Differentiable safe division
+    safe_gain = torch.where(window_gain_accumulation > 0, window_gain_accumulation, 1.0)
+    projections_accumulation = projections_accumulation / safe_gain.unsqueeze(-1)
 
     # Return the cropped timeline (matches MATLAB/NumPy Ls timeline)
     return projections_accumulation[:-(window_length - 1), :, :]

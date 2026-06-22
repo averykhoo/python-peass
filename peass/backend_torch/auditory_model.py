@@ -3,7 +3,6 @@ PEASS PyTorch Auditory Nerve Model
 File path: peass/backend_torch/auditory_model.py
 """
 import math
-import os
 from functools import lru_cache
 
 import torch
@@ -11,32 +10,35 @@ import torch.nn.functional as F
 
 from .gammatone import GammatoneAnalyzerTorch
 from .utils import fast_resample_poly_torch
-from .utils import smoothmax
 from ..config import ModulationProcessingType
 
 
-@lru_cache(maxsize=8)
-def _get_modulation_filters_fft(target_fs: float, N_fft: int, centers_tuple: tuple, bandwidths_tuple: tuple,
-                                device_str: str):
+@lru_cache(maxsize=4)
+def _get_adaptation_constants(fs: float, device_str: str, dtype: torch.dtype):
     device = torch.device(device_str)
-    num_mods = len(centers_tuple)
-    H_all = torch.zeros((num_mods, N_fft), dtype=torch.complex128, device=device)
+    abs_thresh = 10.0 ** (-100.0 / 20.0)
+    bws = 1.0 / (math.pi * torch.tensor([0.005, 0.05, 0.129, 0.253, 0.5], device=device, dtype=dtype))
+    gains = torch.exp(-math.pi * bws / fs)
+    thresholds = torch.tensor([abs_thresh ** (0.5 ** i) for i in range(1, 6)], device=device, dtype=dtype)
+    return abs_thresh, gains, thresholds
 
-    decay_samples = int(target_fs * 0.5)
-    time_indices = torch.arange(decay_samples, device=device, dtype=torch.float64)
 
-    for m_idx in range(num_mods):
-        g = math.exp(-math.pi * bandwidths_tuple[m_idx] / target_fs)
-        b0 = 1.0 - g
-
-        # Math Shortcut: Use vector exp instead of expensive array exponentiation `a1 ** t`
-        log_g = math.log(g)
-        phase = 2j * math.pi * centers_tuple[m_idx] / target_fs
-        ir = b0 * torch.exp(time_indices * (log_g + phase))
-
-        H_all[m_idx] = torch.fft.fft(ir, n=N_fft)
-
-    return H_all
+@lru_cache(maxsize=4)
+def _get_modulation_constants(mod_type: str, device_str: str, dtype: torch.dtype):
+    device = torch.device(device_str)
+    if mod_type == "LOWPASS":
+        centers = torch.tensor([0.0], device=device, dtype=dtype)
+        bandwidths = torch.tensor([15.92], device=device, dtype=dtype)
+    else:
+        centers = torch.cat([
+            torch.tensor([0.0, 5.0], device=device, dtype=dtype),
+            10.0 * (5.0 / 3.0) ** torch.arange(6, device=device, dtype=dtype)
+        ])
+        bandwidths = torch.cat([
+            torch.tensor([5.0, 5.0], device=device, dtype=dtype),
+            5.0 * (5.0 / 3.0) ** torch.arange(6, device=device, dtype=dtype)
+        ])
+    return centers, bandwidths
 
 
 def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> torch.Tensor:
@@ -63,74 +65,62 @@ def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> t
     return transduced.view(*orig_shape)
 
 
-def _raw_adaptation_loop(subbands: torch.Tensor, fs: float, thresholds: torch.Tensor, gains: torch.Tensor,
+@torch.jit.script
+def _raw_adaptation_loop(subbands_flat: torch.Tensor, thresholds: torch.Tensor, gains: torch.Tensor,
                          abs_thresh: float) -> torch.Tensor:
-    orig_shape = subbands.shape
-    T = orig_shape[-1]
-    subbands_flat = subbands.view(-1, T)
-    B = subbands_flat.shape[0]
+    """
+    JIT-compiled loop that is fully autograd-compatible.
+    Uses Lists and Stacks to ensure no gradients are broken via in-place mutation.
+    """
+    B, T = subbands_flat.shape
+    states = thresholds.unsqueeze(0).expand(B, 5)
 
-    adapted = torch.empty_like(subbands_flat)
-    states = thresholds.unsqueeze(0).expand(B, 5).clone()
+    outputs: list[torch.Tensor] = []
 
     for t in range(T):
-        val = smoothmax(subbands_flat[:, t], abs_thresh)
+        val = subbands_flat[:, t]
+        val = torch.nn.functional.softplus(1000.0 * (val - abs_thresh)) / 1000.0 + abs_thresh
+
+        new_states: list[torch.Tensor] = []
         for stage in range(5):
             g = gains[stage]
             th = thresholds[stage]
             st = states[:, stage]
 
             val_compressed = val / st
-            # Smoothmax preserves gradients
-            new_st = smoothmax((1.0 - g) * val_compressed + g * st, th)
+            new_st = torch.nn.functional.softplus(1000.0 * ((1.0 - g) * val_compressed + g * st - th)) / 1000.0 + th
 
-            states[:, stage] = new_st
+            new_states.append(new_st)
             val = val_compressed
 
-        adapted[:, t] = val
+        states = torch.stack(new_states, dim=1)
+        outputs.append(val)
 
-    return adapted.view(*orig_shape)
-
-
-# Optimize compilation path: Bypass cold-start JIT compilations on CPU / Windows environments
-_SHOULD_COMPILE = torch.cuda.is_available() and os.environ.get("PEASS_NO_COMPILE") != "1"
-
-if _SHOULD_COMPILE:
-    try:
-        _compiled_adaptation_loop = torch.compile(_raw_adaptation_loop, mode="reduce-overhead", fullgraph=True)
-    except Exception:
-        _compiled_adaptation_loop = _raw_adaptation_loop
-else:
-    _compiled_adaptation_loop = _raw_adaptation_loop
+    return torch.stack(outputs, dim=1)
 
 
 def simulate_auditory_nerve_adaptation(subbands: torch.Tensor, fs: float) -> torch.Tensor:
-    """Simulates the physiological adaptive properties of the auditory nerve."""
-    abs_thresh = 10.0 ** (-100.0 / 20.0)
-    bws = 1.0 / (math.pi * torch.tensor([0.005, 0.05, 0.129, 0.253, 0.5], device=subbands.device, dtype=subbands.dtype))
+    abs_thresh, gains, thresholds = _get_adaptation_constants(fs, str(subbands.device), subbands.dtype)
 
-    gains = torch.exp(-math.pi * bws / fs)
-    thresholds = torch.tensor([abs_thresh ** (0.5 ** i) for i in range(1, 6)], device=subbands.device,
-                              dtype=subbands.dtype)
+    orig_shape = subbands.shape
+    T = orig_shape[-1]
 
-    adapted = _compiled_adaptation_loop(subbands, fs, thresholds, gains, abs_thresh)
+    adapted = _raw_adaptation_loop(subbands.view(-1, T), thresholds, gains, abs_thresh)
+    adapted = adapted.view(*orig_shape)
 
     final_thresh = abs_thresh ** (0.5 ** 5)
     return (100.0 / (1.0 - final_thresh)) * (adapted - final_thresh)
 
 
 def generate_auditory_internal_representation_torch(
-        signal_data: torch.Tensor,
-        fs: float,
+        signal_data: torch.Tensor, fs: float,
         modulation_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
 ) -> tuple[torch.Tensor, float]:
-    """Generates the 3D internal auditory representation natively on targeted hardware."""
     is_1d = signal_data.dim() == 1
     if is_1d:
         signal_data = signal_data.unsqueeze(0)
 
     scaled = 10.0 * signal_data
-
     low_freq = 235.0
     high_freq = min(0.5 * fs, 14500.0)
 
@@ -140,72 +130,50 @@ def generate_auditory_internal_representation_torch(
         scaled = fast_resample_poly_torch(scaled, new_fs, int(fs), axis=-1)
         fs = float(new_fs)
 
-    # 1. Gammatone Analyzer stage
     analyzer = GammatoneAnalyzerTorch(fs, low_freq, 1000.0, high_freq, 1.0, signal_data.device, signal_data.dtype)
     subbands = analyzer.process(scaled).real
 
-    # 2 & 3. IHC Transduction & Adaptation stage
     transduced = simulate_inner_haircell_transduction(subbands, fs)
     adapted = simulate_auditory_nerve_adaptation(transduced, fs)
 
-    # 4. Decimation & Modulation Filtering step
-    if modulation_type == ModulationProcessingType.LOWPASS:
-        downsampled = fast_resample_poly_torch(adapted, 100, int(fs), axis=-1)
-        target_fs = 100.0
+    mod_str = "LOWPASS" if modulation_type == ModulationProcessingType.LOWPASS else "FILTERBANK"
+    centers, bandwidths = _get_modulation_constants(mod_str, str(signal_data.device), signal_data.dtype)
 
-        # Center frequencies and Bandwidths (Single 0 Hz lowpass filter)
-        centers = torch.tensor([0.0], device=signal_data.device, dtype=signal_data.dtype)
-        bandwidths = torch.tensor([15.92], device=signal_data.device, dtype=signal_data.dtype)
-    else:
-        downsampled = fast_resample_poly_torch(adapted, 800, int(fs), axis=-1)
-        target_fs = 800.0
+    target_fs = 100.0 if mod_str == "LOWPASS" else 800.0
+    down_factor = 100 if mod_str == "LOWPASS" else 800
+    downsampled = fast_resample_poly_torch(adapted, down_factor, int(fs), axis=-1)
 
-        # Original 8-band modulation filterbank centers and bandwidths [2.2]
-        centers = torch.cat([
-            torch.tensor([0.0, 5.0], device=signal_data.device, dtype=signal_data.dtype),
-            10.0 * (5.0 / 3.0) ** torch.arange(6, device=signal_data.device, dtype=signal_data.dtype)
-        ])
-        bandwidths = torch.cat([
-            torch.tensor([5.0, 5.0], device=signal_data.device, dtype=signal_data.dtype),
-            5.0 * (5.0 / 3.0) ** torch.arange(6, device=signal_data.device, dtype=signal_data.dtype)
-        ])
-
-    # BULLETPROOF DIMENSION UNPACKING:
     if downsampled.dim() == 2:
-        num_bands, num_samples = downsampled.shape
-        B = 1
         downsampled = downsampled.unsqueeze(0)
-    else:
-        B, num_bands, num_samples = downsampled.shape
 
+    B, num_bands, num_samples = downsampled.shape
     num_mods = len(centers)
 
-    # Evaluate first-order complex modulation filters via analytical impulse responses
-    decay_samples = int(target_fs * 0.5)  # 500 ms decay window
+    internal_representation = torch.zeros((B, num_bands, num_samples, num_mods), dtype=torch.complex128,
+                                          device=signal_data.device)
+
+    decay_samples = int(target_fs * 0.5)
+    time_indices = torch.arange(decay_samples, device=signal_data.device, dtype=signal_data.dtype)
+
     N_fft = 2 ** math.ceil(math.log2(num_samples + decay_samples))
-    X = torch.fft.fft(downsampled.to(torch.complex128), n=N_fft, dim=-1)  # (B, Bands, N_fft)
+    X = torch.fft.fft(downsampled.to(torch.complex128), n=N_fft, dim=-1)
 
-    # Fetch cached frequency response of modulation filters
-    H_all = _get_modulation_filters_fft(
-        target_fs, N_fft, tuple(centers.tolist()), tuple(bandwidths.tolist()), str(signal_data.device)
+    for m_idx in range(num_mods):
+        g = math.exp(-math.pi * bandwidths[m_idx].item() / target_fs)
+        b0 = 1.0 - g
+        a1 = g * torch.exp(2j * math.pi * centers[m_idx] / target_fs)
+        ir = b0 * (a1 ** time_indices)
+        H = torch.fft.fft(ir, n=N_fft)
+        y = torch.fft.ifft(X * H.unsqueeze(0).unsqueeze(0), n=N_fft, dim=-1)
+        internal_representation[..., m_idx] = y[..., :num_samples]
+
+    # Out-of-place assignment to preserve gradients
+    channels_to_magnitude = (centers > 10.0).view(1, 1, 1, -1)
+    internal_representation = torch.where(
+        channels_to_magnitude,
+        torch.abs(internal_representation).to(torch.complex128),
+        internal_representation.real.to(torch.complex128)
     )
-
-    # Perform a single massive parallel multiply-and-IFFT across all modulation frequencies
-    # X shape: (B, Bands, N_fft, 1), H_all shape: (1, 1, N_fft, Mods)
-    Y = X.unsqueeze(-1) * H_all.T.view(1, 1, N_fft, num_mods)
-
-    # Run IFFT simultaneously over all bands and modulations
-    y = torch.fft.ifft(Y, n=N_fft, dim=2)
-    internal_representation = y[:, :, :num_samples, :]
-
-    # Map complex envelopes to real magnitudes for frequencies above 10 Hz
-    channels_to_magnitude = (centers > 10.0)
-    if channels_to_magnitude.any():
-        internal_representation[..., channels_to_magnitude] = torch.abs(
-            internal_representation[..., channels_to_magnitude]).to(torch.complex128)
-    if (~channels_to_magnitude).any():
-        internal_representation[..., ~channels_to_magnitude] = internal_representation[
-            ..., ~channels_to_magnitude].real.to(torch.complex128)
 
     out = internal_representation.real
     if is_1d:

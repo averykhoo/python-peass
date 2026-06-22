@@ -39,7 +39,7 @@ def _get_synthesizer_params_torch(delay_sec: float, fs: float, cfs_tuple: tuple,
     impulse[0] = 1.0
 
     # Inline the impulse response calculation to avoid cyclical dependencies
-    # ADDED FIX: Apply 0.2s padding to prevent IIR circular convolution wrap-around
+    # Applies 0.2s padding to prevent IIR circular convolution wrap-around
     pad_len = int(0.2 * fs)
     N_fft = 2 ** math.ceil(math.log2(impulse.shape[-1] + pad_len))
 
@@ -167,13 +167,19 @@ class GammatoneSynthesizerTorch:
     def process(self, subbands: torch.Tensor) -> torch.Tensor:
         # subbands shape: (*, Bands, Time)
         aligned = (subbands * self.phase_factors.view(-1, 1)).real
-        out = torch.zeros_like(aligned)
+        Time = aligned.shape[-1]
 
-        for b in range(self.delays.shape[0]):
-            d = self.delays[b].item()
-            if d == 0:
-                out[..., b, :] = aligned[..., b, :]
-            else:
-                out[..., b, d:] = aligned[..., b, :-d]
+        # Vectorized delay shifting using advanced indexing (no loops, entirely autograd safe)
+        idx = torch.arange(Time, device=aligned.device).unsqueeze(0) - self.delays.unsqueeze(1)
+        valid = idx >= 0
+        idx_clamped = torch.clamp(idx, min=0)
+
+        # Prepare shape expansion for any batch dimensions
+        shape_prefix = [1] * (aligned.dim() - 2)
+        idx_clamped = idx_clamped.view(*shape_prefix, self.delays.shape[0], Time).expand_as(aligned)
+        valid = valid.view(*shape_prefix, self.delays.shape[0], Time).expand_as(aligned)
+
+        shifted = torch.gather(aligned, -1, idx_clamped)
+        out = torch.where(valid, shifted, 0.0)
 
         return torch.einsum('b, ...bt -> ...t', self.gains.to(out.dtype), out)

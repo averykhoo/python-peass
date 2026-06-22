@@ -37,9 +37,8 @@ def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
     num_bands, num_samples, num_mods = ref_rep.shape
 
     # Threshold masking
-    test_rep = test_rep.clone()
     mask = torch.abs(test_rep) < torch.abs(ref_rep)
-    test_rep[mask] = 0.25 * ref_rep[mask] + 0.75 * test_rep[mask]
+    test_rep = torch.where(mask, 0.25 * ref_rep + 0.75 * test_rep, test_rep)
 
     frame_len = int(min(num_samples, 0.1 * fs))
     num_frames = num_samples // frame_len
