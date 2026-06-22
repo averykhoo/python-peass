@@ -67,12 +67,20 @@ class GammatoneAnalyzerTorch:
         # Convert audio to freq domain
         X = torch.fft.fft(x_flat.to(torch.complex128), n=N_fft, dim=-1)
 
-        # Use normalized cycles/sample directly to prevent frequency scale stretching
-        freqs_norm = torch.fft.fftfreq(N_fft, device=x.device)
-        z_inv = torch.exp(-2j * math.pi * freqs_norm)
+        # Caching the frequency response H drastically reduces torch.exp and pow calls
+        if not hasattr(self, "_H_cache") or self._H_cache.get('N_fft') != N_fft:
+            freqs_norm = torch.fft.fftfreq(N_fft, device=x.device)
+            z_inv = torch.exp(-2j * math.pi * freqs_norm)
 
-        # H shape: (Bands, N_fft)
-        H = self.norms.view(-1, 1) / (1.0 - self.coefs.view(-1, 1) * z_inv.unsqueeze(0)) ** 4
+            # Math Shortcut: complex ** 4 is incredibly slow. Squaring twice is instant.
+            denom = 1.0 - self.coefs.view(-1, 1) * z_inv.unsqueeze(0)
+            denom_sq = denom * denom
+            denom_quad = denom_sq * denom_sq
+
+            H = self.norms.view(-1, 1) / denom_quad
+            self._H_cache = {'N_fft': N_fft, 'H': H}
+
+        H = self._H_cache['H']
 
         # Pointwise multiplication and back to time domain
         Y = X.unsqueeze(1) * H.unsqueeze(0)
@@ -112,10 +120,10 @@ class GammatoneSynthesizerTorch:
 
         def z_response(z_pts):
             z_col = z_pts.unsqueeze(1)
-            # Corrected attribute reference (analyzer.norms and analyzer.coefs)
-            H = analyzer.norms.unsqueeze(0) / (1.0 - analyzer.coefs.unsqueeze(0) / z_col) ** 4
-            return H
-
+            denom = 1.0 - analyzer.coefs.unsqueeze(0) / z_col
+            denom_sq = denom * denom
+            return analyzer.norms.unsqueeze(0) / (denom_sq * denom_sq)
+        
         # Fix column-wise scaling using unsqueeze(0) for phase factors
         pos = z_response(z) * self.phase_factors.unsqueeze(0) * (z.unsqueeze(1) ** -self.delays.unsqueeze(0))
         neg = z_response(torch.conj(z)) * self.phase_factors.unsqueeze(0) * (

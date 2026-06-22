@@ -13,6 +13,31 @@ from .utils import fast_resample_poly_torch
 from .utils import smoothmax
 from ..config import ModulationProcessingType
 
+from functools import lru_cache
+
+
+@lru_cache(maxsize=8)
+def _get_modulation_filters_fft(target_fs: float, N_fft: int, centers_tuple: tuple, bandwidths_tuple: tuple,
+                                device_str: str):
+    device = torch.device(device_str)
+    num_mods = len(centers_tuple)
+    H_all = torch.zeros((num_mods, N_fft), dtype=torch.complex128, device=device)
+
+    decay_samples = int(target_fs * 0.5)
+    time_indices = torch.arange(decay_samples, device=device, dtype=torch.float64)
+
+    for m_idx in range(num_mods):
+        g = math.exp(-math.pi * bandwidths_tuple[m_idx] / target_fs)
+        b0 = 1.0 - g
+
+        # Math Shortcut: Use vector exp instead of expensive array exponentiation `a1 ** t`
+        log_g = math.log(g)
+        phase = 2j * math.pi * centers_tuple[m_idx] / target_fs
+        ir = b0 * torch.exp(time_indices * (log_g + phase))
+
+        H_all[m_idx] = torch.fft.fft(ir, n=N_fft)
+
+    return H_all
 
 def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> torch.Tensor:
     """Models the nonlinear mechanical-to-neural transduction of the inner hair cells."""
@@ -155,28 +180,23 @@ def generate_auditory_internal_representation_torch(
 
     num_mods = len(centers)
 
-    internal_representation = torch.zeros((B, num_bands, num_samples, num_mods), dtype=torch.complex128,
-                                          device=signal_data.device)
-
     # Evaluate first-order complex modulation filters via analytical impulse responses
     decay_samples = int(target_fs * 0.5)  # 500 ms decay window
-    time_indices = torch.arange(decay_samples, device=signal_data.device, dtype=signal_data.dtype)
-
     N_fft = 2 ** math.ceil(math.log2(num_samples + decay_samples))
     X = torch.fft.fft(downsampled.to(torch.complex128), n=N_fft, dim=-1)  # (B, Bands, N_fft)
 
-    for m_idx in range(num_mods):
-        g = math.exp(-math.pi * bandwidths[m_idx].item() / target_fs)
-        b0 = 1.0 - g
-        # Complex pole rotation
-        a1 = g * torch.exp(2j * math.pi * centers[m_idx] / target_fs)
+    # Fetch cached frequency response of modulation filters
+    H_all = _get_modulation_filters_fft(
+        target_fs, N_fft, tuple(centers.tolist()), tuple(bandwidths.tolist()), str(signal_data.device)
+    )
 
-        # Build analytical complex IIR impulse response
-        ir = b0 * (a1 ** time_indices)
+    # Perform a single massive parallel multiply-and-IFFT across all modulation frequencies
+    # X shape: (B, Bands, N_fft, 1), H_all shape: (1, 1, N_fft, Mods)
+    Y = X.unsqueeze(-1) * H_all.T.view(1, 1, N_fft, num_mods)
 
-        H = torch.fft.fft(ir, n=N_fft)
-        y = torch.fft.ifft(X * H.unsqueeze(0).unsqueeze(0), n=N_fft, dim=-1)
-        internal_representation[..., m_idx] = y[..., :num_samples]
+    # Run IFFT simultaneously over all bands and modulations
+    y = torch.fft.ifft(Y, n=N_fft, dim=2)
+    internal_representation = y[:, :, :num_samples, :]
 
     # Map complex envelopes to real magnitudes for frequencies above 10 Hz
     channels_to_magnitude = (centers > 10.0)

@@ -15,7 +15,14 @@ from .utils import fast_resample_poly_torch
 from ..config import DecomposedFilePaths
 from ..config import DecomposedWaveforms
 from ..config import DecompositionResult
+from functools import lru_cache
 
+@lru_cache(maxsize=16)
+def _get_synthesis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str):
+    device = torch.device(device_str)
+    cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
+    time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
+    return torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
 
 def get_real_dtype(dtype: torch.dtype) -> torch.dtype:
     """Helper returning the corresponding real-valued dtype counterpart of any dtype."""
@@ -363,9 +370,9 @@ def run_auditory_synthesis_filterbank_torch(
                 else: processed[band_idx, :curr_len] = upsampled
 
     # Re-modulate back to center frequencies prior to synthesis
-    time_steps = torch.arange(max_len, device=analyzer.center_frequencies.device,
-                              dtype=analyzer.center_frequencies.dtype)
-    mod_matrix = torch.exp(2j * math.pi / analyzer.fs * analyzer.center_frequencies.unsqueeze(-1) * time_steps)
+    mod_matrix = _get_synthesis_mod_matrix_torch(
+        analyzer.fs, max_len, tuple(analyzer.center_frequencies.tolist()), str(analyzer.center_frequencies.device)
+    )
     processed = processed * mod_matrix
 
     desired_delay_seconds = 1000.0 / analyzer.fs
