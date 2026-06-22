@@ -4,13 +4,17 @@ File path: peass/backend_torch/decomposition.py
 """
 import math
 import pathlib
+
+import soundfile as sf
 import torch
 import torch.nn.functional as F
-import soundfile as sf
 
-from ..config import DecompositionResult, DecomposedWaveforms, DecomposedFilePaths
-from .gammatone import GammatoneAnalyzerTorch, GammatoneSynthesizerTorch
+from .gammatone import GammatoneAnalyzerTorch
+from .gammatone import GammatoneSynthesizerTorch
 from .utils import fast_resample_poly_torch
+from ..config import DecomposedFilePaths
+from ..config import DecomposedWaveforms
+from ..config import DecompositionResult
 
 
 def get_real_dtype(dtype: torch.dtype) -> torch.dtype:
@@ -35,10 +39,10 @@ def validate_and_normalize_audio_torch(data: torch.Tensor, name: str = "audio_da
 
 
 def perform_least_squares_projection_torch(
-    source_estimates: torch.Tensor,
-    true_sources: torch.Tensor,
-    filter_half_length: int,
-    analysis_window: torch.Tensor
+        source_estimates: torch.Tensor,
+        true_sources: torch.Tensor,
+        filter_half_length: int,
+        analysis_window: torch.Tensor
 ) -> torch.Tensor:
     """Computes weighted least-squares projections natively on GPU."""
     filter_length = 2 * filter_half_length + 1
@@ -46,9 +50,11 @@ def perform_least_squares_projection_torch(
     num_samples = source_estimates.shape[0]
 
     # Silence bypass optimization
-    source_energy = torch.sum(true_sources.real ** 2 + true_sources.imag ** 2) if true_sources.is_complex() else torch.sum(true_sources ** 2)
+    source_energy = torch.sum(
+        true_sources.real ** 2 + true_sources.imag ** 2) if true_sources.is_complex() else torch.sum(true_sources ** 2)
     if source_energy < 1e-13:
-        return torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype, device=source_estimates.device)
+        return torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype,
+                           device=source_estimates.device)
 
     # Build Toeplitz matrix using fast 1D striding (unfolded directly without extra F.pad)
     strided_views = []
@@ -76,109 +82,129 @@ def perform_least_squares_projection_torch(
         weighted_estimates = source_estimates * analysis_window.unsqueeze(1)
         projection_weights = torch.linalg.pinv(weighted_toeplitz) @ weighted_estimates
 
-    projections = torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype, device=source_estimates.device)
+    projections = torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype,
+                              device=source_estimates.device)
     weighted_diagonal = analysis_window.unsqueeze(1)
 
     for s_idx in range(num_sources):
         start = s_idx * filter_length
         end = (s_idx + 1) * filter_length
         projections[:, :, s_idx] = weighted_diagonal * (
-            toeplitz_matrix[:, start:end] @ projection_weights[start:end, :]
+                toeplitz_matrix[:, start:end] @ projection_weights[start:end, :]
         )
 
     return projections
 
 
 def perform_time_varying_least_squares_projection_torch(
-    source_estimates: torch.Tensor,
-    true_sources: torch.Tensor,
-    filter_length: int,
-    window_length: int,
-    hop_size: int
+        source_estimates: torch.Tensor,
+        true_sources: torch.Tensor,
+        filter_length: int,
+        window_length: int,
+        hop_size: int
 ) -> torch.Tensor:
-    """Time-varying subband least-squares solver."""
+    """
+    Time-varying subband least-squares solver.
+    Fully vectorized with zero time-loops or source-loops.
+    """
     filter_half_length = (filter_length - 1) // 2
     pad_length = filter_length - 1 + window_length - 1
 
+    # Match the exact sequence-level padding
     true_sources = F.pad(true_sources, (0, 0, 0, pad_length))
     source_estimates = F.pad(source_estimates, (0, 0, 0, pad_length))
 
-    total_samples, num_sources = true_sources.shape
+    total_samples, num_sources = true_sources.shape  # Padded length
     num_channels = source_estimates.shape[1]
 
-    # Dynamically resolve real-valued dtype to prevent arange complex exception
+    # Resolve real-valued dtypes for window calculations
     real_dtype = get_real_dtype(source_estimates.dtype)
-
-    # Match SciPy's sym=False with periodic=True
     hann_window = torch.hann_window(window_length, periodic=True, device=source_estimates.device, dtype=real_dtype)
     analysis_window = torch.sqrt(torch.flip(hann_window, dims=[0]))
     synthesis_window = torch.sqrt(torch.flip(hann_window, dims=[0]))
 
-    synthesis_weights = synthesis_window.view(window_length, 1, 1).repeat(1, num_channels, num_sources)
+    # Closed-form mathematical evaluation of NumFrames matching the sequential loop boundary
+    NumFrames = max(0, int(math.floor((total_samples - 1.5 * window_length + 1) / hop_size)) + 1)
 
-    window_begin = 0
-    window_end = window_begin + window_length
+    if NumFrames == 0:
+        return torch.zeros((total_samples - (window_length - 1), num_channels, num_sources), dtype=true_sources.dtype,
+                           device=true_sources.device)
 
-    projections_accumulation = torch.zeros((total_samples, num_channels, num_sources), dtype=true_sources.dtype, device=true_sources.device)
-    window_gain_accumulation = torch.zeros((total_samples, 1), dtype=real_dtype, device=source_estimates.device)
+    # 1. Unfold and slice estimates and true sources across the temporal axis
+    est_frames = source_estimates.unfold(0, window_length, hop_size).transpose(1, 2)[:NumFrames]
 
-    while window_end - window_length / 2.0 <= projections_accumulation.shape[0] - window_length + 1:
-        frame_estimates = source_estimates[window_begin:window_end, :]
+    # Unfolding true sources requires symmetric source overlap mapping.
+    # To mathematically match the timeline alignment of sw:
+    # We pad the beginning of true_sources with exactly filter_half_length zeros, and then unfold.
+    true_sources_pad = F.pad(true_sources, (0, 0, filter_half_length, 0))
+    src_frames = true_sources_pad.unfold(0, window_length + filter_length - 1, hop_size).transpose(1, 2)[:NumFrames]
 
-        source_window_start = window_begin - filter_half_length
-        source_window_end = window_end + filter_half_length
-        pad_left = max(0, -source_window_start)
-        pad_right = max(0, source_window_end - true_sources.shape[0])
-        slice_start = max(0, source_window_start)
-        slice_end = min(true_sources.shape[0], source_window_end)
+    # 2. Build the batched Toeplitz representations
+    src_unfold = src_frames.unfold(1, filter_length, 1).flip(
+        -1)  # (NumFrames, window_length, num_sources, filter_length)
+    toeplitz_batched = src_unfold.reshape(NumFrames, window_length, num_sources * filter_length)
 
-        frame_sources_slice = true_sources[slice_start:slice_end, :]
-        frame_sources = torch.cat([
-            torch.zeros((pad_left, num_sources), dtype=true_sources.dtype, device=true_sources.device),
-            frame_sources_slice,
-            torch.zeros((pad_right, num_sources), dtype=true_sources.dtype, device=true_sources.device)
-        ], dim=0)
+    # 3. Solve the batched least squares system in a single step
+    window_sq = (analysis_window ** 2).view(1, window_length, 1)
 
-        frame_projections = perform_least_squares_projection_torch(
-            frame_estimates, frame_sources, filter_half_length, analysis_window
-        )
+    Gram = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * toeplitz_batched)
+    RHS = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * est_frames)
 
-        projections_accumulation[window_begin:window_end, :, :] += (
-            frame_projections[:window_length, :, :] * synthesis_weights
-        )
-        window_gain_accumulation[window_begin:window_end, 0] += synthesis_window * analysis_window
+    # Diagonal regularization
+    diag_idx = torch.arange(Gram.shape[-1], device=Gram.device)
+    Gram[:, diag_idx, diag_idx] += 10.0 ** -15
 
-        window_begin += hop_size
-        window_end += hop_size
+    try:
+        weights = torch.linalg.solve(Gram, RHS)
+    except torch.linalg.LinAlgError:
+        weights = torch.linalg.pinv(Gram) @ RHS
 
+    # weights shape: (NumFrames, num_sources * filter_length, num_channels)
+    weights_unflat = weights.view(NumFrames, num_sources, filter_length, num_channels)
+
+    # 4. Reconstruct projections for all sources in one shot (Batch Matrix Multiplication)
+    T_s_all = src_unfold.permute(0, 2, 1, 3)  # (NumFrames, num_sources, window_length, filter_length)
+    W_s_all = weights_unflat  # (NumFrames, num_sources, filter_length, num_channels)
+
+    # Batched matrix product: (F, S, W, FL) @ (F, S, FL, C) -> (F, S, W, C)
+    proj_all = torch.matmul(T_s_all, W_s_all)
+
+    # Permute back to (NumFrames, window_length, num_channels, num_sources)
+    projections_batched = proj_all.permute(0, 2, 3, 1) * analysis_window.view(1, window_length, 1, 1)
+    projections_batched = projections_batched * synthesis_window.view(1, window_length, 1, 1)
+
+    # 5. High-speed vectorized Overlap-Add via Scatter-Add
+    projections_accumulation = torch.zeros(total_samples, num_channels, num_sources, dtype=true_sources.dtype,
+                                           device=true_sources.device)
+    window_gain_accumulation = torch.zeros(total_samples, 1, dtype=real_dtype, device=source_estimates.device)
+
+    # Temporal indexing grids
+    frame_indices = (torch.arange(window_length, device=source_estimates.device).view(1, -1) +
+                     torch.arange(NumFrames, device=source_estimates.device).view(-1, 1) * hop_size)
+
+    proj_flat = projections_batched.reshape(NumFrames * window_length, num_channels * num_sources)
+    idx_flat = frame_indices.reshape(-1, 1).expand(-1, num_channels * num_sources)
+    projections_accumulation.view(-1, num_channels * num_sources).scatter_add_(0, idx_flat, proj_flat)
+
+    win_gain = (analysis_window * synthesis_window).view(1, window_length).expand(NumFrames, -1).reshape(-1, 1)
+    idx_gain = frame_indices.reshape(-1, 1)
+    window_gain_accumulation.scatter_add_(0, idx_gain, win_gain)
+
+    # 6. Apply final gain normalization
     valid_indices = (window_gain_accumulation[:, 0] != 0)
     for s_idx in range(num_sources):
         projections_accumulation[valid_indices, :, s_idx] /= window_gain_accumulation[valid_indices, :]
 
+    # Return the cropped timeline (matches MATLAB/NumPy Ls timeline)
     return projections_accumulation[:-(window_length - 1), :, :]
 
-# Optimize compilation path: Bypass JIT compilation latency on standard CPU runs
-# but compile on GPU or when explicitly requested.
-_SHOULD_COMPILE = torch.cuda.is_available() and os.environ.get("PEASS_NO_COMPILE") != "1"
-
-if _SHOULD_COMPILE:
-    try:
-        _compiled_projection_solver = torch.compile(
-            perform_time_varying_least_squares_projection_torch,
-            mode="reduce-overhead"
-        )
-    except Exception:
-        _compiled_projection_solver = perform_time_varying_least_squares_projection_torch
-else:
-    _compiled_projection_solver = perform_time_varying_least_squares_projection_torch
-
 def extract_target_spatial_distortion_interference_artifacts_torch(
-    true_sources: torch.Tensor,
-    source_estimates: torch.Tensor,
-    filter_length: int,
-    window_length: int,
-    hop_size: int,
-    use_two_stage_projection: bool = False
+        true_sources: torch.Tensor,
+        source_estimates: torch.Tensor,
+        filter_length: int,
+        window_length: int,
+        hop_size: int,
+        use_two_stage_projection: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Splits signals into physical components in the subband domain."""
     total_samples, num_channels, num_sources = true_sources.shape
@@ -190,17 +216,20 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
     sources_reshaped = true_sources.transpose(1, 2).reshape(total_samples, num_sources * num_channels)
     estimates_reshaped = source_estimates.transpose(1, 2).reshape(total_samples, num_estimates * num_channels)
 
-    projections_all = _compiled_projection_solver(
+    projections_all = perform_time_varying_least_squares_projection_torch(
         estimates_reshaped, sources_reshaped, filter_length, window_length, hop_size
     )
 
-    projected_signals = torch.zeros((total_samples, num_channels * num_estimates, num_sources), dtype=true_sources.dtype, device=true_sources.device)
+    projected_signals = torch.zeros((total_samples, num_channels * num_estimates, num_sources),
+                                    dtype=true_sources.dtype, device=true_sources.device)
     for s_idx in range(num_sources):
         start = s_idx * num_channels
         end = (s_idx + 1) * num_channels
-        projected_signals[:, :, s_idx] = torch.sum(projections_all[:total_samples, :, start:end], dim=2)
+        # Slice projections to original timeline (matches MATLAB 1:end-flen+1)
+        projected_signals[:, :, s_idx] = torch.sum(projections_all[:-filter_length + 1, :, start:end], dim=2)
 
-    spatial_distortion = torch.zeros((total_samples, num_estimates * num_channels), dtype=source_estimates.dtype, device=source_estimates.device)
+    spatial_distortion = torch.zeros((total_samples, num_estimates * num_channels), dtype=source_estimates.dtype,
+                                     device=source_estimates.device)
     if use_two_stage_projection:
         for est_idx in range(num_estimates):
             start = est_idx * num_channels
@@ -210,9 +239,10 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
                 sources_reshaped[:, :num_channels],
                 filter_length, window_length, hop_size
             )
-            spatial_distortion[:, start:end] = torch.sum(spatial_projection[:total_samples, :, :], dim=2)
+            spatial_distortion[:, start:end] = torch.sum(spatial_projection[:-filter_length + 1, :, :], dim=2)
 
-    true_ref = torch.zeros((total_samples, num_channels * num_estimates), dtype=true_sources.dtype, device=true_sources.device)
+    true_ref = torch.zeros((total_samples, num_channels * num_estimates), dtype=true_sources.dtype,
+                           device=true_sources.device)
     for est_idx in range(num_estimates):
         start = est_idx * num_channels
         end = (est_idx + 1) * num_channels
@@ -221,7 +251,8 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
     if use_two_stage_projection:
         spatial_distortion = spatial_distortion - true_ref
     else:
-        spatial_distortion = projected_signals[:, :, :num_estimates].transpose(1, 2).reshape(total_samples, num_estimates * num_channels) - true_ref
+        spatial_distortion = projected_signals[:, :, :num_estimates].transpose(1, 2).reshape(total_samples,
+                                                                                             num_estimates * num_channels) - true_ref
 
     interference = torch.sum(projected_signals, dim=2) - spatial_distortion - true_ref
     artifacts = estimates_reshaped - true_ref - spatial_distortion - interference
@@ -235,88 +266,95 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
 
 
 def run_auditory_analysis_filterbank_torch(
-    signal_waveform: torch.Tensor,
-    fs: float,
-    modulation_matrix: torch.Tensor | None = None
+        signal_waveform: torch.Tensor,
+        fs: float,
+        modulation_matrix: torch.Tensor | None = None
 ) -> tuple[list[torch.Tensor], GammatoneAnalyzerTorch, torch.Tensor]:
     """Runs parallel analytical complex-valued filterbanks."""
 
     minimum_frequency = 20.0
     maximum_frequency = fs / 2.0
     base_frequency = 1000.0
-    filters_per_erb = 1.0
 
     # 1. Apply Anti-Aliasing Polyphase Upsampling
     original_fs = fs
     if fs / 2.0 < 1.5 * maximum_frequency:
         new_fs = int(round(1.5 * fs))
-        signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs))
+        signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs), axis=-1)
         fs = float(new_fs)
 
-    analyzer = GammatoneAnalyzerTorch(
-        fs, minimum_frequency, base_frequency, maximum_frequency, filters_per_erb,
-        signal_waveform.device, signal_waveform.dtype
-    )
-
-    # Save the original sample rate onto the analyzer object to match NumPy behavior
+    analyzer = GammatoneAnalyzerTorch(fs, minimum_frequency, base_frequency, maximum_frequency, 1.0,
+                                      signal_waveform.device, signal_waveform.dtype)
     analyzer.original_sampling_frequency_hz = original_fs
 
     subbands_output = analyzer.process(signal_waveform)
-    num_bands = subbands_output.shape[0]
+    num_bands = subbands_output.shape[-2]
 
     if modulation_matrix is None:
-        time_steps = torch.arange(subbands_output.shape[1], device=signal_waveform.device, dtype=signal_waveform.dtype)
-        center_frequencies = analyzer.center_frequencies.unsqueeze(1)
-        # Shift down to baseband (demodulate)
+        time_steps = torch.arange(subbands_output.shape[-1], device=signal_waveform.device, dtype=signal_waveform.dtype)
+        center_frequencies = analyzer.center_frequencies.unsqueeze(-1)
         modulation_matrix = torch.exp(-2j * math.pi / fs * center_frequencies * time_steps)
 
     subbands_output = subbands_output * modulation_matrix
 
     decimated_bands = []
     for band_idx in range(num_bands):
-        decimated = fast_resample_poly_torch(subbands_output[band_idx], 1, int(analyzer.decimations[band_idx]))
+        decimated = fast_resample_poly_torch(subbands_output[..., band_idx, :], 1, int(analyzer.decimations[band_idx]),
+                                             axis=-1)
         decimated_bands.append(decimated)
 
     return decimated_bands, analyzer, modulation_matrix
 
 
 def run_auditory_synthesis_filterbank_torch(
-    subband_list: list,
-    analyzer: GammatoneAnalyzerTorch
+        subband_list: list,
+        analyzer: GammatoneAnalyzerTorch
 ) -> torch.Tensor:
     """Reconstructs subbands back into a single fullband waveform."""
     num_bands = len(subband_list)
-    max_len = max(len(subband_list[b]) * int(analyzer.decimations[b]) for b in range(num_bands))
+    is_batched = subband_list[0].dim() > 1
+    B = subband_list[0].shape[0] if is_batched else 1
 
-    processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
+    max_len = max(subband_list[b].shape[-1] * int(analyzer.decimations[b]) for b in range(num_bands))
+
+    if is_batched:
+        processed = torch.zeros((B, num_bands, max_len), dtype=torch.complex128,
+                                device=analyzer.center_frequencies.device)
+    else:
+        processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
+
     for b in range(num_bands):
         factor = int(analyzer.decimations[b])
-        upsampled = fast_resample_poly_torch(subband_list[b], factor, 1)
-        curr_len = len(upsampled)
+        upsampled = fast_resample_poly_torch(subband_list[b], factor, 1, axis=-1)
+        curr_len = upsampled.shape[-1]
+
         if curr_len >= max_len:
-            processed[b] = upsampled[:max_len]
+            if is_batched:
+                processed[:, b, :] = upsampled[..., :max_len]
+            else:
+                processed[b, :] = upsampled[:max_len]
         else:
-            processed[b, :curr_len] = upsampled
+            if is_batched:
+                processed[:, b, :curr_len] = upsampled
+            else:
+                processed[b, :curr_len] = upsampled
 
     # Re-modulate back to center frequencies prior to synthesis
-    time_steps = torch.arange(max_len, device=analyzer.center_frequencies.device, dtype=analyzer.center_frequencies.dtype)
-    mod_matrix = torch.exp(2j * math.pi / analyzer.fs * analyzer.center_frequencies.unsqueeze(1) * time_steps)
+    time_steps = torch.arange(max_len, device=analyzer.center_frequencies.device,
+                              dtype=analyzer.center_frequencies.dtype)
+    mod_matrix = torch.exp(2j * math.pi / analyzer.fs * analyzer.center_frequencies.unsqueeze(-1) * time_steps)
     processed = processed * mod_matrix
 
-    # -------------------------------------------------------------------------
-    # FIXED: Replaced hardcoded 0.004 (4ms) delay with 1000.0 / analyzer.fs (41.67ms at 24kHz)
-    # -------------------------------------------------------------------------
     desired_delay_seconds = 1000.0 / analyzer.fs
     synth = GammatoneSynthesizerTorch(analyzer, desired_delay_seconds)
     reconstructed = synth.process(processed)
 
     # 1. Downsample back to the original frequency to prevent duration expansion
     original_fs = analyzer.original_sampling_frequency_hz
-    reconstructed = fast_resample_poly_torch(reconstructed, int(original_fs), int(analyzer.fs))
-
-    # 2. Account for synthesizer delay offsets AT the original sampling frequency
+    reconstructed = fast_resample_poly_torch(reconstructed, int(original_fs), int(analyzer.fs), axis=-1)
     delay_samples = int(round(desired_delay_seconds * original_fs))
-    return reconstructed[delay_samples:]
+
+    return reconstructed[..., delay_samples:]
 
 
 def apply_window_shading_torch(sig: torch.Tensor, fs: float, shade_in: float, shade_out: float) -> torch.Tensor:
@@ -340,10 +378,10 @@ def apply_window_shading_torch(sig: torch.Tensor, fs: float, shade_in: float, sh
 
 
 def decompose_distortion_components(
-    source_files: list[str | pathlib.Path | torch.Tensor],
-    estimate_file: str | pathlib.Path | torch.Tensor,
-    configuration=None,
-    sampling_frequency_hz: float | None = None
+        source_files: list[str | pathlib.Path | torch.Tensor],
+        estimate_file: str | pathlib.Path | torch.Tensor,
+        configuration=None,
+        sampling_frequency_hz: float | None = None
 ) -> DecompositionResult:
     """Natively decomposes estimated audio waveforms on PyTorch GPU."""
     if configuration is None:
@@ -358,7 +396,8 @@ def decompose_distortion_components(
         sampling_frequency_hz = float(fs)
 
         # Push to PyTorch (checks if CUDA/MPS is available to choose default hardware accelerator)
-        device = torch.device("cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
+        device = torch.device(
+            "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu"))
         estimate_tensor = torch.tensor(est_numpy, device=device, dtype=torch.float64)
 
         sources_tensors = []
@@ -378,27 +417,24 @@ def decompose_distortion_components(
     S = len(sources_audio)
 
     # 2. Window shading
-    shaded_sources = [apply_window_shading_torch(s, sampling_frequency_hz, configuration.shade_in_milliseconds, configuration.shade_out_milliseconds) for s in sources_audio]
-    shaded_estimate = apply_window_shading_torch(estimate_audio, sampling_frequency_hz, configuration.shade_in_milliseconds, configuration.shade_out_milliseconds)
+    shaded_sources = [apply_window_shading_torch(s, sampling_frequency_hz, configuration.shade_in_milliseconds,
+                                                 configuration.shade_out_milliseconds) for s in sources_audio]
+    shaded_estimate = apply_window_shading_torch(estimate_audio, sampling_frequency_hz,
+                                                 configuration.shade_in_milliseconds,
+                                                 configuration.shade_out_milliseconds)
 
-    # 3. Analyze subbands natively
-    subband_sources = [[None for _ in range(C)] for _ in range(S)]
-    mod_matrix = None
-    analyzer = None
+    # Batched Gammatone Analysis
+    sources_stacked = torch.stack(shaded_sources, dim=0)  # (S, T, C)
+    sources_flat = sources_stacked.transpose(1, 2).reshape(S * C, N_samples)
 
-    for s_idx in range(S):
-        for c_idx in range(C):
-            subband_sources[s_idx][c_idx], analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(
-                shaded_sources[s_idx][:, c_idx], sampling_frequency_hz, mod_matrix
-            )
+    subbands_sources_flat, analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(sources_flat,
+                                                                                         sampling_frequency_hz)
 
-    subband_estimate = [None for _ in range(C)]
-    for c_idx in range(C):
-        subband_estimate[c_idx], _, _ = run_auditory_analysis_filterbank_torch(
-            shaded_estimate[:, c_idx], sampling_frequency_hz, mod_matrix
-        )
+    estimate_flat = shaded_estimate.transpose(0, 1)  # (C, T)
+    subband_estimate_flat, _, _ = run_auditory_analysis_filterbank_torch(estimate_flat, sampling_frequency_hz,
+                                                                         mod_matrix)
 
-    num_bands = len(subband_sources[0][0])
+    num_bands = len(subbands_sources_flat)
 
     # 4. Form composite band tensors and solve
     ref_frequency = 1000.0
@@ -419,10 +455,11 @@ def decompose_distortion_components(
     decomp_artifacts = []
 
     for b in range(num_bands):
-        # Gather signals across sources and channels for this band
-        # true_b: (T_dec, C, S), est_b: (T_dec, C, 1)
-        true_b_stacked = torch.stack([torch.stack([subband_sources[s][c][b] for c in range(C)], dim=1) for s in range(S)], dim=2)
-        est_b_stacked = torch.stack([subband_estimate[c][b] for c in range(C)], dim=1).unsqueeze(2)
+        b_src = subbands_sources_flat[b].view(S, C, -1)
+        true_b_stacked = b_src.permute(2, 1, 0)
+
+        b_est = subband_estimate_flat[b].view(C, -1)
+        est_b_stacked = b_est.transpose(0, 1).unsqueeze(2)
 
         t_b, td_b, int_b, art_b = extract_target_spatial_distortion_interference_artifacts_torch(
             true_b_stacked, est_b_stacked, filter_lengths[b].item(), window_lengths[b].item(), hop_sizes[b].item(),
@@ -433,39 +470,29 @@ def decompose_distortion_components(
         decomp_interf.append(int_b)
         decomp_artifacts.append(art_b)
 
-    # 5. Format and synthesize back to fullband
-    ref_subband_true = [[decomp_true[b][:, c, 0] for b in range(num_bands)] for c in range(C)]
-    ref_subband_target = [[decomp_target[b][:, c, 0] for b in range(num_bands)] for c in range(C)]
-    ref_subband_interf = [[decomp_interf[b][:, c, 0] for b in range(num_bands)] for c in range(C)]
-    ref_subband_artif = [[decomp_artifacts[b][:, c, 0] for b in range(num_bands)] for c in range(C)]
-
-    synth_t = torch.zeros((N_samples, C), dtype=estimate_audio.dtype, device=estimate_audio.device)
-    synth_td = torch.zeros((N_samples, C), dtype=estimate_audio.dtype, device=estimate_audio.device)
-    synth_i = torch.zeros((N_samples, C), dtype=estimate_audio.dtype, device=estimate_audio.device)
-    synth_a = torch.zeros((N_samples, C), dtype=estimate_audio.dtype, device=estimate_audio.device)
+    # Batched Gammatone Synthesis
+    subband_true_batched = [decomp_true[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
+    subband_target_batched = [decomp_target[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
+    subband_interf_batched = [decomp_interf[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
+    subband_artif_batched = [decomp_artifacts[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
 
     def clip_pad(val, target):
         L = val.shape[0]
-        if L >= target:
-            return val[:target]
-        return F.pad(val, (0, target - L))
+        if L >= target: return val[:target]
+        # PADDING THE FIRST DIMENSION (rows, time) OF TENSOR WITH (0, 0, 0, target - L)
+        return F.pad(val, (0, 0, 0, target - L))
 
-    for c in range(C):
-        st = run_auditory_synthesis_filterbank_torch(ref_subband_true[c], analyzer)
-        std = run_auditory_synthesis_filterbank_torch(ref_subband_target[c], analyzer)
-        si = run_auditory_synthesis_filterbank_torch(ref_subband_interf[c], analyzer)
-        sa = run_auditory_synthesis_filterbank_torch(ref_subband_artif[c], analyzer)
-
-        synth_t[:, c] = clip_pad(st, N_samples)
-        synth_td[:, c] = clip_pad(std, N_samples)
-        synth_i[:, c] = clip_pad(si, N_samples)
-        synth_a[:, c] = clip_pad(sa, N_samples)
+    # Synthesis outputs (C, T) -> transpose to (T, C)
+    synth_t = run_auditory_synthesis_filterbank_torch(subband_true_batched, analyzer).transpose(0, 1)
+    synth_td = run_auditory_synthesis_filterbank_torch(subband_target_batched, analyzer).transpose(0, 1)
+    synth_i = run_auditory_synthesis_filterbank_torch(subband_interf_batched, analyzer).transpose(0, 1)
+    synth_a = run_auditory_synthesis_filterbank_torch(subband_artif_batched, analyzer).transpose(0, 1)
 
     waveforms = DecomposedWaveforms(
-        true_target=synth_t,
-        target_distortion=synth_td,
-        interference=synth_i,
-        artifacts=synth_a
+        true_target=clip_pad(synth_t, N_samples),
+        target_distortion=clip_pad(synth_td, N_samples),
+        interference=clip_pad(synth_i, N_samples),
+        artifacts=clip_pad(synth_a, N_samples)
     )
 
     # 6. Save WAV files natively to disk if requested in config or running in file mode
@@ -481,11 +508,10 @@ def decompose_distortion_components(
             interference=str(dest_dir / f"{stem}_eInterf.wav"),
             artifacts=str(dest_dir / f"{stem}_eArtif.wav")
         )
-
-        # Cast back to CPU for standard soundfile saving
-        sf.write(out_paths.true_target, synth_t.detach().cpu().numpy(), int(sampling_frequency_hz))
-        sf.write(out_paths.target_distortion, synth_td.detach().cpu().numpy(), int(sampling_frequency_hz))
-        sf.write(out_paths.interference, synth_i.detach().cpu().numpy(), int(sampling_frequency_hz))
-        sf.write(out_paths.artifacts, synth_a.detach().cpu().numpy(), int(sampling_frequency_hz))
+        sf.write(out_paths.true_target, waveforms.true_target.detach().cpu().numpy(), int(sampling_frequency_hz))
+        sf.write(out_paths.target_distortion, waveforms.target_distortion.detach().cpu().numpy(),
+                 int(sampling_frequency_hz))
+        sf.write(out_paths.interference, waveforms.interference.detach().cpu().numpy(), int(sampling_frequency_hz))
+        sf.write(out_paths.artifacts, waveforms.artifacts.detach().cpu().numpy(), int(sampling_frequency_hz))
 
     return DecompositionResult(waveforms=waveforms, file_paths=out_paths)

@@ -27,28 +27,29 @@ def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> t
     decay_samples = int(fs * 0.01)  # 10 ms decay threshold
     ir = b0 * (gain ** torch.arange(decay_samples, device=subbands.device, dtype=subbands.dtype))
 
-    # Batched 1D Conv
-    B, T = rectified.shape
-    padded = F.pad(rectified, (decay_samples - 1, 0))
+    orig_shape = rectified.shape
+    T = orig_shape[-1]
+    rect_flat = rectified.view(-1, T)
+    B = rect_flat.shape[0]
+
+    padded = F.pad(rect_flat, (decay_samples - 1, 0))
     transduced = F.conv1d(padded.view(B, 1, -1), ir.view(1, 1, -1)).view(B, T)
 
-    return transduced
+    return transduced.view(*orig_shape)
 
 
 def _raw_adaptation_loop(subbands: torch.Tensor, fs: float, thresholds: torch.Tensor, gains: torch.Tensor,
                          abs_thresh: float) -> torch.Tensor:
-    """
-    Standard PyTorch sequential temporal loop.
-    """
-    B, T = subbands.shape
-    adapted = torch.empty_like(subbands)
+    orig_shape = subbands.shape
+    T = orig_shape[-1]
+    subbands_flat = subbands.view(-1, T)
+    B = subbands_flat.shape[0]
 
-    # Initialize states (5 stages)
-    states = thresholds.unsqueeze(0).repeat(B, 1)
+    adapted = torch.empty_like(subbands_flat)
+    states = thresholds.unsqueeze(0).expand(B, 5).clone()
 
     for t in range(T):
-        val = smoothmax(subbands[:, t], abs_thresh)
-
+        val = smoothmax(subbands_flat[:, t], abs_thresh)
         for stage in range(5):
             g = gains[stage]
             th = thresholds[stage]
@@ -63,7 +64,7 @@ def _raw_adaptation_loop(subbands: torch.Tensor, fs: float, thresholds: torch.Te
 
         adapted[:, t] = val
 
-    return adapted
+    return adapted.view(*orig_shape)
 
 
 # Optimize compilation path: Bypass cold-start JIT compilations on CPU / Windows environments
@@ -99,13 +100,20 @@ def generate_auditory_internal_representation_torch(
         modulation_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
 ) -> tuple[torch.Tensor, float]:
     """Generates the 3D internal auditory representation natively on targeted hardware."""
-    if signal_data.dim() > 1:
-        signal_data = signal_data.squeeze()
+    is_1d = signal_data.dim() == 1
+    if is_1d:
+        signal_data = signal_data.unsqueeze(0)
 
     scaled = 10.0 * signal_data
 
     low_freq = 235.0
     high_freq = min(0.5 * fs, 14500.0)
+
+    original_fs = fs
+    if fs / 2.0 < 1.5 * high_freq:
+        new_fs = int(round(1.5 * fs))
+        scaled = fast_resample_poly_torch(scaled, new_fs, int(fs), axis=-1)
+        fs = float(new_fs)
 
     # 1. Gammatone Analyzer stage
     analyzer = GammatoneAnalyzerTorch(fs, low_freq, 1000.0, high_freq, 1.0, signal_data.device, signal_data.dtype)
@@ -137,15 +145,25 @@ def generate_auditory_internal_representation_torch(
             5.0 * (5.0 / 3.0) ** torch.arange(6, device=signal_data.device, dtype=signal_data.dtype)
         ])
 
-    num_bands, num_samples = downsampled.shape
+    # BULLETPROOF DIMENSION UNPACKING:
+    if downsampled.dim() == 2:
+        num_bands, num_samples = downsampled.shape
+        B = 1
+        downsampled = downsampled.unsqueeze(0)
+    else:
+        B, num_bands, num_samples = downsampled.shape
+
     num_mods = len(centers)
 
-    internal_representation = torch.zeros((num_bands, num_samples, num_mods), dtype=torch.complex128,
+    internal_representation = torch.zeros((B, num_bands, num_samples, num_mods), dtype=torch.complex128,
                                           device=signal_data.device)
 
     # Evaluate first-order complex modulation filters via analytical impulse responses
     decay_samples = int(target_fs * 0.5)  # 500 ms decay window
     time_indices = torch.arange(decay_samples, device=signal_data.device, dtype=signal_data.dtype)
+
+    N_fft = 2 ** math.ceil(math.log2(num_samples + decay_samples))
+    X = torch.fft.fft(downsampled.to(torch.complex128), n=N_fft, dim=-1)  # (B, Bands, N_fft)
 
     for m_idx in range(num_mods):
         g = math.exp(-math.pi * bandwidths[m_idx].item() / target_fs)
@@ -156,21 +174,20 @@ def generate_auditory_internal_representation_torch(
         # Build analytical complex IIR impulse response
         ir = b0 * (a1 ** time_indices)
 
-        # Convolution via fast parallel FFT to prevent time-loop slowdown
-        N_fft = 2 ** math.ceil(math.log2(num_samples + decay_samples))
-        X = torch.fft.fft(downsampled.to(torch.complex128), n=N_fft, dim=1)
         H = torch.fft.fft(ir, n=N_fft)
-
-        y = torch.fft.ifft(X * H.unsqueeze(0), n=N_fft, dim=1)
-        internal_representation[:, :, m_idx] = y[:, :num_samples]
+        y = torch.fft.ifft(X * H.unsqueeze(0).unsqueeze(0), n=N_fft, dim=-1)
+        internal_representation[..., m_idx] = y[..., :num_samples]
 
     # Map complex envelopes to real magnitudes for frequencies above 10 Hz
     channels_to_magnitude = (centers > 10.0)
     if channels_to_magnitude.any():
-        internal_representation[:, :, channels_to_magnitude] = torch.abs(
-            internal_representation[:, :, channels_to_magnitude]).to(torch.complex128)
+        internal_representation[..., channels_to_magnitude] = torch.abs(
+            internal_representation[..., channels_to_magnitude]).to(torch.complex128)
     if (~channels_to_magnitude).any():
-        internal_representation[:, :, ~channels_to_magnitude] = internal_representation[
-            :, :, ~channels_to_magnitude].real.to(torch.complex128)
+        internal_representation[..., ~channels_to_magnitude] = internal_representation[
+            ..., ~channels_to_magnitude].real.to(torch.complex128)
 
-    return internal_representation.real, target_fs
+    out = internal_representation.real
+    if is_1d:
+        out = out.squeeze(0)
+    return out, target_fs

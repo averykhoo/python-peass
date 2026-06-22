@@ -3,12 +3,15 @@ PEASS PyTorch MLP Predictor
 File path: peass/backend_torch/predictor.py
 """
 import os
+
 import numpy as np
 import torch
 
-from ..config import PerceptualSeparationScores, DecompositionConfiguration
 from .decomposition import decompose_distortion_components
-from .metrics import calculate_auditory_quality_features, calculate_bss_eval_energy_ratios
+from .metrics import calculate_auditory_quality_features
+from .metrics import calculate_bss_eval_energy_ratios
+from ..config import DecompositionConfiguration
+from ..config import PerceptualSeparationScores
 
 MODEL_WEIGHTS_DIRECTORY = os.path.join(
     os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "parameters"
@@ -19,10 +22,10 @@ def _get_model_parameters_torch(task_idx: int, device, dtype) -> dict:
     parameters_path = os.path.join(MODEL_WEIGHTS_DIRECTORY, f"paramTask{task_idx + 1}.npz")
     with np.load(parameters_path) as data:
         return {
-            'w': torch.tensor(data['W'], device=device, dtype=dtype),
-            'b': torch.tensor(data['b'], device=device, dtype=dtype),
-            'v': torch.tensor(data['v'], device=device, dtype=dtype),
-            'a': torch.tensor(data['a'], device=device, dtype=dtype),
+            'w':     torch.tensor(data['W'], device=device, dtype=dtype),
+            'b':     torch.tensor(data['b'], device=device, dtype=dtype),
+            'v':     torch.tensor(data['v'], device=device, dtype=dtype),
+            'a':     torch.tensor(data['a'], device=device, dtype=dtype),
             'selec': torch.tensor(data['selec'], device=device, dtype=torch.long)
         }
 
@@ -37,11 +40,11 @@ def evaluate_neural_network_mapping_torch(features, w, b, v, a):
 
 
 def predict_perceptual_evaluation_scores(
-    original_files,
-    estimate_file,
-    configuration=None,
-    sampling_frequency_hz=None,
-    return_decomposition=False
+        original_files,
+        estimate_file,
+        configuration=None,
+        sampling_frequency_hz=None,
+        return_decomposition=False
 ):
     """
     Performs least-squares decomposition, generates auditory features,
@@ -81,7 +84,8 @@ def predict_perceptual_evaluation_scores(
     for task_idx in range(4):
         params = _get_model_parameters_cached(task_idx, device, dtype)
         selected = log_mapped[params['selec']]
-        scores.append(evaluate_neural_network_mapping_torch(selected, params['w'], params['b'], params['v'], params['a']))
+        scores.append(
+            evaluate_neural_network_mapping_torch(selected, params['w'], params['b'], params['v'], params['a']))
 
     perceptual_scores = PerceptualSeparationScores(
         overall_perceptual_score=scores[0],
@@ -104,6 +108,7 @@ def predict_perceptual_evaluation_scores(
 
 # Cache weight transformations to prevent recurring numpy reads
 _PARAMS_CACHE = {}
+
 
 def _get_model_parameters_cached(task_idx: int, device, dtype):
     key = (task_idx, device, dtype)

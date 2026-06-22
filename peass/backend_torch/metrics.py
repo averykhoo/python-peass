@@ -3,6 +3,7 @@ PEASS PyTorch Metrics and Auditory Similarity
 File path: peass/backend_torch/metrics.py
 """
 import torch
+
 from .auditory_model import generate_auditory_internal_representation_torch
 
 
@@ -57,14 +58,14 @@ def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
     test_mean = torch.mean(test_frames, dim=1, keepdim=True)
     ltest = test_frames - test_mean
 
-    denom = torch.sqrt(torch.sum(lref**2, dim=1) * torch.sum(ltest**2, dim=1))
+    denom = torch.sqrt(torch.sum(lref ** 2, dim=1) * torch.sum(ltest ** 2, dim=1))
     lpsm = torch.sum(lref * ltest, dim=1) / torch.clamp(denom, min=eps)
 
-    lnms = torch.sum(test_frames**2, dim=1)
+    lnms = torch.sum(test_frames ** 2, dim=1)
     local_p = torch.sum(lpsm * lnms, dim=1) / torch.clamp(torch.sum(lnms, dim=1), min=eps)
 
     # Global integration via cumulative sum
-    test_sq = torch.sum(test_rep[:, :num_samples, :]**2, dim=(0, 2))
+    test_sq = torch.sum(test_rep[:, :num_samples, :] ** 2, dim=(0, 2))
     cum_sum = torch.cat([torch.tensor([0.0], device=test_rep.device), torch.cumsum(test_sq, dim=0)])
 
     centers = (torch.arange(num_frames, device=test_rep.device) + 0.5) * frame_len
@@ -96,20 +97,30 @@ def calculate_auditory_quality_features(signals, fs=16000.0):
     estimate = true_target + target_dist + interf + artif
     C = true_target.shape[1]
 
+    # Combine all condition matrices across all channels into a single Batch tensor
+    # Transposing to (C, T) before concatenation results in Batch = 5 * C
+    combo_0 = estimate.transpose(0, 1)
+    combo_1 = (true_target + interf + artif).transpose(0, 1)
+    combo_2 = (true_target + target_dist + artif).transpose(0, 1)
+    combo_3 = (true_target + target_dist + interf).transpose(0, 1)
+    combo_4 = true_target.transpose(0, 1)
+
+    batched_signals = torch.cat([combo_0, combo_1, combo_2, combo_3, combo_4], dim=0)
+
+    # This single call natively executes all channels and metrics through the auditory nonlinearities at once!
+    rep_batched, target_fs = generate_auditory_internal_representation_torch(batched_signals, fs)
+
     ch_tar, ch_int, ch_art, ch_glo = [], [], [], []
     for c in range(C):
-        mtest, fr = generate_auditory_internal_representation_torch(estimate[:, c], fs)
+        mtest = rep_batched[c]
+        mref_t = rep_batched[1 * C + c]
+        mref_i = rep_batched[2 * C + c]
+        mref_a = rep_batched[3 * C + c]
+        mref_g = rep_batched[4 * C + c]
 
-        mref_t, _ = generate_auditory_internal_representation_torch(true_target[:, c] + interf[:, c] + artif[:, c], fs)
-        ch_tar.append(calculate_auditory_similarity_metric_torch(mref_t, mtest, fr))
-
-        mref_i, _ = generate_auditory_internal_representation_torch(true_target[:, c] + target_dist[:, c] + artif[:, c], fs)
-        ch_int.append(calculate_auditory_similarity_metric_torch(mref_i, mtest, fr))
-
-        mref_a, _ = generate_auditory_internal_representation_torch(true_target[:, c] + target_dist[:, c] + interf[:, c], fs)
-        ch_art.append(calculate_auditory_similarity_metric_torch(mref_a, mtest, fr))
-
-        mref_g, _ = generate_auditory_internal_representation_torch(true_target[:, c], fs)
-        ch_glo.append(calculate_auditory_similarity_metric_torch(mref_g, mtest, fr))
+        ch_tar.append(calculate_auditory_similarity_metric_torch(mref_t, mtest, target_fs))
+        ch_int.append(calculate_auditory_similarity_metric_torch(mref_i, mtest, target_fs))
+        ch_art.append(calculate_auditory_similarity_metric_torch(mref_a, mtest, target_fs))
+        ch_glo.append(calculate_auditory_similarity_metric_torch(mref_g, mtest, target_fs))
 
     return min(ch_tar), min(ch_int), min(ch_art), min(ch_glo)

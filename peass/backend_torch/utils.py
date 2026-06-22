@@ -22,6 +22,7 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
     """
     Native PyTorch polyphase resampler replicating SciPy's upfirdn using Conv1D.
     Directly pads the input to match SciPy's off-end filter sliding.
+    Heavily optimized for batched processing of continuous N-dimensional sequences.
     """
     if up == down:
         return x
@@ -51,9 +52,9 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
 
     # Flatten prefix dimensions into Batch
     x_flat = x_moved.reshape(-1, in_len)
+    B = x_flat.shape[0]
 
     # Zero-insertion Upsampling
-    B = x_flat.shape[0]
     x_up = torch.zeros((B, in_len * up), dtype=x.dtype, device=x.device)
     x_up[:, ::up] = x_flat
 
@@ -69,7 +70,7 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
 
     # Downsampling via Stride Convolution (Flipped weights for true convolution)
     weights = h_padded.flip(-1).view(1, 1, -1)
-    x_conv = F.conv1d(x_up_padded.unsqueeze(1), weights, stride=down).squeeze(1)
+    x_conv = F.conv1d(x_up_padded.unsqueeze(1), weights, stride=down)[..., 0, :]
 
     # Slice and reconstruct shapes
     y_flat = x_conv[:, n_pre_remove: n_pre_remove + out_len]

@@ -55,30 +55,32 @@ class GammatoneAnalyzerTorch:
     def process(self, x: torch.Tensor) -> torch.Tensor:
         """
         Massively parallel FFT evaluation of 4th-order complex IIR filters.
-        x shape: (T)
-        Returns: (num_bands, T)
+        x shape: (*, T) -> Returns (*, num_bands, T)
         """
-        T = x.shape[0]
-        # Pad by 200ms to avoid circular convolution tail wrap-around
+        original_shape = x.shape[:-1]
+        T = x.shape[-1]
+
+        x_flat = x.reshape(-1, T)
         pad_len = int(0.2 * self.fs)
         N_fft = 2 ** math.ceil(math.log2(T + pad_len))
 
         # Convert audio to freq domain
-        X = torch.fft.fft(x.to(torch.complex128), n=N_fft)
+        X = torch.fft.fft(x_flat.to(torch.complex128), n=N_fft, dim=-1)
 
-        # Corrected: Use normalized cycles/sample directly to prevent frequency scale stretching
+        # Use normalized cycles/sample directly to prevent frequency scale stretching
         freqs_norm = torch.fft.fftfreq(N_fft, device=x.device)
         z_inv = torch.exp(-2j * math.pi * freqs_norm)
 
-        # Shape: (num_bands, N_fft)
+        # H shape: (Bands, N_fft)
         H = self.norms.view(-1, 1) / (1.0 - self.coefs.view(-1, 1) * z_inv.unsqueeze(0)) ** 4
 
         # Pointwise multiplication and back to time domain
-        Y = X.unsqueeze(0) * H
-        y = torch.fft.ifft(Y, n=N_fft, dim=1)
+        Y = X.unsqueeze(1) * H.unsqueeze(0)
+        y = torch.fft.ifft(Y, n=N_fft, dim=2)
+        y = y[..., :T]
 
         # Slice valid region (linear convolution match)
-        return y[:, :T]
+        return y.view(*original_shape, len(self.center_frequencies), T)
 
 
 class GammatoneSynthesizerTorch:
@@ -116,7 +118,8 @@ class GammatoneSynthesizerTorch:
 
         # Fix column-wise scaling using unsqueeze(0) for phase factors
         pos = z_response(z) * self.phase_factors.unsqueeze(0) * (z.unsqueeze(1) ** -self.delays.unsqueeze(0))
-        neg = z_response(torch.conj(z)) * self.phase_factors.unsqueeze(0) * (torch.conj(z).unsqueeze(1) ** -self.delays.unsqueeze(0))
+        neg = z_response(torch.conj(z)) * self.phase_factors.unsqueeze(0) * (
+                    torch.conj(z).unsqueeze(1) ** -self.delays.unsqueeze(0))
         combo = (pos + torch.conj(neg)) / 2.0
 
         for _ in range(100):
@@ -124,17 +127,15 @@ class GammatoneSynthesizerTorch:
             self.gains = self.gains / (torch.abs(spec) + 1e-15).real
 
     def process(self, subbands: torch.Tensor) -> torch.Tensor:
-        # Phase alignment and time shifting
-        num_bands, num_samples = subbands.shape
+        # subbands shape: (*, Bands, Time)
         aligned = (subbands * self.phase_factors.view(-1, 1)).real
-
         out = torch.zeros_like(aligned)
-        for b in range(num_bands):
+
+        for b in range(self.delays.shape[0]):
             d = self.delays[b].item()
             if d == 0:
-                out[b] = aligned[b]
+                out[..., b, :] = aligned[..., b, :]
             else:
-                out[b, d:] = aligned[b, :-d]
+                out[..., b, d:] = aligned[..., b, :-d]
 
-        # Matrix mixing
-        return self.gains @ out
+        return torch.einsum('b, ...bt -> ...t', self.gains.to(out.dtype), out)
