@@ -12,6 +12,13 @@ import pytest
 import scipy.signal as signal
 import soundfile as sf
 
+try:
+    import torch
+
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+
 
 @pytest.fixture(scope="session")
 def project_root():
@@ -143,3 +150,49 @@ def database_audio_pair(request, db_resources) -> tuple[np.ndarray, np.ndarray, 
     interferer, _ = sf.read(interferer_path)
 
     return target, interferer, float(fs), identifier
+
+
+@pytest.fixture(params=["numpy", "torch_cpu", "torch_gpu"])
+def peass_backend(request):
+    """
+    Parametrized fixture yielding (backend_type, device) configurations.
+    Automatically skips unavailable hardware environments (CUDA / MPS).
+    """
+    mode = request.param
+    if mode.startswith("torch"):
+        if not _HAS_TORCH:
+            pytest.skip("PyTorch is not installed in this environment.")
+
+        if mode == "torch_cpu":
+            return "torch", torch.device("cpu")
+        elif mode == "torch_gpu":
+            if torch.cuda.is_available():
+                return "torch", torch.device("cuda")
+            elif torch.backends.mps.is_available():
+                return "torch", torch.device("mps")
+            else:
+                pytest.skip("GPU hardware (CUDA or MPS) is not available.")
+
+    return "numpy", None
+
+
+def to_backend_format(data, backend_type: str, device=None):
+    """Converts signals and arrays to the target backend type and device."""
+    if backend_type == "torch":
+        import torch
+        if isinstance(data, list):
+            return [to_backend_format(x, "torch", device) for x in data]
+        if isinstance(data, np.ndarray):
+            # Bypass torch.from_numpy C-binding issues in specific environments
+            return torch.tensor(data, device=device, dtype=torch.float64)
+    return data
+
+
+def to_numpy_format(data):
+    """Casts outputs back to standard NumPy arrays for validation assertions."""
+    if _HAS_TORCH and isinstance(data, torch.Tensor):
+        # Convert via nested list to completely bypass local C-binding limitations
+        return np.array(data.detach().cpu().tolist())
+    if hasattr(data, "__dict__"):  # Handle dataclass structures
+        return data
+    return data

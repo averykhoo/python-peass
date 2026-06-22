@@ -1,0 +1,112 @@
+"""
+PEASS PyTorch MLP Predictor
+File path: peass/backend_torch/predictor.py
+"""
+import os
+import numpy as np
+import torch
+
+from ..config import PerceptualSeparationScores, DecompositionConfiguration
+from .decomposition import decompose_distortion_components
+from .metrics import calculate_auditory_quality_features, calculate_bss_eval_energy_ratios
+
+MODEL_WEIGHTS_DIRECTORY = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.realpath(__file__))), "parameters"
+)
+
+
+def _get_model_parameters_torch(task_idx: int, device, dtype) -> dict:
+    parameters_path = os.path.join(MODEL_WEIGHTS_DIRECTORY, f"paramTask{task_idx + 1}.npz")
+    with np.load(parameters_path) as data:
+        return {
+            'w': torch.tensor(data['W'], device=device, dtype=dtype),
+            'b': torch.tensor(data['b'], device=device, dtype=dtype),
+            'v': torch.tensor(data['v'], device=device, dtype=dtype),
+            'a': torch.tensor(data['a'], device=device, dtype=dtype),
+            'selec': torch.tensor(data['selec'], device=device, dtype=torch.long)
+        }
+
+
+def evaluate_neural_network_mapping_torch(features, w, b, v, a):
+    if features.dim() == 1:
+        features = features.unsqueeze(1)
+    hidden_activation = w @ features + b
+    hidden_output = torch.sigmoid(hidden_activation)
+    output_activation = v.T @ hidden_output + a
+    return 100.0 * torch.sigmoid(output_activation).item()
+
+
+def predict_perceptual_evaluation_scores(
+    original_files,
+    estimate_file,
+    configuration=None,
+    sampling_frequency_hz=None,
+    return_decomposition=False
+):
+    """
+    Performs least-squares decomposition, generates auditory features,
+    and predicts Perceptual Evaluation scores natively on target hardware.
+    """
+    if configuration is None:
+        configuration = DecompositionConfiguration()
+
+    # Step 1: Run subband decomposition on PyTorch backend
+    decomp_result = decompose_distortion_components(
+        source_files=original_files,
+        estimate_file=estimate_file,
+        configuration=configuration,
+        sampling_frequency_hz=sampling_frequency_hz
+    )
+    waveforms = decomp_result.waveforms
+    device = estimate_file.device
+    dtype = estimate_file.dtype
+
+    # Calculate actual energy ratios
+    isr, sir, sar, sdr = calculate_bss_eval_energy_ratios(
+        waveforms.true_target,
+        waveforms.target_distortion,
+        waveforms.interference,
+        waveforms.artifacts
+    )
+
+    # Compute actual auditory features
+    signals = (waveforms.true_target, waveforms.target_distortion, waveforms.interference, waveforms.artifacts)
+    q_target, q_interf, q_artif, q_global = calculate_auditory_quality_features(signals, sampling_frequency_hz)
+
+    aud_features = torch.tensor([q_global, q_target, q_interf, q_artif], device=device, dtype=dtype)
+    clamped = torch.clamp(aud_features, -1.0 + 1e-15, 1.0 - 1e-15)
+    log_mapped = torch.clamp(torch.log((1.0 + clamped) / (1.0 - clamped)), -5.5, 5.5)
+
+    scores = []
+    for task_idx in range(4):
+        params = _get_model_parameters_cached(task_idx, device, dtype)
+        selected = log_mapped[params['selec']]
+        scores.append(evaluate_neural_network_mapping_torch(selected, params['w'], params['b'], params['v'], params['a']))
+
+    perceptual_scores = PerceptualSeparationScores(
+        overall_perceptual_score=scores[0],
+        target_perceptual_score=scores[1],
+        interference_perceptual_score=scores[2],
+        artifact_perceptual_score=scores[3],
+        source_to_distortion_ratio=sdr,
+        source_to_spatial_distortion_ratio=isr,
+        source_to_interference_ratio=sir,
+        source_to_artifacts_ratio=sar
+    )
+
+    # Step 4: Attach waveforms if requested
+    if return_decomposition:
+        perceptual_scores.decomposition_waveforms = waveforms
+        perceptual_scores.decomposition_files = decomp_result.file_paths
+
+    return perceptual_scores
+
+
+# Cache weight transformations to prevent recurring numpy reads
+_PARAMS_CACHE = {}
+
+def _get_model_parameters_cached(task_idx: int, device, dtype):
+    key = (task_idx, device, dtype)
+    if key not in _PARAMS_CACHE:
+        _PARAMS_CACHE[key] = _get_model_parameters_torch(task_idx, device, dtype)
+    return _PARAMS_CACHE[key]

@@ -11,15 +11,18 @@ from peass import calculate_auditory_quality_features
 from peass import calculate_bss_eval_energy_ratios
 from peass import decompose_distortion_components
 from peass import predict_perceptual_evaluation_scores
+from tests.conftest import to_backend_format
+from tests.conftest import to_numpy_format
 
 
 @pytest.mark.integration
-def test_end_to_end_stereo_separation():
+def test_end_to_end_stereo_separation(peass_backend):
     """
     Integration test using multi-channel (Stereo) inputs.
     Verifies that the entire PEASS pipeline (decomposition, metrics, and prediction)
     runs with 2-channel stereo arrays, handling the collapsed worst-channel scores.
     """
+    backend_type, device = peass_backend
     sampling_frequency = 16000.0
     duration_seconds = 1.0
     num_samples = int(duration_seconds * sampling_frequency)
@@ -38,27 +41,32 @@ def test_end_to_end_stereo_separation():
     # 3. Create estimate with slight leakage and artifact noise
     estimate = target + 0.1 * interferer + 0.02 * np.random.randn(num_samples, 2)
 
-    # 4. Run end-to-end prediction
+    # 2. Format inputs to active backend
+    target_in = to_backend_format(target, backend_type, device)
+    interferer_in = to_backend_format(interferer, backend_type, device)
+    estimate_in = to_backend_format(estimate, backend_type, device)
+
+    # 3. Run prediction
     results = predict_perceptual_evaluation_scores(
-        original_files=[target, interferer],
-        estimate_file=estimate,
+        original_files=[target_in, interferer_in],
+        estimate_file=estimate_in,
         sampling_frequency_hz=sampling_frequency,
         return_decomposition=True
     )
 
     # Verify scores are generated and stay bounded
-    assert 0.0 <= results.overall_perceptual_score <= 100.0
-    assert 0.0 <= results.target_perceptual_score <= 100.0
-    assert 0.0 <= results.interference_perceptual_score <= 100.0
-    assert 0.0 <= results.artifact_perceptual_score <= 100.0
+    assert 0.0 <= float(to_numpy_format(results.overall_perceptual_score)) <= 100.0
+    assert 0.0 <= float(to_numpy_format(results.target_perceptual_score)) <= 100.0
+    assert 0.0 <= float(to_numpy_format(results.interference_perceptual_score)) <= 100.0
+    assert 0.0 <= float(to_numpy_format(results.artifact_perceptual_score)) <= 100.0
 
     # Ensure returned decomposition arrays are present and have stereo dimensions
     decomp_waveforms = results.decomposition_waveforms
     assert decomp_waveforms is not None
-    assert decomp_waveforms.true_target.shape == (num_samples, 2)
-    assert decomp_waveforms.target_distortion.shape == (num_samples, 2)
-    assert decomp_waveforms.interference.shape == (num_samples, 2)
-    assert decomp_waveforms.artifacts.shape == (num_samples, 2)
+    assert to_numpy_format(decomp_waveforms.true_target).shape == (num_samples, 2)
+    assert to_numpy_format(decomp_waveforms.target_distortion).shape == (num_samples, 2)
+    assert to_numpy_format(decomp_waveforms.interference).shape == (num_samples, 2)
+    assert to_numpy_format(decomp_waveforms.artifacts).shape == (num_samples, 2)
 
 
 @pytest.mark.integration

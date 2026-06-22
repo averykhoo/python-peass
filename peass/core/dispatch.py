@@ -16,8 +16,35 @@ from ..config import PerceptualSeparationScores
 def resolve_backend(estimate_signal: any, source_signals: any = None) -> BaseBackend:
     """
     Inspects input types and resolves the appropriate execution backend.
-    Without PyTorch registered yet, this strictly routes to NumpyBackend.
+    Enforces device and precision homogeneity for PyTorch tensors.
     """
+    has_torch = False
+    try:
+        import torch
+        has_torch = True
+    except ImportError:
+        pass
+
+    if has_torch and isinstance(estimate_signal, torch.Tensor):
+        devices = {estimate_signal.device}
+        dtypes = {estimate_signal.dtype}
+
+        if source_signals is not None:
+            for s in source_signals:
+                if not isinstance(s, torch.Tensor):
+                    raise TypeError("Mixed inputs: estimate_file is a Tensor, but a source_file is not.")
+                devices.add(s.device)
+                dtypes.add(s.dtype)
+
+        if len(devices) > 1:
+            raise RuntimeError(f"Device mismatch: Tensors must be on the same device. Found {devices}")
+        if len(dtypes) > 1:
+            raise RuntimeError(f"Precision mismatch: Tensors must have the same dtype. Found {dtypes}")
+
+        from ..backend_torch import TorchBackend
+        return TorchBackend()
+
+    # Fallback to NumPy optimized backend
     from ..backend_numpy import NumpyBackend
     return NumpyBackend()
 
