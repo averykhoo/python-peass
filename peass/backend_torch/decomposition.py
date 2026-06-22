@@ -4,6 +4,7 @@ File path: peass/backend_torch/decomposition.py
 """
 import math
 import pathlib
+from functools import lru_cache
 
 import soundfile as sf
 import torch
@@ -15,7 +16,15 @@ from .utils import fast_resample_poly_torch
 from ..config import DecomposedFilePaths
 from ..config import DecomposedWaveforms
 from ..config import DecompositionResult
-from functools import lru_cache
+
+
+@lru_cache(maxsize=16)
+def _get_analysis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str):
+    device = torch.device(device_str)
+    cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
+    time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
+    return torch.exp(-2j * math.pi / fs * cfs.unsqueeze(-1) * time_steps)
+
 
 @lru_cache(maxsize=16)
 def _get_synthesis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str):
@@ -23,6 +32,7 @@ def _get_synthesis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, d
     cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
     time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
     return torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
+
 
 def get_real_dtype(dtype: torch.dtype) -> torch.dtype:
     """Helper returning the corresponding real-valued dtype counterpart of any dtype."""
@@ -205,6 +215,7 @@ def perform_time_varying_least_squares_projection_torch(
     # Return the cropped timeline (matches MATLAB/NumPy Ls timeline)
     return projections_accumulation[:-(window_length - 1), :, :]
 
+
 def extract_target_spatial_distortion_interference_artifacts_torch(
         true_sources: torch.Tensor,
         source_estimates: torch.Tensor,
@@ -227,13 +238,12 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
         estimates_reshaped, sources_reshaped, filter_length, window_length, hop_size
     )
 
-    projected_signals = torch.zeros((total_samples, num_channels * num_estimates, num_sources),
-                                    dtype=true_sources.dtype, device=true_sources.device)
-    for s_idx in range(num_sources):
-        start = s_idx * num_channels
-        end = (s_idx + 1) * num_channels
-        # Slice projections to original timeline (matches MATLAB 1:end-flen+1)
-        projected_signals[:, :, s_idx] = torch.sum(projections_all[:-filter_length + 1, :, start:end], dim=2)
+    # 100% Vectorized C++ aggregation (Replaces the Python For-Loop)
+    proj_sliced = projections_all[:-filter_length + 1]
+    T_dim, EC_dim = proj_sliced.shape[:2]
+
+    # Reshape and sum across the contiguous channels natively
+    projected_signals = proj_sliced.view(T_dim, EC_dim, num_sources, num_channels).sum(dim=-1)
 
     spatial_distortion = torch.zeros((total_samples, num_estimates * num_channels), dtype=source_estimates.dtype,
                                      device=source_estimates.device)
@@ -298,9 +308,9 @@ def run_auditory_analysis_filterbank_torch(
     num_bands = subbands_output.shape[-2]
 
     if modulation_matrix is None:
-        time_steps = torch.arange(subbands_output.shape[-1], device=signal_waveform.device, dtype=signal_waveform.dtype)
-        center_frequencies = analyzer.center_frequencies.unsqueeze(-1)
-        modulation_matrix = torch.exp(-2j * math.pi / fs * center_frequencies * time_steps)
+        modulation_matrix = _get_analysis_mod_matrix_torch(
+            fs, subbands_output.shape[-1], tuple(analyzer.center_frequencies.tolist()), str(signal_waveform.device)
+        )
 
     subbands_output = subbands_output * modulation_matrix
 
@@ -339,7 +349,8 @@ def run_auditory_synthesis_filterbank_torch(
     max_len = max(subband_list[b].shape[-1] * int(analyzer.decimations[b]) for b in range(num_bands))
 
     if is_batched:
-        processed = torch.zeros((B, num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
+        processed = torch.zeros((B, num_bands, max_len), dtype=torch.complex128,
+                                device=analyzer.center_frequencies.device)
     else:
         processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
 
@@ -363,11 +374,15 @@ def run_auditory_synthesis_filterbank_torch(
             upsampled = upsampled_block[..., idx, :]
             curr_len = upsampled.shape[-1]
             if curr_len >= max_len:
-                if is_batched: processed[:, band_idx, :] = upsampled[..., :max_len]
-                else: processed[band_idx, :] = upsampled[:max_len]
+                if is_batched:
+                    processed[:, band_idx, :] = upsampled[..., :max_len]
+                else:
+                    processed[band_idx, :] = upsampled[:max_len]
             else:
-                if is_batched: processed[:, band_idx, :curr_len] = upsampled
-                else: processed[band_idx, :curr_len] = upsampled
+                if is_batched:
+                    processed[:, band_idx, :curr_len] = upsampled
+                else:
+                    processed[band_idx, :curr_len] = upsampled
 
     # Re-modulate back to center frequencies prior to synthesis
     mod_matrix = _get_synthesis_mod_matrix_torch(

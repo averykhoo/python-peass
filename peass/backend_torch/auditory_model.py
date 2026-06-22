@@ -4,6 +4,7 @@ File path: peass/backend_torch/auditory_model.py
 """
 import math
 import os
+from functools import lru_cache
 
 import torch
 import torch.nn.functional as F
@@ -12,8 +13,6 @@ from .gammatone import GammatoneAnalyzerTorch
 from .utils import fast_resample_poly_torch
 from .utils import smoothmax
 from ..config import ModulationProcessingType
-
-from functools import lru_cache
 
 
 @lru_cache(maxsize=8)
@@ -38,6 +37,7 @@ def _get_modulation_filters_fft(target_fs: float, N_fft: int, centers_tuple: tup
         H_all[m_idx] = torch.fft.fft(ir, n=N_fft)
 
     return H_all
+
 
 def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> torch.Tensor:
     """Models the nonlinear mechanical-to-neural transduction of the inner hair cells."""
