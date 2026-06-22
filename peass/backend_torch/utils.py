@@ -50,8 +50,8 @@ def get_resample_filter_torch(up: int, down: int, dtype: torch.dtype, device: to
 def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1) -> torch.Tensor:
     """
     Native PyTorch polyphase resampler replicating SciPy's upfirdn using Conv1D.
-    Directly pads the input to match SciPy's off-end filter sliding.
-    Heavily optimized for batched processing of continuous N-dimensional sequences.
+    Heavily optimized for batched processing of continuous N-dimensional sequences
+    using transposed convolutions to mathematically skip zero-insertions.
     """
     if up == down:
         return x
@@ -71,27 +71,43 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
     # Flatten prefix dimensions into Batch
     x_flat = x_moved.reshape(-1, in_len)
     B = x_flat.shape[0]
-
-    # Zero-insertion Upsampling
-    x_up = torch.zeros((B, in_len * up_reduced), dtype=x.dtype, device=x.device)
-    x_up[:, ::up_reduced] = x_flat
-
-    # Calculate and apply input padding (causal padding at start, remainder at end)
     K = h_padded.shape[0]
-    pad_left = K - 1
 
-    required_conv_len = n_pre_remove + out_len
-    L_required = (required_conv_len - 1) * down_reduced + K
-    pad_right = max(0, L_required - (x_up.shape[1] + pad_left))
+    # Standard batched 1D convolution layout: (Batch, Channels, Length)
+    x_batched = x_flat.unsqueeze(1)
 
-    x_up_padded = F.pad(x_up, (pad_left, pad_right))
+    if up_reduced == 1 and down_reduced > 1:
+        # OPTIMIZATION 1: Native Downsampling via Strided Convolution
+        pad_left = K - 1
+        required_conv_len = n_pre_remove + out_len
+        L_required = (required_conv_len - 1) * down_reduced + K
+        pad_right = max(0, L_required - (in_len + pad_left))
 
-    # Downsampling via Stride Convolution (Flipped weights for true convolution)
-    weights = h_padded.flip(-1).view(1, 1, -1)
-    x_conv = F.conv1d(x_up_padded.unsqueeze(1), weights, stride=down_reduced)[..., 0, :]
+        x_padded = F.pad(x_batched, (pad_left, pad_right))
 
-    # Slice and reconstruct shapes
-    y_flat = x_conv[:, n_pre_remove: n_pre_remove + out_len]
+        # FIR filtering corresponds to correlation, which requires flipped weights
+        weights_flipped = h_padded.flip(-1).view(1, 1, K)
+
+        y_conv = F.conv1d(x_padded, weights_flipped, stride=down_reduced)
+        y_flat = y_conv[:, 0, n_pre_remove: n_pre_remove + out_len]
+
+    else:
+        # OPTIMIZATION 2: Native Upsampling via Transposed Convolution
+        # Transposed convolution naturally applies the kernel without flipping it,
+        # perfectly matching zero-insertion followed by standard FIR convolution.
+        weights = h_padded.view(1, 1, K)
+        y_upsampled = F.conv_transpose1d(x_batched, weights, stride=up_reduced)
+
+        start_idx = n_pre_remove * down_reduced
+        end_idx = (n_pre_remove + out_len) * down_reduced
+
+        pad_needed = max(0, end_idx - y_upsampled.shape[-1])
+        if pad_needed > 0:
+            y_upsampled = F.pad(y_upsampled, (0, pad_needed))
+
+        y_flat = y_upsampled[:, 0, start_idx: end_idx: down_reduced]
+
+    # Reconstruct original shape
     y = y_flat.view(*shape_prefix, out_len).transpose(axis, -1)
 
     return y
