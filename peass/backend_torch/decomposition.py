@@ -297,11 +297,25 @@ def run_auditory_analysis_filterbank_torch(
 
     subbands_output = subbands_output * modulation_matrix
 
-    decimated_bands = []
-    for band_idx in range(num_bands):
-        decimated = fast_resample_poly_torch(subbands_output[..., band_idx, :], 1, int(analyzer.decimations[band_idx]),
-                                             axis=-1)
-        decimated_bands.append(decimated)
+    # -------------------------------------------------------------------------
+    # OPTIMIZED: Group bands by unique decimation factors (decimations)
+    # -------------------------------------------------------------------------
+    decimated_bands = [None] * num_bands
+    unique_factors = torch.unique(analyzer.decimations)
+
+    for factor in unique_factors:
+        factor_val = factor.item()
+        band_indices = torch.where(analyzer.decimations == factor_val)[0]
+
+        # Extract the entire group block: shape (Batch, NumGroupBands, Time)
+        block = subbands_output[..., band_indices, :]
+
+        # Resample the 3D block along the last axis in a single parallel call!
+        resampled_block = fast_resample_poly_torch(block, 1, factor_val, axis=-1)
+
+        # Unpack back into the list
+        for idx, band_idx in enumerate(band_indices.tolist()):
+            decimated_bands[band_idx] = resampled_block[..., idx, :]
 
     return decimated_bands, analyzer, modulation_matrix
 
@@ -318,26 +332,35 @@ def run_auditory_synthesis_filterbank_torch(
     max_len = max(subband_list[b].shape[-1] * int(analyzer.decimations[b]) for b in range(num_bands))
 
     if is_batched:
-        processed = torch.zeros((B, num_bands, max_len), dtype=torch.complex128,
-                                device=analyzer.center_frequencies.device)
+        processed = torch.zeros((B, num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
     else:
         processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
 
-    for b in range(num_bands):
-        factor = int(analyzer.decimations[b])
-        upsampled = fast_resample_poly_torch(subband_list[b], factor, 1, axis=-1)
-        curr_len = upsampled.shape[-1]
+    # -------------------------------------------------------------------------
+    # OPTIMIZED: Group subbands by unique decimation factors (decimations)
+    # -------------------------------------------------------------------------
+    unique_factors = torch.unique(analyzer.decimations)
 
-        if curr_len >= max_len:
-            if is_batched:
-                processed[:, b, :] = upsampled[..., :max_len]
+    for factor in unique_factors:
+        factor_val = factor.item()
+        band_indices = torch.where(analyzer.decimations == factor_val)[0]
+
+        # Stack the subbands for this group: shape (..., GroupBands, T_decimated)
+        block = torch.stack([subband_list[b] for b in band_indices.tolist()], dim=-2)
+
+        # Upsample the 3D block in a single parallel call!
+        upsampled_block = fast_resample_poly_torch(block, factor_val, 1, axis=-1)
+
+        # Unpack back into the processed buffer
+        for idx, band_idx in enumerate(band_indices.tolist()):
+            upsampled = upsampled_block[..., idx, :]
+            curr_len = upsampled.shape[-1]
+            if curr_len >= max_len:
+                if is_batched: processed[:, band_idx, :] = upsampled[..., :max_len]
+                else: processed[band_idx, :] = upsampled[:max_len]
             else:
-                processed[b, :] = upsampled[:max_len]
-        else:
-            if is_batched:
-                processed[:, b, :curr_len] = upsampled
-            else:
-                processed[b, :curr_len] = upsampled
+                if is_batched: processed[:, band_idx, :curr_len] = upsampled
+                else: processed[band_idx, :curr_len] = upsampled
 
     # Re-modulate back to center frequencies prior to synthesis
     time_steps = torch.arange(max_len, device=analyzer.center_frequencies.device,
