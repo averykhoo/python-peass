@@ -5,8 +5,18 @@ PEASS Configuration and Data Structures
 from dataclasses import dataclass
 from enum import Enum
 from enum import auto
+from typing import TYPE_CHECKING
 
 import numpy as np
+
+# OPTIONAL DEPENDENCY TYPING:
+# Resolves PyCharm warnings without introducing PyTorch import requirements at runtime!
+if TYPE_CHECKING:
+    import torch
+
+    TensorOrArray = np.ndarray | torch.Tensor
+else:
+    TensorOrArray = np.ndarray  # = Any
 
 
 class ModulationProcessingType(Enum):
@@ -17,11 +27,11 @@ class ModulationProcessingType(Enum):
 
 @dataclass(slots=True)
 class DecomposedWaveforms:
-    """Holds the in-memory NumPy arrays for the decomposed physical components."""
-    true_target: np.ndarray
-    target_distortion: np.ndarray
-    interference: np.ndarray
-    artifacts: np.ndarray
+    """Holds the in-memory arrays for the decomposed physical components."""
+    true_target: TensorOrArray
+    target_distortion: TensorOrArray
+    interference: TensorOrArray
+    artifacts: TensorOrArray
 
 
 @dataclass(slots=True)

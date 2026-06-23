@@ -55,7 +55,9 @@ def test_torch_perceptual_assimilation_behavior(device_str):
     fs = 100.0
     num_bands, num_samples, num_modulations = 4, 200, 1
 
-    ref_rep = torch.abs(torch.ones(num_bands, num_samples, num_modulations, device=device, dtype=torch.float64))
+    # Generates non-zero variance vectors to prevent division-by-zero NaNs in standard Pearson correlation
+    ref_rep = torch.abs(
+        1.0 + 0.2 * torch.randn(num_bands, num_samples, num_modulations, device=device, dtype=torch.float64))
     # Noisy estimate scaled down
     test_rep = 0.5 * (ref_rep + 0.1 * torch.randn_like(ref_rep))
 

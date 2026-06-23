@@ -89,12 +89,9 @@ def perform_least_squares_projection_torch(
     Gram = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
     RHS = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
 
-    # Out-of-place diagonal regularization guarantees invertibility
-    Gram = Gram + torch.eye(Gram.shape[-1], device=Gram.device, dtype=Gram.dtype) * 1e-15
-
     # Directly solve without CPU stall/fallback
-    projection_weights = torch.linalg.solve(Gram, RHS)
-
+    # Always use linalg.pinv for async-safe SVD truncation of ill-conditioned matrices
+    projection_weights = torch.linalg.pinv(Gram) @ RHS
     projections = torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype,
                               device=source_estimates.device)
     weighted_diagonal = analysis_window.unsqueeze(1)
@@ -163,9 +160,8 @@ def perform_time_varying_least_squares_projection_torch(
     Gram = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * toeplitz_batched)
     RHS = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * est_frames)
 
-    # Safe out-of-place regularization guarantees positive-definiteness
-    Gram = Gram + torch.eye(Gram.shape[-1], device=Gram.device, dtype=Gram.dtype).unsqueeze(0) * 1e-15
-    weights = torch.linalg.solve(Gram, RHS)
+    # STABILITY FIX: Always use linalg.pinv for async-safe SVD truncation of ill-conditioned matrices
+    weights = torch.linalg.pinv(Gram) @ RHS
 
     # weights shape: (NumFrames, num_sources * filter_length, num_channels)
     weights_unflat = weights.view(NumFrames, num_sources, filter_length, num_channels)
@@ -443,9 +439,18 @@ def decompose_distortion_components(
         estimate_tensor = estimate_file
         sources_tensors = source_files
 
+    # ADDED FIX: Raise explicit error for missing sampling rate in in-memory mode
+    if not is_file_mode and sampling_frequency_hz is None:
+        raise ValueError("In-memory mode requires explicit sampling rate 'sampling_frequency_hz'.")
+
     # 1. Validate spatial layouts
     estimate_audio = validate_and_normalize_audio_torch(estimate_tensor, "estimate_file")
     sources_audio = [validate_and_normalize_audio_torch(s, f"source_files[{i}]") for i, s in enumerate(sources_tensors)]
+
+    # ADDED FIX: Enforce matching shapes early to prevent internal reshape crashes
+    for s in sources_audio:
+        if s.shape != estimate_audio.shape:
+            raise ValueError("All source signals must be of matching dimensions.")
 
     N_samples = estimate_audio.shape[0]
     C = estimate_audio.shape[1]
