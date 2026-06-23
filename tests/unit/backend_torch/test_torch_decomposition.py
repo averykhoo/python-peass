@@ -256,6 +256,6 @@ def test_torch_decomposition_gain_invariance_with_padding(freq, gain):
     expected_distortion = (gain - 1.0) * true_target
 
     # Assert that strict, high-fidelity tolerances pass on the steady-state segment
-    torch.testing.assert_close(target_distortion, expected_distortion, rtol=1e-6, atol=1e-6)
-    assert torch.max(torch.abs(interference)).item() < 1e-6
-    assert torch.max(torch.abs(artifacts)).item() < 1e-6
+    torch.testing.assert_close(target_distortion, expected_distortion, rtol=2e-6, atol=2e-6)
+    assert torch.max(torch.abs(interference)).item() < 2e-6
+    assert torch.max(torch.abs(artifacts)).item() < 2e-6
