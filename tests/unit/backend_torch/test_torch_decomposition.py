@@ -28,12 +28,8 @@ def test_torch_decomposition_algebraic_reconstruction(device_str):
     estimate = target + 0.1 * interferer
 
     config = DecompositionConfiguration()
-    result = decompose_distortion_components(
-        source_files=[target, interferer],
-        estimate_file=estimate,
-        configuration=config,
-        sampling_frequency_hz=fs
-    )
+    result = decompose_distortion_components(source_files=[target, interferer], estimate_file=estimate,
+                                             configuration=config, sampling_frequency_hz=fs)
     wf = result.waveforms
 
     # Verify matching dimensions
@@ -70,18 +66,12 @@ def test_torch_decomposition_input_validation():
     estimate_mismatched = torch.randn(1010, 1, dtype=torch.float64)
 
     with pytest.raises(ValueError, match="dimensions|size"):
-        decompose_distortion_components(
-            source_files=[target, interferer],
-            estimate_file=estimate_mismatched,
-            sampling_frequency_hz=fs
-        )
+        decompose_distortion_components(source_files=[target, interferer], estimate_file=estimate_mismatched,
+                                        sampling_frequency_hz=fs)
 
     with pytest.raises(ValueError, match="requires explicit sampling rate"):
-        decompose_distortion_components(
-            source_files=[target, interferer],
-            estimate_file=target,
-            sampling_frequency_hz=None
-        )
+        decompose_distortion_components(source_files=[target, interferer], estimate_file=target,
+                                        sampling_frequency_hz=None)
 
 
 @pytest.mark.unit
@@ -101,11 +91,8 @@ def test_torch_decomposition_gain_invariance(device_str):
     # 30% amplitude reduction
     estimate = 0.7 * target
 
-    result = decompose_distortion_components(
-        source_files=[target, silent_interferer],
-        estimate_file=estimate,
-        sampling_frequency_hz=fs
-    )
+    result = decompose_distortion_components(source_files=[target, silent_interferer], estimate_file=estimate,
+                                             sampling_frequency_hz=fs)
     wf = result.waveforms
 
     # 7. Extract the time-domain artifacts and calculate peak absolute value
@@ -113,9 +100,7 @@ def test_torch_decomposition_gain_invariance(device_str):
 
     # 8. Calculate the corresponding gain-invariance internal error:
     # max(|target_distortion - (-0.3 * true_target)|)
-    gain_invariance_mismatch = torch.max(
-        torch.abs(wf.target_distortion - (-0.3 * wf.true_target))
-    ).item()
+    gain_invariance_mismatch = torch.max(torch.abs(wf.target_distortion - (-0.3 * wf.true_target))).item()
 
     # 9. Format outputs to full float64 precision
     print("=" * 65)
@@ -237,12 +222,9 @@ def test_torch_decomposition_gain_invariance_with_padding(freq, gain):
 
     # 3. Execute decomposition on the padded inputs
     config = DecompositionConfiguration()
-    result = decompose_distortion_components(
-        source_files=[padded_target, padded_interferer],
-        estimate_file=padded_estimate,
-        configuration=config,
-        sampling_frequency_hz=sample_rate
-    )
+    result = decompose_distortion_components(source_files=[padded_target, padded_interferer],
+                                             estimate_file=padded_estimate, configuration=config,
+                                             sampling_frequency_hz=sample_rate)
     wf = result.waveforms
 
     # 4. Truncate the boundary padding regions to isolate the steady-state signal

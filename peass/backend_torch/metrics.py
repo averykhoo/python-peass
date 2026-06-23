@@ -8,6 +8,9 @@ from .auditory_model import generate_auditory_internal_representation_torch
 
 
 def calculate_bss_eval_energy_ratios(true_source, target_dist, interf, artif):
+    """
+    Computes energy ratio metrics. Returns native differentiable PyTorch tensors.
+    """
     eps = 1e-15
     # Flatten across time and channels
     s = true_source.view(-1)
@@ -29,7 +32,7 @@ def calculate_bss_eval_energy_ratios(true_source, target_dist, interf, artif):
     SAR = 10.0 * torch.log10(torch.clamp(torch.dot(sum_int, sum_int), min=eps) / torch.clamp(energy_artif, min=eps))
     SDR = 10.0 * torch.log10(torch.clamp(energy_true, min=eps) / torch.clamp(torch.dot(sum_all, sum_all), min=eps))
 
-    return ISR.item(), SIR.item(), SAR.item(), SDR.item()
+    return ISR, SIR, SAR, SDR
 
 
 def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
@@ -65,7 +68,8 @@ def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
 
     # Global integration via cumulative sum
     test_sq = torch.sum(test_rep[:, :num_samples, :] ** 2, dim=(0, 2))
-    cum_sum = torch.cat([torch.tensor([0.0], device=test_rep.device), torch.cumsum(test_sq, dim=0)])
+    cum_sum = torch.cat(
+        [torch.tensor([0.0], device=test_rep.device, dtype=test_rep.dtype), torch.cumsum(test_sq, dim=0)])
 
     centers = (torch.arange(num_frames, device=test_rep.device) + 0.5) * frame_len
     starts = torch.clamp(centers - 0.5 * fs, min=0).to(torch.long)
@@ -81,7 +85,12 @@ def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
     cutoff = 0.5 * cum_rms[-1]
     matches = torch.where(cum_rms >= cutoff)[0]
 
-    return float(sorted_p[matches[0]].item()) if len(matches) > 0 else 0.0
+    if len(matches) > 0:
+        val = sorted_p[matches[0]]
+    else:
+        val = torch.tensor(0.0, device=ref_rep.device, dtype=ref_rep.dtype)
+
+    return val
 
 
 def calculate_auditory_quality_features(signals, fs=16000.0):
@@ -122,4 +131,9 @@ def calculate_auditory_quality_features(signals, fs=16000.0):
         ch_art.append(calculate_auditory_similarity_metric_torch(mref_a, mtest, target_fs))
         ch_glo.append(calculate_auditory_similarity_metric_torch(mref_g, mtest, target_fs))
 
-    return min(ch_tar), min(ch_int), min(ch_art), min(ch_glo)
+    return (
+        torch.stack(ch_tar).min(),
+        torch.stack(ch_int).min(),
+        torch.stack(ch_art).min(),
+        torch.stack(ch_glo).min()
+    )

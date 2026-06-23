@@ -18,10 +18,10 @@ def test_torch_calculate_energy_ratios_analytical():
         true_source, target_distortion, interference, artifacts
     )
 
-    assert np.isclose(isr, 20.0)
-    assert np.isclose(sir, 10.0 * np.log10(484.0))
-    assert np.isclose(sar, 10.0 * np.log10(2116.0))
-    assert np.isclose(sdr, 10.0 * np.log10(32.653061224))
+    assert np.isclose(isr.item(), 20.0)
+    assert np.isclose(sir.item(), 10.0 * np.log10(484.0))
+    assert np.isclose(sar.item(), 10.0 * np.log10(2116.0))
+    assert np.isclose(sdr.item(), 10.0 * np.log10(32.653061224))
 
 
 @pytest.mark.unit

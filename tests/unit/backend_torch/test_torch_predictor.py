@@ -1,6 +1,5 @@
 import math
 
-import numpy as np
 import pytest
 import torch
 
@@ -90,8 +89,8 @@ def test_torch_predictor_amplitude_robustness(device_str):
         sampling_frequency_hz=fs
     )
 
-    assert not np.isnan(results.overall_perceptual_score)
-    assert not np.isinf(results.overall_perceptual_score)
+    assert not torch.isnan(results.overall_perceptual_score).any()
+    assert not torch.isinf(results.overall_perceptual_score).any()
 
 
 @pytest.mark.unit

@@ -4,6 +4,7 @@ import pytest
 
 from peass import DecompositionConfiguration
 from peass import decompose_distortion_components
+from peass import predict_perceptual_evaluation_scores
 
 
 @pytest.mark.integration
@@ -62,4 +63,51 @@ def test_pytorch_backpropagation_through_decomposition():
     max_gradient = torch.max(torch.abs(estimate.grad)).item()
     assert max_gradient > 0.0, "Gradients are zero, meaning the graph is dead."
 
-    print(f"\n---> BACKPROP SUCCESS. Max gradient on input estimate: {max_gradient:.6e}")
+
+@pytest.mark.integration
+def test_pytorch_backpropagation_through_scoring_pipeline():
+    """
+    Verifies that gradients can flow backward through the entire PyTorch
+    cognitive evaluation pipeline (Decomposition -> PEMO-Q Metrics -> MLP Predictor).
+    This confirms the end-to-end differentiability of predicted subjective scores.
+    """
+    try:
+        import torch
+    except ImportError:
+        pytest.skip("PyTorch is not installed in this environment.")
+
+    sampling_frequency = 16000.0
+    duration_seconds = 0.25  # keeps the test quick while satisfying minimum 50ms constraints
+    num_samples = int(duration_seconds * sampling_frequency)
+
+    device = torch.device("cpu")
+    time_steps = torch.linspace(0.0, duration_seconds, num_samples, device=device, dtype=torch.float64)
+
+    # 1. Create clean target and noise sources
+    target = torch.sin(2.0 * math.pi * 440.0 * time_steps).unsqueeze(1)
+    interferer = torch.sin(2.0 * math.pi * 1000.0 * time_steps).unsqueeze(1)
+
+    # 2. Create the estimate requiring gradients (simulating model output)
+    estimate = (target + 0.1 * interferer + 0.01 * torch.randn_like(target)).clone().detach().requires_grad_(True)
+
+    # 3. Run full evaluation score predictor
+    scores = predict_perceptual_evaluation_scores(
+        original_files=[target, interferer],
+        estimate_file=estimate,
+        sampling_frequency_hz=sampling_frequency,
+        return_decomposition=False
+    )
+
+    # 4. Define loss as the penalty of the predicted overall perceptual score (OPS)
+    loss = 100.0 - scores.overall_perceptual_score
+
+    # 5. Execute backward pass
+    loss.backward()
+
+    # 6. Assertions
+    assert estimate.grad is not None, "Autograd graph disconnected! Gradients did not flow back from the MLP."
+    assert not torch.isnan(estimate.grad).any(), "Gradient calculations returned NaNs."
+    assert not torch.isinf(estimate.grad).any(), "Gradient calculations returned Inf."
+
+    max_gradient = torch.max(torch.abs(estimate.grad)).item()
+    assert max_gradient > 0.0, "Gradients are zero, indicating a broken gradient path."

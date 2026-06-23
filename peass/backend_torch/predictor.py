@@ -36,7 +36,7 @@ def evaluate_neural_network_mapping_torch(features, w, b, v, a):
     hidden_activation = w @ features + b
     hidden_output = torch.sigmoid(hidden_activation)
     output_activation = v.T @ hidden_output + a
-    return 100.0 * torch.sigmoid(output_activation).item()
+    return (100.0 * torch.sigmoid(output_activation)).squeeze()
 
 
 def predict_perceptual_evaluation_scores(
@@ -76,7 +76,12 @@ def predict_perceptual_evaluation_scores(
     signals = (waveforms.true_target, waveforms.target_distortion, waveforms.interference, waveforms.artifacts)
     q_target, q_interf, q_artif, q_global = calculate_auditory_quality_features(signals, sampling_frequency_hz)
 
-    aud_features = torch.tensor([q_global, q_target, q_interf, q_artif], device=device, dtype=dtype)
+    aud_features = torch.stack([
+        q_global if isinstance(q_global, torch.Tensor) else torch.tensor(q_global, device=device, dtype=dtype),
+        q_target if isinstance(q_target, torch.Tensor) else torch.tensor(q_target, device=device, dtype=dtype),
+        q_interf if isinstance(q_interf, torch.Tensor) else torch.tensor(q_interf, device=device, dtype=dtype),
+        q_artif if isinstance(q_artif, torch.Tensor) else torch.tensor(q_artif, device=device, dtype=dtype)
+    ])
     clamped = torch.clamp(aud_features, -1.0 + 1e-15, 1.0 - 1e-15)
     log_mapped = torch.clamp(torch.log((1.0 + clamped) / (1.0 - clamped)), -5.5, 5.5)
 
