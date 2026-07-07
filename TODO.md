@@ -12,21 +12,18 @@
 
 - perf: `backend_torch/auditory_model.py` runs the auditory-nerve adaptation as a
   `torch.jit.script` per-sample loop at the up-sampled rate (~24 kHz). This is a
-  performance cliff for multi-second audio. Vectorize via an associative/scan
-  formulation, or run it after decimation. Deferred because it needs a torch
-  runtime to verify numerical parity (torch is not installed in the dev env).
-- tests: `test_differential_numpy_vs_torch.py` still contains two debug-harness
-  tests worth cleaning up — `test_linalg_solve_fallback_parity` compares scipy vs
-  torch reimplementations rather than the production code path, and
-  `test_synthesis_fixed_delay_parity` monkey-patches a hand-copied fork of
-  `run_auditory_synthesis_filterbank_torch` that can silently drift. Convert to
-  real production-path tests or remove.
-- tests: `test_torch_decomposition.py:~115` relaxes tolerances with a TODO
-  comment; track the backend accuracy gap via `xfail(strict=True)` + an issue
-  instead of loosening the assertion.
-- tests: a few numpy unit tests assert only shapes (e.g.
-  `test_numpy_gammatone.py::test_gammatone_analysis_reconstruction`) or use loose
-  0.85 reconstruction thresholds — tighten to value/fidelity checks.
+  performance cliff for multi-second audio. It is an inherently sequential
+  *nonlinear* first-order recurrence (each timestep divides by the previous
+  state), so it cannot be exactly parallelized with an associative scan; any
+  speedup is an approximation that needs a torch runtime to verify against the
+  numpy reference (torch is not installed in the dev env). Left as-is.
+- tests: `test_torch_decomposition.py:~115` relaxes tolerances with a stale TODO
+  ("will pass once linalg.pinv is added") even though `torch.linalg.pinv` is now
+  used. Re-check whether the strict tolerance passes and, if not, track the gap
+  via `xfail(strict=True)` + an issue. Needs a torch runtime to verify.
+- tests: `test_linalg_solve_fallback_parity` in the differential file compares
+  scipy vs torch library reimplementations rather than the production code path;
+  convert to exercise the real solver/fallback or remove.
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference (not MATLAB-published) numbers; replace with MATLAB's
   actual OPS/TPS/IPS/APS for the example clips if/when available.
