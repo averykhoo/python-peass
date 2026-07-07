@@ -585,80 +585,12 @@ def test_synthesis_temporal_alignment_parity(matlab_ref_resources):
     lags = signal.correlation_lags(len(s_np), len(s_th), mode='full')
     best_lag = lags[np.argmax(np.abs(correlation))]
 
+    # Regression guard: both backends must use the same synthesis group delay
+    # (1000/fs). A non-zero lag means the torch synthesis delay has drifted.
     assert best_lag == 0, (
-        f"Temporal shift detected! PyTorch is shifted by {best_lag} samples "
-        f"relative to NumPy. This shift is caused by the hardcoded 4ms group delay "
-        f"mismatch in PyTorch's synthesis filterbank."
+        f"Temporal shift detected: PyTorch synthesis is shifted by {best_lag} "
+        f"samples relative to NumPy (synthesis group-delay mismatch)."
     )
-
-
-def test_synthesis_fixed_delay_parity(matlab_ref_resources):
-    """
-    Monkey-patches the incorrect PyTorch delay parameter to match NumPy's 1000/fs delay,
-    and asserts that the resulting waveform achieves near-perfect correlation with NumPy.
-    """
-
-    target, fs = sf.read(matlab_ref_resources / "targetSrc.wav")
-    ch0 = target[:, 0]
-
-    # 1. Run NumPy
-    subbands_np, analyzer_np, _ = run_analysis_np(ch0, float(fs))
-    synth_np, _ = run_synth_np(subbands_np, analyzer_np)
-
-    # 2. Run PyTorch with monkey-patched fixed delay
-    original_run_synth = decomp_module.run_auditory_synthesis_filterbank_torch
-
-    def patched_run_synth(subband_list, analyzer):
-
-        num_bands = len(subband_list)
-        max_len = max(len(subband_list[b]) * int(analyzer.decimations[b]) for b in range(num_bands))
-        processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
-        for b in range(num_bands):
-            factor = int(analyzer.decimations[b])
-            upsampled = decomp_module.fast_resample_poly_torch(subband_list[b], factor, 1)
-            curr_len = len(upsampled)
-            if curr_len >= max_len:
-                processed[b] = upsampled[:max_len]
-            else:
-                processed[b, :curr_len] = upsampled
-        time_steps = torch.arange(max_len, device=analyzer.center_frequencies.device,
-                                  dtype=analyzer.center_frequencies.dtype)
-        mod_matrix = torch.exp(2j * math.pi / analyzer.fs * analyzer.center_frequencies.unsqueeze(1) * time_steps)
-        processed = processed * mod_matrix
-
-        # FIXED DELAY VALUE (Matching NumPy's 1000 / fs)
-        desired_delay_seconds = 1000.0 / analyzer.fs
-
-        synth = GammatoneSynthesizerTorch(analyzer, desired_delay_seconds)
-        reconstructed = synth.process(processed)
-        original_fs = analyzer.original_sampling_frequency_hz
-        reconstructed = decomp_module.fast_resample_poly_torch(reconstructed, int(original_fs), int(analyzer.fs))
-        delay_samples = int(round(desired_delay_seconds * original_fs))
-        return reconstructed[delay_samples:]
-
-    decomp_module.run_auditory_synthesis_filterbank_torch = patched_run_synth
-
-    try:
-        fs_upsampled = analyzer_np.sampling_frequency_hz
-        analyzer_th = GammatoneAnalyzerTorch(
-            fs_upsampled, 20.0, 1000.0, analyzer_np.upper_cutoff_frequency_hz, 1.0,
-            torch.device("cpu"), torch.float64
-        )
-        analyzer_th.original_sampling_frequency_hz = analyzer_np.original_sampling_frequency_hz
-        subbands_th = [torch.tensor(b, dtype=torch.complex128) for b in subbands_np]
-
-        synth_th = to_numpy_format(patched_run_synth(subbands_th, analyzer_th))
-
-        # 3. Assert matching length and near-perfect correlation
-        assert len(synth_np) == len(synth_th), f"Length mismatched even after patch: {len(synth_np)} vs {len(synth_th)}"
-        corr = np.corrcoef(synth_np, synth_th)[0, 1]
-
-        print(f"\n---> PATCHED SYNTHESIS CORRELATION: {corr:.8f}")
-        assert corr > 0.999, f"Correlation remains low even after delay fix: {corr:.6f}"
-
-    finally:
-        # Restore original function to prevent state pollution
-        decomp_module.run_auditory_synthesis_filterbank_torch = original_run_synth
 
 
 @pytest.mark.regression

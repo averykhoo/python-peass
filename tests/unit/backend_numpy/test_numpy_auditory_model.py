@@ -45,28 +45,42 @@ def test_internal_auditory_representation(synthetic_audio_data):
 
 @pytest.mark.unit
 def test_auditory_fallback_kernels():
-    """Explicitly tests the fallback implementations to guarantee coverage on JIT environments."""
-    subband_signals = np.random.randn(4, 100)
+    """Tests the fallback kernels and, when Numba is present, asserts they match
+    the JIT kernels to floating-point precision (the meaningful invariant)."""
+    subband_signals = np.random.default_rng(seed=0).standard_normal((4, 100))
     adaptation_loop_bandwidths = 1.0 / (np.pi * np.array([0.005, 0.05, 0.129, 0.253, 0.5]))
+    haircell_gain = np.exp(-np.pi * 2000.0 / 16000.0)
 
-    # 1. Test fallback adaptation loops directly
+    # 1. Fallback adaptation loops
     res_loops = _fallback_adaptation_loops(
-        subband_signals=subband_signals,
+        subband_signals=subband_signals.copy(),
         sampling_frequency_hz=16000.0,
         adaptation_bandwidths=adaptation_loop_bandwidths,
         absolute_hearing_threshold=1e-5
     )
     assert res_loops.shape == subband_signals.shape
 
-    # 2. Test fallback fused auditory kernel directly
+    # 2. Fallback fused auditory kernel
     res_fused = _fallback_fused_auditory_kernel(
-        subband_signals=subband_signals,
+        subband_signals=subband_signals.copy(),
         sampling_frequency_hz=16000.0,
-        haircell_filter_gain=np.exp(-np.pi * 2000.0 / 16000.0),
+        haircell_filter_gain=haircell_gain,
         adaptation_bandwidths=adaptation_loop_bandwidths,
         absolute_hearing_threshold=1e-5
     )
     assert res_fused.shape == subband_signals.shape
+
+    # 3. JIT-vs-fallback parity: the two paths must agree closely.
+    if _HAS_NUMBA:
+        jit_loops = _numba_adaptation_loops_kernel(
+            subband_signals.copy(), 16000.0, adaptation_loop_bandwidths, 1e-5
+        )
+        np.testing.assert_allclose(res_loops, jit_loops, rtol=1e-9, atol=1e-12)
+
+        jit_fused = _numba_fused_auditory_kernel(
+            subband_signals.copy(), 16000.0, haircell_gain, adaptation_loop_bandwidths, 1e-5
+        )
+        np.testing.assert_allclose(res_fused, jit_fused, rtol=1e-9, atol=1e-12)
 
 
 @pytest.mark.unit

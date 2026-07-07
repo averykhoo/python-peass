@@ -141,7 +141,10 @@ def test_gammatone_reconstruction_parameterized(synthetic_signal):
     original_sliced = original_sliced[:min_len]
     reconstructed_sliced = reconstructed_sliced[:min_len]
 
-    # Verify high phase and shape matching through cross-correlation
+    # Verify high phase and shape matching through cross-correlation. The bound
+    # is deliberately loose: broadband inputs (chirp, white noise) carry energy
+    # outside the [80, 6000] Hz filterbank span that cannot be reconstructed, so
+    # ~0.89 is the physical ceiling for those cases (narrowband tones reach ~0.99).
     corr = np.corrcoef(original_sliced, reconstructed_sliced)[0, 1]
     assert corr > 0.85
 
@@ -194,28 +197,38 @@ def test_gammatone_fallback_vs_jit_equivalence():
 @pytest.mark.parametrize("sampling_frequency_hz", [8000.0, 16000.0, 44100.0])
 def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
     """
-    Checks the basic array shape and dimensions of the reconstructed signal from
-    the analysis-synthesis filterbank.
+    Verifies the analysis-synthesis filterbank reconstructs a tone with the
+    correct shape AND high fidelity (once the fixed group delay is compensated).
     """
     duration_seconds = 0.5
     num_samples = int(duration_seconds * sampling_frequency_hz)
     signal_input = np.sin(2.0 * np.pi * 500.0 * np.linspace(0, duration_seconds, num_samples))
 
+    # Keep the upper cutoff strictly below Nyquist so the filterbank is valid.
+    upper_cutoff = min(8000.0, sampling_frequency_hz / 2.0 * 0.9)
     analyzer = GammatoneAnalyzer(
         sampling_frequency_hz=sampling_frequency_hz,
         lower_cutoff_frequency_hz=80.0,
         specified_center_frequency_hz=1000.0,
-        upper_cutoff_frequency_hz=8000.0,
+        upper_cutoff_frequency_hz=upper_cutoff,
         filters_per_equivalent_rectangular_bandwidth=1.0
     )
 
     subbands = analyzer.process(signal_input)
     assert subbands.ndim == 2
 
-    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds=0.004)
-    reconstructed = synthesizer.process(subbands)
+    desired_delay_seconds = 0.004
+    synthesizer = GammatoneSynthesizer(analyzer, desired_delay_seconds=desired_delay_seconds)
+    reconstructed = np.real(synthesizer.process(subbands))
     assert reconstructed.ndim == 1
     assert reconstructed.shape[0] == num_samples
+
+    # Compensate the synthesis group delay, then assert high reconstruction fidelity.
+    delay_samples = int(round(desired_delay_seconds * sampling_frequency_hz))
+    original_aligned = signal_input[:num_samples - delay_samples]
+    reconstructed_aligned = reconstructed[delay_samples:delay_samples + len(original_aligned)]
+    corr = np.corrcoef(original_aligned, reconstructed_aligned)[0, 1]
+    assert corr > 0.98, f"Reconstruction fidelity too low at {sampling_frequency_hz} Hz: {corr:.4f}"
 
 
 @pytest.mark.unit

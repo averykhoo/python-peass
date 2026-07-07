@@ -78,7 +78,13 @@ def perform_least_squares_projection_torch(
         filter_half_length: int,
         analysis_window: torch.Tensor
 ) -> torch.Tensor:
-    """Computes weighted least-squares projections natively on GPU."""
+    """Computes weighted least-squares projections natively on GPU.
+
+    Note: the production pipeline uses the fully-batched
+    ``perform_time_varying_least_squares_projection_torch`` below; this
+    single-frame solver is retained as the direct analogue of the NumPy
+    per-frame solver for the differential parity tests.
+    """
     filter_length = 2 * filter_half_length + 1
     num_sources = true_sources.shape[1]
     num_samples = source_estimates.shape[0]
