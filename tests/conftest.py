@@ -19,6 +19,15 @@ try:
 except ImportError:
     _HAS_TORCH = False
 
+# PyTorch is an optional extra. When it is not installed, skip collection of the
+# torch-only test modules entirely so a bare `pytest` run does not abort with
+# import errors (paths are relative to this conftest's directory).
+if not _HAS_TORCH:
+    collect_ignore_glob = [
+        "unit/backend_torch/*.py",
+        "regression/test_differential_numpy_vs_torch.py",
+    ]
+
 
 @pytest.fixture(scope="session")
 def project_root():

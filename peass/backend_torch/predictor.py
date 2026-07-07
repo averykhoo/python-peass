@@ -3,8 +3,10 @@ PEASS PyTorch MLP Predictor
 File path: peass/backend_torch/predictor.py
 """
 import os
+import pathlib
 
 import numpy as np
+import soundfile as sf
 import torch
 
 from .decomposition import decompose_distortion_components
@@ -61,8 +63,18 @@ def predict_perceptual_evaluation_scores(
         sampling_frequency_hz=sampling_frequency_hz
     )
     waveforms = decomp_result.waveforms
-    device = estimate_file.device
-    dtype = estimate_file.dtype
+    # Derive device/dtype from the decomposed waveforms rather than the input:
+    # estimate_file may be a file path (not a tensor), and the internal pipeline
+    # always promotes to float64, so this keeps the MLP weights consistent.
+    device = waveforms.true_target.device
+    dtype = waveforms.true_target.dtype
+
+    # Recover the sampling rate for file-based inputs (mirrors the NumPy backend).
+    if sampling_frequency_hz is None:
+        if isinstance(estimate_file, (str, pathlib.Path)):
+            sampling_frequency_hz = float(sf.info(estimate_file).samplerate)
+        else:
+            sampling_frequency_hz = 16000.0
 
     # Calculate actual energy ratios
     isr, sir, sar, sdr = calculate_bss_eval_energy_ratios(
@@ -85,9 +97,12 @@ def predict_perceptual_evaluation_scores(
     clamped = torch.clamp(aud_features, -1.0 + 1e-15, 1.0 - 1e-15)
     log_mapped = torch.clamp(torch.log((1.0 + clamped) / (1.0 - clamped)), -5.5, 5.5)
 
+    # The MLP weights must match the feature dtype (the auditory pipeline runs in
+    # float64), independent of the caller's input precision (e.g. a float32 tensor).
+    param_dtype = log_mapped.dtype
     scores = []
     for task_idx in range(4):
-        params = _get_model_parameters_cached(task_idx, device, dtype)
+        params = _get_model_parameters_cached(task_idx, device, param_dtype)
         selected = log_mapped[params['selec']]
         scores.append(
             evaluate_neural_network_mapping_torch(selected, params['w'], params['b'], params['v'], params['a']))
