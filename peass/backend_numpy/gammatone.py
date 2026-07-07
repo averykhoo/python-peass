@@ -554,19 +554,23 @@ class GammatoneSynthesizer:
         return self.mixer_unit.process(delayed_signal)
 
 
+# Anti-aliasing FIR half-length as a multiple of the up/down ratio. 10 matches
+# SciPy's resample_poly default (and the MATLAB reference) for near bit-exact
+# agreement. Lower values trade accuracy for speed: empirically 3x costs ~6% of
+# each component's energy and drops MATLAB correlation to ~0.99 (the reduction is
+# NOT free even for the band-limited subband resamples, contrary to a prior note).
+DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR = 10
+
+
 @lru_cache(maxsize=256)
-def get_resample_filter(up: int, down: int) -> tuple:
+def get_resample_filter(up: int, down: int, half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR) -> tuple:
     g = math.gcd(up, down)
     up_reduced = up // g
     down_reduced = down // g
 
     max_len = max(up_reduced, down_reduced)
 
-    # REDUCED ORDER FILTER DESIGN:
-    # Scale from 10 to 3. Because subband signals are already band-limited
-    # by the Gammatone filterbank, 3 * max_len provides excellent anti-aliasing
-    # while reducing filter taps by 70% (e.g. from 10,001 to 3,001 taps).
-    half_len = 3 * max_len
+    half_len = half_length_factor * max_len
     n_filt = 2 * half_len + 1
 
     # 1. Design standard Kaiser FIR filter
@@ -583,11 +587,17 @@ def get_resample_filter(up: int, down: int) -> tuple:
     return h_padded, up_reduced, down_reduced, n_pre_remove
 
 
-def fast_resample_poly(x: np.ndarray, up: int, down: int, axis: int = -1) -> np.ndarray:
+def fast_resample_poly(
+        x: np.ndarray,
+        up: int,
+        down: int,
+        axis: int = -1,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+) -> np.ndarray:
     if up == down:
         return x.copy()
 
-    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down)
+    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down, half_length_factor)
 
     in_len = x.shape[axis]
     out_len = int(np.ceil(in_len * up_reduced / down_reduced))

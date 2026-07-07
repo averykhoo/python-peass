@@ -18,7 +18,7 @@ against the MATLAB gold `.wav` files for the stereo reference clip.
 | Severity | Finding | Status |
 |---|---|---|
 | CRITICAL | Torch haircell lowpass applied time-reversed (missing `conv1d` kernel flip) | **FIXED this session** (`c2c7e76`) |
-| MEDIUM | Reduced-order (3×) resample filter is the dominant deviation from MATLAB (subband resamples) — accuracy/speed tradeoff | **Decision needed** |
+| MEDIUM | Reduced-order (3×) resample filter was the dominant deviation from MATLAB (subband resamples) | **RESOLVED this session**: default now full-order 10× (corr → 0.99999), configurable via `DecompositionConfiguration.resample_filter_half_length_factor` |
 | LOW | Sequential independent loops leave ~2× wall-clock on the table | Follow-up (perf) |
 | LOW | numpy predictor re-decodes the estimate file just for its sample rate | Safe fix |
 | LOW | Unbounded `lru_cache` on the synthesis modulation matrix (memory growth) | Safe fix |
@@ -72,13 +72,14 @@ rather than ~1.0. Because the deficit is roughly uniform across components, the
 BSS *ratios* (SDR/ISR/SIR/SAR) are largely unaffected (scaling cancels), but the
 decomposed *waveforms* and the perceptual scores that consume them can shift.
 
-Options (a design decision about what this library is for):
-1. **Keep 3×** — fastest; document the ~0.99/−6% deviation from MATLAB explicitly.
-2. **Go full-order (10×)** — near bit-exact MATLAB match at +33% runtime.
-3. **Make it configurable** — add a resample-quality knob (e.g. `filter_half_length_factor` on the config, default 7 as a balance: −1.3% energy, ~0.999 corr, ~+20%).
-
-Recommended: option 3 with a sensible default, so users who need MATLAB-faithful
-numbers can opt into it and those who need speed can keep the fast path.
+**RESOLVED:** made configurable via `DecompositionConfiguration.resample_filter_half_length_factor`,
+defaulting to full-order `10` (near bit-exact MATLAB match: min component
+correlation on the reference clip went 0.98985 → 0.999997). Users who need the
+old speed can set it to `3` (corr ~0.99, ~25% faster decompose). Threaded through
+both the numpy and torch decomposition paths; the auditory-model resampling uses
+the same full-order default. The perceptual scores shifted with the more accurate
+decomposition (e.g. OPS 15.38 → 17.67); the characterization test values were
+updated accordingly, and the numpy regression correlation gate tightened to 0.999.
 
 ---
 
@@ -170,11 +171,10 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
 
 ## Recommendation: this session vs. a new one
 
-- **Done this session:** C1 (critical torch fix), plus the two zero-risk perf/
-  hygiene fixes (#2 predictor sample-rate, #4 cache cap).
-- **Needs your decision (this session or next):** M1 resample accuracy/speed
-  tradeoff — this changes numerical output, so it's your call which option to take.
-- **Best as its own focused session:** the parallelization work (#1) — it's a
+- **Done this session:** C1 (critical torch fix); M1 (full-order resampling as
+  the configurable default → MATLAB correlation ~0.99999); the two zero-risk
+  perf/hygiene fixes (#2 predictor sample-rate, #4 cache cap).
+- **Deferred (your call):** the parallelization work (#1) — it's a
   larger change (numba `nogil`/`prange` + threading) that needs careful
   bit-parity validation against the serial path and a torch runtime for the torch
   side. Low risk conceptually, but worth doing deliberately with benchmarks.

@@ -175,8 +175,10 @@ Python's outputs must achieve a cross-correlation coefficient exceeding $0.95$ w
 
 The package dispatches to a NumPy backend for array/file inputs and a PyTorch
 backend for tensor inputs (selected automatically by input type). The NumPy
-backend is the numerical reference and matches the MATLAB toolbox closely
-(cross-correlation > 0.98). The PyTorch backend is designed to be **fully
+backend is the numerical reference and matches the MATLAB toolbox very closely
+(cross-correlation > 0.999 with the default full-order resampling; lower
+`DecompositionConfiguration.resample_filter_half_length_factor` from `10` toward
+`3` to trade a little fidelity for ~25% faster decomposition). The PyTorch backend is designed to be **fully
 differentiable** (usable inside a training loop): it replaces the hard
 non-linearities and IIR recursions of the reference with smooth, backprop-safe
 surrogates (softplus, FIR-truncated filters). As a result its outputs match the

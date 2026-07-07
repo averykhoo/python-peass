@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .gammatone import GammatoneAnalyzerTorch
 from .gammatone import GammatoneSynthesizerTorch
+from .utils import DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 from .utils import fast_resample_poly_torch
 from ..config import DecomposedFilePaths
 from ..config import DecomposedWaveforms
@@ -299,7 +300,8 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
 def run_auditory_analysis_filterbank_torch(
         signal_waveform: torch.Tensor,
         fs: float,
-        modulation_matrix: torch.Tensor | None = None
+        modulation_matrix: torch.Tensor | None = None,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 ) -> tuple[list[torch.Tensor], GammatoneAnalyzerTorch, torch.Tensor]:
     """Runs parallel analytical complex-valued filterbanks."""
 
@@ -313,7 +315,9 @@ def run_auditory_analysis_filterbank_torch(
     # `fs/2 < 1.5*(fs/2)` is a tautology (always true), so this is unconditional.
     original_fs = fs
     new_fs = int(round(1.5 * fs))
-    signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs), axis=-1)
+    signal_waveform = fast_resample_poly_torch(
+        signal_waveform, new_fs, int(fs), axis=-1, half_length_factor=half_length_factor
+    )
     fs = float(new_fs)
 
     analyzer = GammatoneAnalyzerTorch(fs, minimum_frequency, base_frequency, maximum_frequency, 1.0,
@@ -344,7 +348,7 @@ def run_auditory_analysis_filterbank_torch(
         block = subbands_output[..., band_indices, :]
 
         # Resample the 3D block along the last axis in a single parallel call!
-        resampled_block = fast_resample_poly_torch(block, 1, factor_val, axis=-1)
+        resampled_block = fast_resample_poly_torch(block, 1, factor_val, axis=-1, half_length_factor=half_length_factor)
 
         # Unpack back into the list
         for idx, band_idx in enumerate(band_indices.tolist()):
@@ -355,7 +359,8 @@ def run_auditory_analysis_filterbank_torch(
 
 def run_auditory_synthesis_filterbank_torch(
         subband_list: list,
-        analyzer: GammatoneAnalyzerTorch
+        analyzer: GammatoneAnalyzerTorch,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 ) -> torch.Tensor:
     """Reconstructs subbands back into a single fullband waveform."""
     num_bands = len(subband_list)
@@ -383,7 +388,7 @@ def run_auditory_synthesis_filterbank_torch(
         block = torch.stack([subband_list[b] for b in band_indices.tolist()], dim=-2)
 
         # Upsample the 3D block in a single parallel call!
-        upsampled_block = fast_resample_poly_torch(block, factor_val, 1, axis=-1)
+        upsampled_block = fast_resample_poly_torch(block, factor_val, 1, axis=-1, half_length_factor=half_length_factor)
 
         # Unpack back into the processed buffer
         for idx, band_idx in enumerate(band_indices.tolist()):
@@ -412,7 +417,9 @@ def run_auditory_synthesis_filterbank_torch(
 
     # 1. Downsample back to the original frequency to prevent duration expansion
     original_fs = analyzer.original_sampling_frequency_hz
-    reconstructed = fast_resample_poly_torch(reconstructed, int(original_fs), int(analyzer.fs), axis=-1)
+    reconstructed = fast_resample_poly_torch(
+        reconstructed, int(original_fs), int(analyzer.fs), axis=-1, half_length_factor=half_length_factor
+    )
     delay_samples = int(round(desired_delay_seconds * original_fs))
 
     return reconstructed[..., delay_samples:]
@@ -507,16 +514,20 @@ def decompose_distortion_components(
                                                  configuration.shade_in_milliseconds,
                                                  configuration.shade_out_milliseconds)
 
+    resample_factor = configuration.resample_filter_half_length_factor
+
     # Batched Gammatone Analysis
     sources_stacked = torch.stack(shaded_sources, dim=0)  # (S, T, C)
     sources_flat = sources_stacked.transpose(1, 2).reshape(S * C, N_samples)
 
-    subbands_sources_flat, analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(sources_flat,
-                                                                                         sampling_frequency_hz)
+    subbands_sources_flat, analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(
+        sources_flat, sampling_frequency_hz, half_length_factor=resample_factor
+    )
 
     estimate_flat = shaded_estimate.transpose(0, 1)  # (C, T)
-    subband_estimate_flat, _, _ = run_auditory_analysis_filterbank_torch(estimate_flat, sampling_frequency_hz,
-                                                                         mod_matrix)
+    subband_estimate_flat, _, _ = run_auditory_analysis_filterbank_torch(
+        estimate_flat, sampling_frequency_hz, mod_matrix, half_length_factor=resample_factor
+    )
 
     num_bands = len(subbands_sources_flat)
 
@@ -567,10 +578,14 @@ def decompose_distortion_components(
         return F.pad(val, (0, 0, 0, target - L))
 
     # Synthesis outputs (C, T) -> transpose to (T, C)
-    synth_t = run_auditory_synthesis_filterbank_torch(subband_true_batched, analyzer).transpose(0, 1)
-    synth_td = run_auditory_synthesis_filterbank_torch(subband_target_batched, analyzer).transpose(0, 1)
-    synth_i = run_auditory_synthesis_filterbank_torch(subband_interf_batched, analyzer).transpose(0, 1)
-    synth_a = run_auditory_synthesis_filterbank_torch(subband_artif_batched, analyzer).transpose(0, 1)
+    synth_t = run_auditory_synthesis_filterbank_torch(
+        subband_true_batched, analyzer, half_length_factor=resample_factor).transpose(0, 1)
+    synth_td = run_auditory_synthesis_filterbank_torch(
+        subband_target_batched, analyzer, half_length_factor=resample_factor).transpose(0, 1)
+    synth_i = run_auditory_synthesis_filterbank_torch(
+        subband_interf_batched, analyzer, half_length_factor=resample_factor).transpose(0, 1)
+    synth_a = run_auditory_synthesis_filterbank_torch(
+        subband_artif_batched, analyzer, half_length_factor=resample_factor).transpose(0, 1)
 
     waveforms = DecomposedWaveforms(
         true_target=clip_pad(synth_t, N_samples),

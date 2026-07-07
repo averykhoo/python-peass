@@ -19,11 +19,23 @@ def smoothmax(x: torch.Tensor, threshold: float | torch.Tensor, k: float = 1000.
     return F.softplus(k * (x - threshold)) / k + threshold
 
 
+# Anti-aliasing FIR half-length as a multiple of the up/down ratio. 10 matches
+# SciPy/MATLAB (and the NumPy backend) for near bit-exact agreement; lower values
+# trade accuracy for speed. Kept in sync with the NumPy backend's default.
+DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR = 10
+
+
 # -----------------------------------------------------------------------------
 # HIGH-SPEED CACHED FILTER DESIGNER
 # -----------------------------------------------------------------------------
 @lru_cache(maxsize=256)
-def get_resample_filter_torch(up: int, down: int, dtype: torch.dtype, device: torch.device) -> tuple:
+def get_resample_filter_torch(
+        up: int,
+        down: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+) -> tuple:
     """
     Designs and caches the Kaiser resample filter on the fly to eliminate
     CPU-to-Device transfer overhead.
@@ -33,7 +45,7 @@ def get_resample_filter_torch(up: int, down: int, dtype: torch.dtype, device: to
     down_reduced = down // g
 
     max_len = max(up_reduced, down_reduced)
-    half_len = 3 * max_len
+    half_len = half_length_factor * max_len
     n_filt = 2 * half_len + 1
 
     # Design filter on CPU, push to the correct target device/dtype once
@@ -47,7 +59,13 @@ def get_resample_filter_torch(up: int, down: int, dtype: torch.dtype, device: to
     return h_padded, up_reduced, down_reduced, n_pre_remove
 
 
-def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1) -> torch.Tensor:
+def fast_resample_poly_torch(
+        x: torch.Tensor,
+        up: int,
+        down: int,
+        axis: int = -1,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+) -> torch.Tensor:
     """
     Native PyTorch polyphase resampler replicating SciPy's upfirdn using Conv1D.
     Heavily optimized for batched processing of continuous N-dimensional sequences
@@ -58,7 +76,7 @@ def fast_resample_poly_torch(x: torch.Tensor, up: int, down: int, axis: int = -1
 
     # Fetch pre-calculated and cached filter tensor instantly
     h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter_torch(
-        up, down, x.dtype, x.device
+        up, down, x.dtype, x.device, half_length_factor
     )
 
     in_len = x.shape[axis]

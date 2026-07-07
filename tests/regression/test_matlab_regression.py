@@ -52,10 +52,10 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
         (to_numpy_format(py_waveforms.artifacts), "targetEstimate_eArtif.wav", "artifacts")
     ]
 
-    # The NumPy backend is a faithful numerical port and reaches ~0.99 correlation
-    # against MATLAB; the torch backend deliberately uses differentiable
-    # approximations (softplus, FIR-truncated IIRs) and is held to a looser bound.
-    corr_threshold = 0.98 if backend_type == "numpy" else 0.95
+    # With full-order resampling (the default) the NumPy backend matches MATLAB to
+    # ~0.9999; the torch backend deliberately uses differentiable approximations
+    # (softplus, FIR-truncated IIRs) and is held to a looser bound.
+    corr_threshold = 0.999 if backend_type == "numpy" else 0.95
 
     for py_val, gold_filename, label in validation_map:
         gold_val, _ = sf.read(matlab_ref_resources / gold_filename)
@@ -92,16 +92,16 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
 # predictor — e.g. a metric that collapsed to a constant would break this even
 # though the loose 0<=score<=100 range checks elsewhere would not.
 _EXPECTED_SCORES = {
-    "overall_perceptual_score": 15.382,
-    "target_perceptual_score": 58.475,
-    "interference_perceptual_score": 19.016,
-    "artifact_perceptual_score": 77.938,
+    "overall_perceptual_score": 17.665,
+    "target_perceptual_score": 60.992,
+    "interference_perceptual_score": 20.484,
+    "artifact_perceptual_score": 76.302,
 }
 _EXPECTED_RATIOS = {
-    "source_to_distortion_ratio": 0.901,
-    "source_to_spatial_distortion_ratio": 7.551,
-    "source_to_interference_ratio": -0.390,
-    "source_to_artifacts_ratio": 19.362,
+    "source_to_distortion_ratio": 0.911,
+    "source_to_spatial_distortion_ratio": 7.518,
+    "source_to_interference_ratio": -0.371,
+    "source_to_artifacts_ratio": 19.359,
 }
 
 

@@ -60,6 +60,11 @@ class DecompositionConfiguration:
     shade_in_milliseconds: float = 10.0
     shade_out_milliseconds: float = 10.0
     segmentation_factor: int = 1
+    # Anti-aliasing FIR half-length as a multiple of the up/down ratio, used for
+    # the polyphase resampling inside the decomposition. 10 matches SciPy/MATLAB
+    # (near bit-exact reference agreement); lower values (e.g. 3) trade accuracy
+    # for speed (~-6% component energy, correlation ~0.99 at 3x).
+    resample_filter_half_length_factor: int = 10
 
 
 @dataclass(slots=True)

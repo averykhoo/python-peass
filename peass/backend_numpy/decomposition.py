@@ -19,6 +19,7 @@ from peass.config import DecomposedFilePaths
 from peass.config import DecomposedWaveforms
 from peass.config import DecompositionConfiguration
 from peass.config import DecompositionResult
+from .gammatone import DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
 from .gammatone import calculate_equivalent_rectangular_bandwidth
@@ -301,7 +302,8 @@ def extract_target_spatial_distortion_interference_artifacts(
 def run_auditory_analysis_filterbank(
         signal_waveform: np.ndarray,
         sampling_frequency_hz: float,
-        modulation_matrix: np.ndarray | None = None
+        modulation_matrix: np.ndarray | None = None,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 ) -> tuple[list[np.ndarray], GammatoneAnalyzer, np.ndarray]:
     """Helper executing Gammatone Analysis subband decomposition."""
     minimum_frequency = 20.0
@@ -315,7 +317,9 @@ def run_auditory_analysis_filterbank(
     # guard `fs/2 < 1.5*(fs/2)` is a tautology (always true), so this is
     # unconditional; kept explicit here for clarity.
     new_fs = int(round(1.5 * sampling_frequency_hz))
-    signal_waveform = fast_resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+    signal_waveform = fast_resample_poly(
+        signal_waveform, new_fs, int(sampling_frequency_hz), half_length_factor=half_length_factor
+    )
     sampling_frequency_hz = new_fs
 
     analyzer = GammatoneAnalyzer(
@@ -353,7 +357,7 @@ def run_auditory_analysis_filterbank(
         block = subbands_output[band_indices, :]
 
         # Vectorized 2D resampling along the last axis (-1) in a single C-backend execution pass
-        resampled_block = fast_resample_poly(block, 1, factor, axis=-1)
+        resampled_block = fast_resample_poly(block, 1, factor, axis=-1, half_length_factor=half_length_factor)
 
         for idx, band_idx in enumerate(band_indices):
             decimated_bands[band_idx] = resampled_block[idx, :]
@@ -394,7 +398,8 @@ def get_synthesis_modulation_matrix(
 
 def run_auditory_synthesis_filterbank(
         subband_list: list,
-        analyzer: GammatoneAnalyzer
+        analyzer: GammatoneAnalyzer,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 ) -> tuple[np.ndarray, GammatoneSynthesizer]:
     """Helper executing Gammatone synthesis reconstruction."""
     num_bands = len(subband_list)
@@ -414,7 +419,7 @@ def run_auditory_synthesis_filterbank(
         block = np.array([subband_list[b] for b in band_indices])
 
         # Vectorized 2D upsampling along axis=-1
-        upsampled_block = fast_resample_poly(block, factor, 1, axis=-1)
+        upsampled_block = fast_resample_poly(block, factor, 1, axis=-1, half_length_factor=half_length_factor)
 
         for idx, band_idx in enumerate(band_indices):
             target_length = len(subband_list[band_idx]) * factor
@@ -443,7 +448,8 @@ def run_auditory_synthesis_filterbank(
     reconstructed_signal = fast_resample_poly(
         reconstructed_signal,
         int(original_sampling_frequency),
-        int(sampling_frequency)
+        int(sampling_frequency),
+        half_length_factor=half_length_factor
     )
     delay_offset_samples = int(round(desired_delay_seconds * original_sampling_frequency))
     reconstructed_signal = reconstructed_signal[delay_offset_samples:]
@@ -558,19 +564,22 @@ def decompose_distortion_components(
     subband_source_signals = [[None for _ in range(number_of_channels)] for _ in range(number_of_sources)]
     modulation_matrix = None
     analyzer_instance = None
+    resample_factor = configuration.resample_filter_half_length_factor
 
     for source_idx in range(number_of_sources):
         for channel_idx in range(number_of_channels):
             subband_source_signals[source_idx][channel_idx], analyzer_instance, modulation_matrix = (
                 run_auditory_analysis_filterbank(
-                    shaded_sources[source_idx][:, channel_idx], sampling_frequency_hz, modulation_matrix
+                    shaded_sources[source_idx][:, channel_idx], sampling_frequency_hz, modulation_matrix,
+                    half_length_factor=resample_factor
                 )
             )
 
     subband_estimate_signals = [None for _ in range(number_of_channels)]
     for channel_idx in range(number_of_channels):
         subband_estimate_signals[channel_idx], analyzer_instance, _ = run_auditory_analysis_filterbank(
-            shaded_estimate[:, channel_idx], sampling_frequency_hz, modulation_matrix
+            shaded_estimate[:, channel_idx], sampling_frequency_hz, modulation_matrix,
+            half_length_factor=resample_factor
         )
 
     number_of_bands = len(subband_source_signals[0][0])
@@ -655,12 +664,18 @@ def decompose_distortion_components(
         return np.pad(signal_array, (0, target_length - len(signal_array)), mode='constant')
 
     for channel_idx in range(number_of_channels):
-        synth_t, _ = run_auditory_synthesis_filterbank(reformatted_subband_true[channel_idx], analyzer_instance)
-        synth_td, _ = run_auditory_synthesis_filterbank(
-            reformatted_subband_target_distortion[channel_idx], analyzer_instance
+        synth_t, _ = run_auditory_synthesis_filterbank(
+            reformatted_subband_true[channel_idx], analyzer_instance, half_length_factor=resample_factor
         )
-        synth_i, _ = run_auditory_synthesis_filterbank(reformatted_subband_interference[channel_idx], analyzer_instance)
-        synth_a, _ = run_auditory_synthesis_filterbank(reformatted_subband_artifacts[channel_idx], analyzer_instance)
+        synth_td, _ = run_auditory_synthesis_filterbank(
+            reformatted_subband_target_distortion[channel_idx], analyzer_instance, half_length_factor=resample_factor
+        )
+        synth_i, _ = run_auditory_synthesis_filterbank(
+            reformatted_subband_interference[channel_idx], analyzer_instance, half_length_factor=resample_factor
+        )
+        synth_a, _ = run_auditory_synthesis_filterbank(
+            reformatted_subband_artifacts[channel_idx], analyzer_instance, half_length_factor=resample_factor
+        )
 
         synthesized_true_target[:, channel_idx] = clip_or_pad_to_target_length(synth_t, original_samples_length)
         synthesized_target_distortion[:, channel_idx] = (
