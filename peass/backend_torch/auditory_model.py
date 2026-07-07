@@ -60,7 +60,11 @@ def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> t
     B = rect_flat.shape[0]
 
     padded = F.pad(rect_flat, (decay_samples - 1, 0))
-    transduced = F.conv1d(padded.view(B, 1, -1), ir.view(1, 1, -1)).view(B, T)
+    # F.conv1d is cross-correlation (no kernel flip), so the kernel must be
+    # flipped to implement the causal FIR y[n] = sum_k x[n-k]*ir[k] that matches
+    # the NumPy backend's lfilter([b0], [1, -gain]). Without the flip the filter
+    # is applied time-reversed (verified: corr with the reference drops to ~0).
+    transduced = F.conv1d(padded.view(B, 1, -1), ir.flip(-1).view(1, 1, -1)).view(B, T)
 
     return transduced.view(*orig_shape)
 
