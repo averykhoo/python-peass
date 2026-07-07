@@ -79,7 +79,7 @@ def synthetic_audio_data(request) -> tuple[np.ndarray, np.ndarray, np.ndarray, f
     target_distorted = signal.lfilter(butterworth_b, butterworth_a, target_waveform, axis=0)
 
     # 4. Generate Artifacts (low level white Gaussian noise)
-    artifact_noise = 0.01 * np.random.randn(num_samples, 1)
+    artifact_noise = 0.01 * np.random.default_rng(seed=1234).standard_normal((num_samples, 1))
 
     # 5. Compile simulated Separation Estimate
     estimate_waveform = target_distorted + 0.15 * interferer_waveform + artifact_noise

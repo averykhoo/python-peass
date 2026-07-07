@@ -8,6 +8,7 @@ import pytest
 import soundfile as sf
 
 from peass import decompose_distortion_components
+from peass import predict_perceptual_evaluation_scores
 from peass.config import DecompositionConfiguration
 from tests.conftest import to_backend_format
 from tests.conftest import to_numpy_format
@@ -51,6 +52,11 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
         (to_numpy_format(py_waveforms.artifacts), "targetEstimate_eArtif.wav", "artifacts")
     ]
 
+    # The NumPy backend is a faithful numerical port and reaches ~0.99 correlation
+    # against MATLAB; the torch backend deliberately uses differentiable
+    # approximations (softplus, FIR-truncated IIRs) and is held to a looser bound.
+    corr_threshold = 0.98 if backend_type == "numpy" else 0.95
+
     for py_val, gold_filename, label in validation_map:
         gold_val, _ = sf.read(matlab_ref_resources / gold_filename)
 
@@ -60,9 +66,62 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
         gold_segment = gold_val[:min_len]
 
         for ch in range(py_segment.shape[1]):
+            gold_ch = gold_segment[:, ch]
+            py_ch = py_segment[:, ch]
             # If the segment is silent, correlation is NaN; check variance instead
-            if np.std(gold_segment[:, ch]) < 1e-4:
-                assert np.std(py_segment[:, ch]) < 1e-4, f"Energy mismatch in {label} channel {ch}"
+            if np.std(gold_ch) < 1e-4:
+                assert np.std(py_ch) < 1e-4, f"Energy mismatch in {label} channel {ch}"
             else:
-                corr = np.corrcoef(py_segment[:, ch], gold_segment[:, ch])[0, 1]
-                assert corr > 0.95, f"Regression failure on {backend_type} (device: {device}): {label} (CH{ch}) correlation is {corr:.4f}"
+                corr = np.corrcoef(py_ch, gold_ch)[0, 1]
+                assert corr > corr_threshold, (
+                    f"Regression failure on {backend_type} (device: {device}): "
+                    f"{label} (CH{ch}) correlation is {corr:.4f}"
+                )
+                # Correlation is blind to gain/offset, so also assert the energy
+                # (RMS) is within a sane band of the reference to catch scale errors.
+                rms_ratio = np.sqrt(np.mean(py_ch ** 2)) / (np.sqrt(np.mean(gold_ch ** 2)) + 1e-20)
+                assert 0.5 < rms_ratio < 2.0, (
+                    f"Energy scale mismatch on {backend_type} (device: {device}): "
+                    f"{label} (CH{ch}) RMS ratio is {rms_ratio:.4f}"
+                )
+
+
+# Characterization values for the MATLAB reference clip set, produced by the
+# NumPy backend. These are NOT the MATLAB-published scores (those are not
+# available here) but a lock against silent drift in the PEMO-Q metric / MLP
+# predictor — e.g. a metric that collapsed to a constant would break this even
+# though the loose 0<=score<=100 range checks elsewhere would not.
+_EXPECTED_SCORES = {
+    "overall_perceptual_score": 15.382,
+    "target_perceptual_score": 58.475,
+    "interference_perceptual_score": 19.016,
+    "artifact_perceptual_score": 77.938,
+}
+_EXPECTED_RATIOS = {
+    "source_to_distortion_ratio": 0.901,
+    "source_to_spatial_distortion_ratio": 7.551,
+    "source_to_interference_ratio": -0.390,
+    "source_to_artifacts_ratio": 19.362,
+}
+
+
+@pytest.mark.regression
+def test_numpy_perceptual_scores_characterization(matlab_ref_resources):
+    """Locks the NumPy backend's OPS/TPS/IPS/APS and energy ratios on the MATLAB
+    reference clips so a regression in the metric or predictor is caught."""
+    target_src, fs = sf.read(matlab_ref_resources / "targetSrc.wav")
+    interf1, _ = sf.read(matlab_ref_resources / "interfSrc1.wav")
+    interf2, _ = sf.read(matlab_ref_resources / "interfSrc2.wav")
+    estimate, _ = sf.read(matlab_ref_resources / "targetEstimate.wav")
+
+    scores = predict_perceptual_evaluation_scores(
+        [target_src, interf1, interf2], estimate, sampling_frequency_hz=float(fs)
+    )
+
+    for field, expected in _EXPECTED_SCORES.items():
+        actual = getattr(scores, field)
+        assert abs(actual - expected) < 1.0, f"{field} drifted: {actual:.3f} vs expected ~{expected}"
+
+    for field, expected in _EXPECTED_RATIOS.items():
+        actual = getattr(scores, field)
+        assert abs(actual - expected) < 0.5, f"{field} drifted: {actual:.3f} vs expected ~{expected} dB"

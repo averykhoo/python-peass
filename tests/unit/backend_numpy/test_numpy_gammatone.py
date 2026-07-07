@@ -68,7 +68,7 @@ def test_gammatone_filter_state_clearing():
     assert np.all(filt.state == 0.0)
 
     # Process some noise to populate the state
-    input_noise = np.random.randn(100)
+    input_noise = np.random.default_rng(seed=7).standard_normal(100)
     filt.process(input_noise)
 
     # State should now be populated with non-zero values
@@ -97,7 +97,7 @@ def test_gammatone_analyzer_state_clearing():
         assert np.all(filt.state == 0.0)
 
     # Process signal
-    analyzer.process(np.random.randn(50))
+    analyzer.process(np.random.default_rng(seed=7).standard_normal(50))
 
     # States should be non-zero
     for filt in analyzer.filters:

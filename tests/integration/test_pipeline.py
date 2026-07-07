@@ -39,7 +39,7 @@ def test_end_to_end_stereo_separation(peass_backend):
     interferer = np.stack([interf_left, interf_right], axis=1)
 
     # 3. Create estimate with slight leakage and artifact noise
-    estimate = target + 0.1 * interferer + 0.02 * np.random.randn(num_samples, 2)
+    estimate = target + 0.1 * interferer + 0.02 * np.random.default_rng(seed=101).standard_normal((num_samples, 2))
 
     # 2. Format inputs to active backend
     target_in = to_backend_format(target, backend_type, device)
@@ -82,7 +82,7 @@ def test_silent_reference_robustness():
 
     target = np.sin(2.0 * np.pi * 440.0 * time_steps)[:, np.newaxis]
     silent_noise = np.zeros_like(target)  # Completely silent interferer
-    estimate = target + 0.01 * np.random.randn(num_samples, 1)
+    estimate = target + 0.01 * np.random.default_rng(seed=102).standard_normal((num_samples, 1))
 
     # Execute full scoring run
     results = predict_perceptual_evaluation_scores(
@@ -149,7 +149,7 @@ def test_predictor_pipeline_on_database_assets(database_audio_pair):
     target, interferer, fs, _ = database_audio_pair
 
     # Simulate a realistic separation estimate (Target + low-level leakage + small noise)
-    estimate = target + 0.05 * interferer + 0.01 * np.random.randn(*target.shape)
+    estimate = target + 0.05 * interferer + 0.01 * np.random.default_rng(seed=103).standard_normal(target.shape)
 
     # Execute full scoring pipeline
     results = predict_perceptual_evaluation_scores(

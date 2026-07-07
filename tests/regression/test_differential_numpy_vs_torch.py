@@ -659,3 +659,34 @@ def test_synthesis_fixed_delay_parity(matlab_ref_resources):
     finally:
         # Restore original function to prevent state pollution
         decomp_module.run_auditory_synthesis_filterbank_torch = original_run_synth
+
+
+@pytest.mark.regression
+def test_differential_auditory_internal_representation(baseline_signals):
+    """
+    Parity check for the auditory model (haircell transduction + nerve adaptation
+    + modulation filtering) between the NumPy and torch backends. The torch path
+    uses differentiable surrogates (softplus, FIR-truncated IIRs), so we assert a
+    high correlation rather than bit-exact equality.
+    """
+    from peass.backend_numpy.auditory_model import generate_auditory_internal_representation as air_np
+    from peass.backend_torch.auditory_model import generate_auditory_internal_representation_torch as air_th
+
+    _, _, estimate_np, fs = baseline_signals
+    sig_np = estimate_np[:, 0]
+
+    rep_np, fr_np = air_np(sig_np, fs)
+    rep_th, fr_th = air_th(torch.tensor(sig_np, dtype=torch.float64), fs)
+    rep_th_np = to_numpy_format(rep_th)
+
+    # torch returns a batched representation (B, bands, samples, mods); take batch 0
+    if rep_th_np.ndim == rep_np.ndim + 1:
+        rep_th_np = rep_th_np[0]
+
+    assert fr_np == fr_th, f"Representation sampling rate mismatch: {fr_np} vs {fr_th}"
+
+    min_len = min(rep_np.shape[1], rep_th_np.shape[1])
+    a = rep_np[:, :min_len, :].ravel()
+    b = rep_th_np[:, :min_len, :].ravel()
+    corr = np.corrcoef(a, b)[0, 1]
+    assert corr > 0.95, f"Auditory internal representation parity too low: corr={corr:.4f}"

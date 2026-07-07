@@ -37,7 +37,7 @@ def test_pemo_similarity_identity():
     bands, samples, modulations = 4, 200, 1
     fs = 100.0
 
-    ref_rep = np.abs(np.random.randn(bands, samples, modulations))
+    ref_rep = np.abs(np.random.default_rng(seed=42).standard_normal((bands, samples, modulations)))
     test_rep = ref_rep.copy()
 
     sim = calculate_auditory_similarity_metric(ref_rep, test_rep, fs)
