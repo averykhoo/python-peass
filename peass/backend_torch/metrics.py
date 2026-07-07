@@ -11,7 +11,7 @@ def calculate_bss_eval_energy_ratios(true_source, target_dist, interf, artif):
     """
     Computes energy ratio metrics. Returns native differentiable PyTorch tensors.
     """
-    eps = 1e-15
+    eps = torch.finfo(torch.float64).eps  # match the NumPy backend's float64 epsilon
     # Flatten across time and channels
     s = true_source.view(-1)
     e_t = target_dist.view(-1)
@@ -35,7 +35,7 @@ def calculate_bss_eval_energy_ratios(true_source, target_dist, interf, artif):
     return ISR, SIR, SAR, SDR
 
 
-def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
+def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> torch.Tensor:
     """Vectorized calculation of PEMO-Q assimilation similarity."""
     num_bands, num_samples, num_mods = ref_rep.shape
 
@@ -53,7 +53,7 @@ def calculate_auditory_similarity_metric_torch(ref_rep, test_rep, fs) -> float:
     test_frames = test_rep[:, :num_samples, :].reshape(num_bands, num_frames, frame_len, num_mods)
     test_frames = test_frames.permute(1, 0, 2, 3).reshape(num_frames, -1, num_mods)
 
-    eps = 1e-15
+    eps = torch.finfo(torch.float64).eps  # match the NumPy backend's float64 epsilon
     ref_mean = torch.mean(ref_frames, dim=1, keepdim=True)
     lref = ref_frames - ref_mean
 

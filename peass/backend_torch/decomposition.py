@@ -41,8 +41,17 @@ def get_real_dtype(dtype: torch.dtype) -> torch.dtype:
     return dtype
 
 
-def validate_and_normalize_audio_torch(data: torch.Tensor, name: str = "audio_data") -> torch.Tensor:
-    """Enforces standard 2D (samples, channels) formatting for PyTorch tensors."""
+def validate_and_normalize_audio_torch(
+        data: torch.Tensor,
+        sampling_frequency_hz: float,
+        name: str = "audio_data"
+) -> torch.Tensor:
+    """Enforces standard 2D (samples, channels) formatting for PyTorch tensors.
+
+    Mirrors the NumPy backend's validation: at most 32 channels and a minimum
+    physical duration of 50 ms so the boundary shading and subband frame
+    decimation stay well-defined.
+    """
     if data.dim() == 1:
         data = data.unsqueeze(1)
 
@@ -51,6 +60,14 @@ def validate_and_normalize_audio_torch(data: torch.Tensor, name: str = "audio_da
         raise ValueError(
             f"Layout violation for '{name}'. Expected (samples, channels) with channels <= 32. "
             f"Found shape {data.shape}. Please transpose."
+        )
+
+    min_samples = int(50 * sampling_frequency_hz / 1000)
+    if num_samples < min_samples:
+        raise ValueError(
+            f"Signal duration for '{name}' is too short ({num_samples} samples). "
+            f"PEASS requires a minimum of {min_samples} samples to perform "
+            f"the subband least-squares and overlap-add decomposition safely."
         )
     return data
 
@@ -260,6 +277,11 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
     interference = torch.sum(projected_signals, dim=2) - spatial_distortion - true_ref
     artifacts = estimates_reshaped - true_ref - spatial_distortion - interference
 
+    # NOTE: the NumPy backend reshapes these buffers with order='F' (estimate-major
+    # column layout). torch only has C-order reshape, which coincides with F-order
+    # here solely because num_estimates == 1 throughout the current pipeline. If
+    # multi-estimate support is ever added, these reshapes must be reworked to
+    # preserve the estimate-major layout, or the channels will be scrambled.
     true_ref_3d = true_ref.reshape(total_samples, num_channels, num_estimates)
     spatial_dist_3d = spatial_distortion.reshape(total_samples, num_channels, num_estimates)
     interference_3d = interference.reshape(total_samples, num_channels, num_estimates)
@@ -279,12 +301,14 @@ def run_auditory_analysis_filterbank_torch(
     maximum_frequency = fs / 2.0
     base_frequency = 1000.0
 
-    # 1. Apply Anti-Aliasing Polyphase Upsampling
+    # 1. Apply Anti-Aliasing Polyphase Upsampling.
+    # The PEASS reference always upsamples by 1.5x so the Gammatone filters near
+    # the original Nyquist are well resolved. The original guard
+    # `fs/2 < 1.5*(fs/2)` is a tautology (always true), so this is unconditional.
     original_fs = fs
-    if fs / 2.0 < 1.5 * maximum_frequency:
-        new_fs = int(round(1.5 * fs))
-        signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs), axis=-1)
-        fs = float(new_fs)
+    new_fs = int(round(1.5 * fs))
+    signal_waveform = fast_resample_poly_torch(signal_waveform, new_fs, int(fs), axis=-1)
+    fs = float(new_fs)
 
     analyzer = GammatoneAnalyzerTorch(fs, minimum_frequency, base_frequency, maximum_frequency, 1.0,
                                       signal_waveform.device, signal_waveform.dtype)
@@ -395,6 +419,12 @@ def apply_window_shading_torch(sig: torch.Tensor, fs: float, shade_in: float, sh
     fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
     fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
 
+    if fade_in_samples + fade_out_samples > num_samples:
+        raise ValueError(
+            f"Combined shading length ({fade_in_samples + fade_out_samples} samples) "
+            f"exceeds the signal length ({num_samples} samples)."
+        )
+
     if fade_in_samples > 1:
         t = torch.arange(fade_in_samples, device=sig.device, dtype=sig.dtype)
         win = 0.5 - 0.5 * torch.cos(math.pi * t / (fade_in_samples - 1))
@@ -419,6 +449,9 @@ def decompose_distortion_components(
         from ..config import DecompositionConfiguration
         configuration = DecompositionConfiguration()
 
+    if not source_files:
+        raise ValueError("source_files list cannot be empty.")
+
     is_file_mode = isinstance(estimate_file, str | pathlib.Path)
 
     if is_file_mode:
@@ -433,7 +466,9 @@ def decompose_distortion_components(
 
         sources_tensors = []
         for src_path in source_files:
-            src_numpy, _ = sf.read(src_path)
+            src_numpy, src_fs = sf.read(src_path)
+            if src_fs != fs:
+                raise ValueError("Sampling rates of all files must match.")
             sources_tensors.append(torch.tensor(src_numpy, device=device, dtype=torch.float64))
     else:
         estimate_tensor = estimate_file
@@ -444,8 +479,11 @@ def decompose_distortion_components(
         raise ValueError("In-memory mode requires explicit sampling rate 'sampling_frequency_hz'.")
 
     # 1. Validate spatial layouts
-    estimate_audio = validate_and_normalize_audio_torch(estimate_tensor, "estimate_file")
-    sources_audio = [validate_and_normalize_audio_torch(s, f"source_files[{i}]") for i, s in enumerate(sources_tensors)]
+    estimate_audio = validate_and_normalize_audio_torch(estimate_tensor, sampling_frequency_hz, "estimate_file")
+    sources_audio = [
+        validate_and_normalize_audio_torch(s, sampling_frequency_hz, f"source_files[{i}]")
+        for i, s in enumerate(sources_tensors)
+    ]
 
     # ADDED FIX: Enforce matching shapes early to prevent internal reshape crashes
     for s in sources_audio:
@@ -535,13 +573,13 @@ def decompose_distortion_components(
         artifacts=clip_pad(synth_a, N_samples)
     )
 
-    # 6. Save WAV files natively to disk if requested in config or running in file mode
+    # 6. Save WAV files to disk only in file mode (matches the NumPy backend).
     out_paths = None
-    if is_file_mode or configuration.destination_directory != "./":
+    if is_file_mode:
         dest_dir = pathlib.Path(configuration.destination_directory)
         dest_dir.mkdir(parents=True, exist_ok=True)
 
-        stem = pathlib.Path(estimate_file).stem if is_file_mode else "decomposed"
+        stem = pathlib.Path(estimate_file).stem
         out_paths = DecomposedFilePaths(
             true_target=str(dest_dir / f"{stem}_true.wav"),
             target_distortion=str(dest_dir / f"{stem}_eTarget.wav"),

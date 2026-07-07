@@ -4,6 +4,7 @@ File path: peass/core/dispatch.py
 """
 
 import pathlib
+from typing import Any
 
 import numpy as np
 
@@ -13,7 +14,7 @@ from ..config import DecompositionResult
 from ..config import PerceptualSeparationScores
 
 
-def resolve_backend(estimate_signal: any, source_signals: any = None) -> BaseBackend:
+def resolve_backend(estimate_signal: Any, source_signals: Any = None) -> BaseBackend:
     """
     Inspects input types and resolves the appropriate execution backend.
     Enforces device and precision homogeneity for PyTorch tensors.

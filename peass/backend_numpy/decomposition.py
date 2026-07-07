@@ -310,11 +310,13 @@ def run_auditory_analysis_filterbank(
     filters_per_erb = 1.0
 
     original_fs = sampling_frequency_hz
-    if sampling_frequency_hz / 2.0 < 1.5 * maximum_frequency:
-        new_fs = int(round(1.5 * sampling_frequency_hz))
-        # signal_waveform = signal.resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
-        signal_waveform = fast_resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
-        sampling_frequency_hz = new_fs
+    # The PEASS reference always upsamples the analysis signal by 1.5x so the
+    # Gammatone filters near the original Nyquist are well resolved. The original
+    # guard `fs/2 < 1.5*(fs/2)` is a tautology (always true), so this is
+    # unconditional; kept explicit here for clarity.
+    new_fs = int(round(1.5 * sampling_frequency_hz))
+    signal_waveform = fast_resample_poly(signal_waveform, new_fs, int(sampling_frequency_hz))
+    sampling_frequency_hz = new_fs
 
     analyzer = GammatoneAnalyzer(
         sampling_frequency_hz, minimum_frequency, base_frequency, maximum_frequency, filters_per_erb
