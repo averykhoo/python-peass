@@ -365,7 +365,10 @@ def run_auditory_analysis_filterbank(
 # SYNTHESIS MODULATION MATRIX CACHE (Using functools.lru_cache)
 # -----------------------------------------------------------------------------
 
-@lru_cache
+# Bounded cache: keyed on signal length, so each distinct length holds a full
+# (num_bands x max_samples) complex matrix. Cap it so long-lived processes that
+# score many different-length signals don't accumulate unbounded memory.
+@lru_cache(maxsize=8)
 def _get_synthesis_modulation_matrix_cached(
         sampling_frequency: float,
         max_samples_length: int,

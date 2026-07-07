@@ -81,7 +81,9 @@ def predict_perceptual_evaluation_scores(
 
     if sampling_frequency_hz is None:
         if isinstance(estimate_file, str | pathlib.Path):
-            _, sampling_frequency_hz = sf.read(estimate_file)
+            # Read only the header for the sample rate; decomposition already
+            # decoded the audio, so don't re-decode the whole file here.
+            sampling_frequency_hz = float(sf.info(estimate_file).samplerate)
         else:
             sampling_frequency_hz = 16000.0
 
