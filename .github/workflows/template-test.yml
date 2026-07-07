@@ -13,6 +13,10 @@ on:
         required: false
         type: boolean
         default: false
+      remove-torch: # Dynamic trigger to strip PyTorch from requirements
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-tests:
@@ -35,11 +39,12 @@ jobs:
           sed -i '/numba/d' requirements.txt
         shell: bash
 
-      - name: Install MKL mathematical backends (Linux only)
-        if: runner.os == 'Linux'
+      # Dynamically strip PyTorch to exercise the pure-NumPy install path
+      - name: Drop PyTorch from requirements
+        if: ${{ inputs.remove-torch == true }}
         run: |
-          python -m pip install --upgrade pip
-          pip install numpy scipy --extra-index-url https://urob.github.io/numpy-mkl
+          sed -i '/torch/d' requirements.txt
+        shell: bash
 
       - name: Install dependencies
         run: |

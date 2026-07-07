@@ -27,6 +27,17 @@ jobs:
             exit 1
           fi
 
+      # Aborts if the tag (e.g. v2.0.1.4) does not match peass.__version__
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION=$(grep -oP '__version__\s*=\s*"\K[^"]+' peass/__init__.py)
+          echo "Tag version: $TAG_VERSION | Package version: $PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "Error: tag $GITHUB_REF_NAME does not match package version $PKG_VERSION."
+            exit 1
+          fi
+
   # ---------------------------------------------------------------------------
   # STAGE 2: Comprehensive Verification (Only runs if Stage 1 passes)
   # ---------------------------------------------------------------------------
@@ -35,12 +46,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Generates Cartesian product of 2 (OS) * 6 (Python) * 2 (remove-numba) = 24 jobs
+        # Cartesian product of 2 (OS) * 5 (Python) * 2 (remove-numba) = 20 jobs,
+        # plus the macOS include below = 21 jobs.
         os: [ ubuntu-latest, windows-latest ]
         python-version: [ "3.10", "3.11", "3.12", "3.13", "3.14" ]
         remove-numba: [ true, false ]
         include:
-          # Appends 1 specific macOS job (bringing total to 25 jobs)
+          # Appends 1 specific macOS job
           - os: macos-latest
             python-version: "3.12"
             remove-numba: false
@@ -52,11 +64,24 @@ jobs:
       remove-numba: ${{ matrix.remove-numba }}
 
   # ---------------------------------------------------------------------------
+  # STAGE 2b: Minimal-install verification (the default `pip install python-peass`
+  # user: no torch, no numba, exercising the pure-NumPy fallback path)
+  # ---------------------------------------------------------------------------
+  verify-minimal:
+    needs: validate-tag
+    uses: ./.github/workflows/template-test.yml
+    with:
+      os: ubuntu-latest
+      python-version: "3.12"
+      remove-numba: true
+      remove-torch: true
+
+  # ---------------------------------------------------------------------------
   # STAGE 3: Deploy (Only runs if Stage 2 passes)
   # ---------------------------------------------------------------------------
   deploy:
     name: Deploy to PyPI
-    needs: comprehensive-verify
+    needs: [ comprehensive-verify, verify-minimal ]
     runs-on: ubuntu-latest
     environment:
       name: release
@@ -81,6 +106,26 @@ jobs:
       - name: Build package distribution (sdist and wheel)
         run: |
           python -m build
+
+      # Validate metadata and prove the *built wheel* actually works when
+      # installed clean (catches e.g. the model-weight .npz files being excluded).
+      - name: Check and smoke-test built artifacts
+        run: |
+          pip install twine
+          twine check dist/*
+          python -m venv /tmp/smoke
+          /tmp/smoke/bin/pip install dist/*.whl
+          /tmp/smoke/bin/python -c "
+          import numpy as np
+          from peass import predict_perceptual_evaluation_scores
+          rng = np.random.default_rng(0)
+          target = rng.standard_normal((16000, 1))
+          noise = rng.standard_normal((16000, 1))
+          estimate = target + 0.05 * noise
+          scores = predict_perceptual_evaluation_scores([target, noise], estimate, sampling_frequency_hz=16000.0)
+          assert 0.0 <= scores.overall_perceptual_score <= 100.0
+          print('wheel smoke test OK:', scores.overall_perceptual_score)
+          "
 
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1

@@ -162,3 +162,7 @@ cython_debug/
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 .idea/
 
+# Local LLM-context tooling / generated output (not part of the package)
+build_system_prompt.py
+system-prompt.txt
+

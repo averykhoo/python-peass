@@ -171,6 +171,17 @@ We test our output waveforms directly against the original `.wav` reference wave
 PEASS toolbox (located in `references/peass_master_22c7fc4e/v2.0.1/example/`).
 Python's outputs must achieve a cross-correlation coefficient exceeding $0.95$ with the MATLAB reference to pass.
 
+### NumPy vs PyTorch backends
+
+The package dispatches to a NumPy backend for array/file inputs and a PyTorch
+backend for tensor inputs (selected automatically by input type). The NumPy
+backend is the numerical reference and matches the MATLAB toolbox closely
+(cross-correlation > 0.98). The PyTorch backend is designed to be **fully
+differentiable** (usable inside a training loop): it replaces the hard
+non-linearities and IIR recursions of the reference with smooth, backprop-safe
+surrogates (softplus, FIR-truncated filters). As a result its outputs match the
+NumPy backend by high correlation rather than to floating-point precision.
+
 ### Parallel Execution
 
 To run the test suite across multiple CPU cores using `pytest-xdist`, execute:
