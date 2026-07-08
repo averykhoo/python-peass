@@ -162,11 +162,30 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
 5. **complex64/float32** through the gammatone/modulation path: ~10–20% but
    **medium/high** correctness risk on a precision-sensitive reference port. Not
    recommended without careful tolerance validation.
-6. **Torch**: the per-sample `torch.jit.script` adaptation loop at the upsampled
-   rate is the dominant torch cost — but it's an inherently sequential *nonlinear*
-   recurrence, so it can't be exactly parallelized (associative scan needs
-   linearity). Repeated `.item()`/`.tolist()` device syncs in the per-band loops
-   should be hoisted to CPU once (low risk, matters on GPU).
+6. **Torch** (profiled with a CPU runtime; 5 s stereo clip):
+   - **FIXED — haircell OOM.** The FIR haircell used `F.conv1d`, whose im2col is
+     `O(B*K*L)`; on the real clip the batched metrics make a `(10,27,120000)`
+     tensor → a **62 GB** allocation that aborted. The torch predictor could not
+     run on any realistic-length signal (tests only used 0.5 s clips). Replaced
+     with FFT convolution (`O(B*L)`, bit-identical to conv1d at 1e-15). This was a
+     robustness bug, not just perf.
+   - **DONE — adaptation loop unroll.** The nonlinear 5-stage adaptation recurrence
+     is the dominant torch cost (~93% of the auditory model, ~34 s). It's
+     inherently sequential (can't parallelize the time axis), but unrolling the
+     5-stage inner loop to drop a per-timestep `torch.stack` gave ~1.35×
+     (40.4 s → 30.0 s), bit-identical.
+   - **Still slow**: even after the above, a 5 s clip takes ~30–50 s in torch
+     (sequential recurrence at the 24 kHz upsampled rate). The torch backend is
+     for differentiable *training* on short segments; batch scoring of long clips
+     should use the numpy backend. `torch.compile` on the loop is a possible
+     future lever but speculative (deprecation-migration territory, uncertain
+     bit-parity). `.item()`/`.tolist()` device syncs still matter on GPU.
+   - **FINDING — score divergence on long clips.** On the 5 s reference clip the
+     torch scores differ from numpy by up to ~5 points (OPS 14.2 vs 17.7), the
+     accumulated effect of the differentiable surrogates (softplus max, FIR
+     truncation) — only observable now that the predictor runs at length. Within
+     the "matches by correlation, not precision" contract, but larger than the
+     short-clip tests imply; worth a dedicated parity study on realistic lengths.
 
 ### Hands-on performance investigation (2026-07, torch installed)
 

@@ -20,7 +20,12 @@
 - perf/deprecation: the torch adaptation loop uses `@torch.jit.script`, which
   torch 2.x deprecates in favor of `torch.compile`/`torch.export`. Migrating is
   non-trivial (the loop is a sequential nonlinear recurrence) and orthogonal to
-  the perf cliff above; revisit together.
+  the perf cliff; revisit together. (The loop was unrolled for ~1.35x in 2026-07;
+  the haircell OOM was fixed via FFT convolution.)
+- correctness: torch vs numpy perceptual scores diverge by up to ~5 points on the
+  5 s reference clip (only visible since the torch predictor OOM was fixed). It's
+  the accumulated differentiable-surrogate error; do a parity study on realistic
+  lengths and, if needed, tighten the surrogates or document the expected gap.
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
