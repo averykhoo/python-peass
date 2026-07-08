@@ -180,12 +180,25 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
      should use the numpy backend. `torch.compile` on the loop is a possible
      future lever but speculative (deprecation-migration territory, uncertain
      bit-parity). `.item()`/`.tolist()` device syncs still matter on GPU.
-   - **FINDING — score divergence on long clips.** On the 5 s reference clip the
-     torch scores differ from numpy by up to ~5 points (OPS 14.2 vs 17.7), the
-     accumulated effect of the differentiable surrogates (softplus max, FIR
-     truncation) — only observable now that the predictor runs at length. Within
-     the "matches by correlation, not precision" contract, but larger than the
-     short-clip tests imply; worth a dedicated parity study on realistic lengths.
+   - **RESOLVED — score divergence on long clips.** On the 5 s reference clip the
+     torch scores diverged from numpy by up to ~5 points (OPS 14.2 vs 17.7). Root
+     cause: the plain `softplus(1000x)/1000` surrogate for `max()` in the 5-stage
+     adaptation cascade drifts through the feedback loop, dropping the auditory
+     representation correlation to ~0.90. Fixed with a straight-through estimator
+     (exact `max` forward → matches numpy to ~1e-12, corr 0.90→1.000000; softplus
+     gradient backward → still differentiable). Verified on the real farfield
+     audio too. Parity test tightened 0.95→0.999 to guard it.
+   - **BACKPROP — correct but not fast.** Gradients flow correctly end-to-end
+     (finite, 100% nonzero, gradient-ascent raises OPS). But backprop is slow, and
+     the bottleneck is NOT the decomposition (its `pinv` backward is cheap: 0.7×
+     ratio, ~0.7 s) — it's the metrics/auditory model: ~10.5× backward ratio,
+     ~76 s for 0.5 s audio, i.e. BPTT through the ~12000-step sequential adaptation
+     recurrence. The straight-through adds ~1.75× to that loop's backward (cost of
+     exact parity). This is inherent to a sequential recurrence at the 24 kHz
+     upsampled rate; a real fix would be a custom `autograd.Function` with a
+     hand-derived analytic backward for the adaptation loop (substantial, risky).
+     Practical guidance: the torch backend suits differentiable use on short
+     segments; it is not a high-throughput training loss as-is.
 
 ### Hands-on performance investigation (2026-07, torch installed)
 

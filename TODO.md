@@ -22,10 +22,13 @@
   non-trivial (the loop is a sequential nonlinear recurrence) and orthogonal to
   the perf cliff; revisit together. (The loop was unrolled for ~1.35x in 2026-07;
   the haircell OOM was fixed via FFT convolution.)
-- correctness: torch vs numpy perceptual scores diverge by up to ~5 points on the
-  5 s reference clip (only visible since the torch predictor OOM was fixed). It's
-  the accumulated differentiable-surrogate error; do a parity study on realistic
-  lengths and, if needed, tighten the surrogates or document the expected gap.
+- perf/backprop: the torch metrics (auditory adaptation loop) dominate backprop —
+  ~10.5x backward/forward, ~76s for 0.5s audio — because it is BPTT through the
+  ~12000-step sequential recurrence (the decomposition's pinv backward is cheap by
+  comparison). A custom autograd.Function with a hand-derived analytic backward for
+  the 5-stage adaptation cascade would make training-scale backprop practical;
+  it's substantial and needs careful gradient validation. (The torch<->numpy score
+  divergence itself was fixed via the straight-through max in 2026-07.)
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
