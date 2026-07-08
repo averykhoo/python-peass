@@ -153,8 +153,9 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
 2. **`predictor.py` re-decodes the estimate file** just for its sample rate
    (`sf.read` after decomposition already read it) — use `sf.info(...).samplerate`.
    Correctness risk: none. (Safe fix — applied this session.)
-3. **`scipy.linalg.solve(..., check_finite=False)`** in the LS inner loop (inputs
-   are freshly computed and finite) — ~2–3%. Low risk.
+3. ~~**`scipy.linalg.solve(..., check_finite=False)`**~~ — tried; benefit is below
+   the measurement floor on 2337 tiny matrices. Not worth it (see investigation
+   below).
 4. **Unbounded `lru_cache`** on `_get_synthesis_modulation_matrix_cached` (keyed on
    signal length): memory growth across varying-length batches. Cap `maxsize`.
    Correctness risk: none. (Safe fix — applied this session.)
@@ -167,15 +168,63 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
    linearity). Repeated `.item()`/`.tolist()` device syncs in the per-band loops
    should be hoisted to CPU once (low risk, matters on GPU).
 
+### Hands-on performance investigation (2026-07, torch installed)
+
+Re-profiled `predict_perceptual_evaluation_scores` on the stereo reference clip
+(~8 s warm, 8-core box) after the full-order (10×) resampling became the default.
+The profile shifted substantially:
+
+| Stage | Share | Note |
+|---|---|---|
+| `upfirdn` resampling | **~43% (3.6s)** | now dominant — the cost of full-order (10×) MATLAB-fidelity resampling |
+| LS solve cluster (`perform_least_squares_projection` ×2337 + `solve` + `hstack`) | ~15% | |
+| `_numba_gfb_analyze` | ~7% | |
+| `_numba_fused_auditory_kernel` | ~6% | |
+
+Tried and **rejected** (measured against a within-process bit-parity anchor):
+- **numba `parallel=True` + `prange` over bands** on the four kernels
+  (`_numba_gfb_analyze`, `_numba_delay_process`, fused auditory, adaptation): the
+  kernels are called many times on small band counts (~30), so thread-spawn
+  overhead plus contention with MKL/`upfirdn` made the whole pipeline **slower**
+  (8.8s vs 8.0s), and introduced a ~5e-11 drift. Reverted.
+- **`scipy.linalg.solve(check_finite=False)`**: safe (inputs provably finite) but
+  the benefit on 2337 tiny matrices is below the measurement floor. Reverted —
+  no evidence of a win. Note: within a process the pipeline is bit-deterministic
+  (spread 0.0 over repeated runs); the ~5e-11 variation is only *cross-process*
+  MKL BLAS thread-scheduling, which swamps sub-5% optimizations.
+
+Conclusion: the pipeline is already well-optimized at the micro level, and the
+dominant cost is now the fidelity-driven resampling, which cannot be reduced
+without either lowering `resample_filter_half_length_factor` (trades MATLAB
+correlation) or a risky bit-inexact FFT-resampler rewrite. The remaining
+substantial levers all trade something:
+- **Batch the per-frame LS solves** (like the torch backend does with `unfold` +
+  batched `pinv`) — ~15% of runtime — but batching forfeits the per-frame
+  posv→pinv ill-conditioning fallback (49/2337 frames use it), so it changes the
+  numerics by ~1e-6 (still ~0.9999 vs MATLAB). Small correctness trade.
+- **Batch the analysis/synthesis across sources+channels** (like torch) — reduces
+  the 548 `upfirdn` call overheads but not the dominant filter *compute*, so a
+  limited win for a medium-risk refactor.
+- **Thread the analysis/synthesis loops** — `upfirdn` releases the GIL and is now
+  43%, so threading the independent per-(source,channel) passes could give
+  ~1.3–1.5× (the numba parts stay GIL-serialized). This is the "parallelization"
+  item deferred earlier; medium risk on the Windows MKL/OpenMP stack.
+
 ---
 
 ## Recommendation: this session vs. a new one
 
-- **Done this session:** C1 (critical torch fix); M1 (full-order resampling as
-  the configurable default → MATLAB correlation ~0.99999); the two zero-risk
-  perf/hygiene fixes (#2 predictor sample-rate, #4 cache cap).
-- **Deferred (your call):** the parallelization work (#1) — it's a
-  larger change (numba `nogil`/`prange` + threading) that needs careful
-  bit-parity validation against the serial path and a torch runtime for the torch
-  side. Low risk conceptually, but worth doing deliberately with benchmarks.
+- **Done:** C1 (critical torch fix); M1 (full-order resampling as the
+  configurable default → MATLAB correlation ~0.99999); the two zero-risk
+  perf/hygiene fixes (#2 predictor sample-rate, #4 cache cap); torch backend
+  validated end-to-end with a CPU runtime (decomposition torch-vs-numpy-vs-MATLAB
+  all ~1.0; auditory parity confirms the haircell fix); torch test cleanup.
+- **Investigated & rejected:** intra-kernel `prange` (slower here) and
+  `check_finite=False` (unmeasurable). No safe *micro*-optimization moves the
+  needle; the dominant cost is the fidelity-driven resampling.
+- **Available but trades something (your call):** the three structural levers in
+  the investigation above — batched per-frame solve (~15%, ~1e-6 numeric change),
+  batched analysis (limited win, medium risk), or threading the GIL-free
+  analysis/synthesis loops (~1.3–1.5×, medium risk on Windows MKL/OpenMP). Best as
+  a deliberate, benchmarked follow-up.
 - **Note-only / optional:** the LOW items; address opportunistically.
