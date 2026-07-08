@@ -165,7 +165,8 @@ def database_audio_pair(request, db_resources) -> tuple[np.ndarray, np.ndarray, 
 def peass_backend(request):
     """
     Parametrized fixture yielding (backend_type, device) configurations.
-    Automatically skips unavailable hardware environments (CUDA / MPS).
+    Skips unavailable hardware. MPS is intentionally excluded: it does not support
+    float64, and the PEASS torch backend runs in float64 throughout.
     """
     mode = request.param
     if mode.startswith("torch"):
@@ -177,10 +178,8 @@ def peass_backend(request):
         elif mode == "torch_gpu":
             if torch.cuda.is_available():
                 return "torch", torch.device("cuda")
-            elif torch.backends.mps.is_available():
-                return "torch", torch.device("mps")
             else:
-                pytest.skip("GPU hardware (CUDA or MPS) is not available.")
+                pytest.skip("No float64-capable GPU (CUDA) available (MPS is float32-only).")
 
     return "numpy", None
 

@@ -11,8 +11,8 @@ from peass.backend_torch.predictor import predict_perceptual_evaluation_scores
 def test_torch_predictor_score_range_constraints(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
     device = torch.device(device_str)
 
     fs = 16000.0
@@ -40,8 +40,8 @@ def test_torch_predictor_score_range_constraints(device_str):
 def test_torch_predictor_pristine_audio_conditions(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
     device = torch.device(device_str)
 
     fs = 16000.0
@@ -68,8 +68,8 @@ def test_torch_predictor_pristine_audio_conditions(device_str):
 def test_torch_predictor_amplitude_robustness(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
     device = torch.device(device_str)
 
     fs = 16000.0

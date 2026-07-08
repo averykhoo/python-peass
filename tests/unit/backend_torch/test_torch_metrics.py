@@ -29,8 +29,8 @@ def test_torch_calculate_energy_ratios_analytical():
 def test_torch_pemo_similarity_identity(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
     device = torch.device(device_str)
 
     bands, samples, modulations = 4, 200, 1
@@ -48,8 +48,8 @@ def test_torch_pemo_similarity_identity(device_str):
 def test_torch_perceptual_assimilation_behavior(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
     device = torch.device(device_str)
 
     fs = 100.0

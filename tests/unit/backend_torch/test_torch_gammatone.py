@@ -13,8 +13,8 @@ from tests.conftest import to_numpy_format
 def test_torch_gammatone_filterbank(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA not available.")
-    if device_str == "mps" and not torch.backends.mps.is_available():
-        pytest.skip("MPS not available.")
+    if device_str == "mps":
+        pytest.skip("MPS does not support float64; the PEASS torch backend is float64-only.")
 
     device = torch.device(device_str)
 
