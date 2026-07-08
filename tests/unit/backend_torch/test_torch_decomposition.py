@@ -110,8 +110,11 @@ def test_torch_decomposition_gain_invariance(device_str):
     print(f"  Gain-Invariance Mismatch:            {gain_invariance_mismatch:.17f}")
     print("=" * 65)
 
-    # Gain change should map perfectly to target_distortion
-    # Strict limits are fully restored (will pass once linalg.pinv is added to decomposition.py)
+    # A pure gain change should map entirely into target_distortion. The 2e-3
+    # bound is the Gammatone analysis-synthesis reconstruction floor on a short
+    # (0.5 s) signal, NOT a backend approximation: the NumPy reference hits the
+    # same ~1.9e-3 error here (see the diagnostics test). The padding test below
+    # drives this under 1e-4 with reflective boundary padding.
     torch.testing.assert_close(wf.target_distortion, -0.3 * wf.true_target, rtol=2e-3, atol=2e-3)
     assert torch.max(torch.abs(wf.interference)).item() < 1e-6
     assert torch.max(torch.abs(wf.artifacts)).item() < 2e-3
@@ -178,8 +181,15 @@ def test_torch_decomposition_gain_invariance_diagnostics():
     print(f"  PyTorch Gain-Invariance Internal Error:            {err_gain_th:.6e}")
     print("=" * 67 + "\n")
 
-    # Relax assertion to physically correct bounds of approximate reconstruction
+    # The gain-invariance error is the shared Gammatone reconstruction floor
+    # (~1.9e-3), so both backends hit it; the meaningful check is that the two
+    # backends AGREE closely and that torch is no worse than numpy at this limit.
     assert err_gain_th < 2e-3, f"PyTorch gain invariance error {err_gain_th:.6e} exceeds reconstruction limit."
+    assert abs(err_gain_th - err_gain_np) < 1e-5, "torch and numpy reconstruction limits diverge"
+    assert diff_true < 1e-4, f"true_target backend mismatch too large: {diff_true:.3e}"
+    assert diff_dist < 1e-4, f"target_distortion backend mismatch too large: {diff_dist:.3e}"
+    assert diff_interf < 1e-4, f"interference backend mismatch too large: {diff_interf:.3e}"
+    assert diff_artif < 1e-4, f"artifacts backend mismatch too large: {diff_artif:.3e}"
 
 
 @pytest.mark.unit

@@ -4,15 +4,12 @@ File path: tests/regression/test_differential_numpy_vs_torch.py
 """
 
 import math
-import warnings
 
 import numpy as np
 import pytest
-import scipy.linalg as linalg
 import scipy.signal as signal
 import soundfile as sf
 import torch
-from scipy.linalg import LinAlgWarning
 
 import peass.backend_torch.decomposition as decomp_module
 from peass import DecompositionConfiguration
@@ -289,38 +286,6 @@ def test_get_erb_center_frequencies_parity():
     np.testing.assert_allclose(
         cfs_np, cfs_th, atol=1e-7,
         err_msg="PyTorch ERB center frequencies do not match NumPy."
-    )
-
-
-def test_linalg_solve_fallback_parity():
-    """
-    Verifies that solving ill-conditioned projection matrices yields identical results.
-    PyTorch uses LU solve which may not fail on non-positive definite matrices where NumPy's Cholesky (posv) would.
-    """
-
-    # Create a highly ill-conditioned, near-singular Gram matrix
-    Gram_np = np.array([[1e-15, 1e-15], [1e-15, 1e-15]])
-    RHS_np = np.array([[1.0], [1.0]])
-
-    # NumPy behavior: tries Cholesky, fails, falls back to pinv
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", LinAlgWarning)
-        try:
-            proj_np = linalg.solve(Gram_np, RHS_np, assume_a='pos')
-        except (linalg.LinAlgError, ValueError):
-            proj_np = linalg.pinv(Gram_np) @ RHS_np
-
-    # PyTorch behavior: tries LU solve
-    Gram_th = torch.tensor(Gram_np)
-    RHS_th = torch.tensor(RHS_np)
-    try:
-        proj_th = torch.linalg.solve(Gram_th, RHS_th)
-    except torch.linalg.LinAlgError:
-        proj_th = torch.linalg.pinv(Gram_th) @ RHS_th
-
-    np.testing.assert_allclose(
-        proj_np, to_numpy_format(proj_th), atol=1e-6,
-        err_msg="PyTorch linalg.solve behavior diverges from NumPy's Cholesky posv on ill-conditioned matrices."
     )
 
 

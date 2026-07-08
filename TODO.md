@@ -17,13 +17,18 @@
   state), so it cannot be exactly parallelized with an associative scan; any
   speedup is an approximation that needs a torch runtime to verify against the
   numpy reference (torch is not installed in the dev env). Left as-is.
-- tests: `test_torch_decomposition.py:~115` relaxes tolerances with a stale TODO
-  ("will pass once linalg.pinv is added") even though `torch.linalg.pinv` is now
-  used. Re-check whether the strict tolerance passes and, if not, track the gap
-  via `xfail(strict=True)` + an issue. Needs a torch runtime to verify.
-- tests: `test_linalg_solve_fallback_parity` in the differential file compares
-  scipy vs torch library reimplementations rather than the production code path;
-  convert to exercise the real solver/fallback or remove.
+- perf/deprecation: the torch adaptation loop uses `@torch.jit.script`, which
+  torch 2.x deprecates in favor of `torch.compile`/`torch.export`. Migrating is
+  non-trivial (the loop is a sequential nonlinear recurrence) and orthogonal to
+  the perf cliff above; revisit together.
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
-  are Python-reference (not MATLAB-published) numbers; replace with MATLAB's
-  actual OPS/TPS/IPS/APS for the example clips if/when available.
+  are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
+  but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
+  replace with MATLAB's actual scores for the example clips if/when available.
+
+Resolved 2026-07 (torch runtime now available locally, KMP_DUPLICATE_LIB_OK=TRUE):
+the `test_torch_decomposition` relaxed tolerance is the shared Gammatone
+reconstruction floor (numpy hits the same ~1.9e-3), not a torch gap — comment
+corrected and real numpy-vs-torch parity assertions added; the redundant
+`test_linalg_solve_fallback_parity` (tested library internals, not our code) was
+removed.
