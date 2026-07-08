@@ -50,21 +50,22 @@ def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> t
     gain = math.exp(-math.pi * 2000.0 / fs)
     b0 = 1.0 - gain
 
-    # Pre-compute exact IIR impulse response to 60dB decay
-    decay_samples = int(fs * 0.01)  # 10 ms decay threshold
+    # Pre-compute the causal IIR impulse response out to 60 dB decay (10 ms).
+    decay_samples = int(fs * 0.01)
     ir = b0 * (gain ** torch.arange(decay_samples, device=subbands.device, dtype=subbands.dtype))
 
     orig_shape = rectified.shape
     T = orig_shape[-1]
     rect_flat = rectified.view(-1, T)
-    B = rect_flat.shape[0]
 
-    padded = F.pad(rect_flat, (decay_samples - 1, 0))
-    # F.conv1d is cross-correlation (no kernel flip), so the kernel must be
-    # flipped to implement the causal FIR y[n] = sum_k x[n-k]*ir[k] that matches
-    # the NumPy backend's lfilter([b0], [1, -gain]). Without the flip the filter
-    # is applied time-reversed (verified: corr with the reference drops to ~0).
-    transduced = F.conv1d(padded.view(B, 1, -1), ir.flip(-1).view(1, 1, -1)).view(B, T)
+    # Causal FIR filtering via FFT linear convolution. This is the true
+    # convolution y[n] = sum_k x[n-k]*ir[k] (no kernel flip needed, unlike the
+    # cross-correlation F.conv1d), matching the NumPy lfilter([b0], [1, -gain]).
+    # FFT convolution is O(B*L) memory vs conv1d's O(B*K*L) im2col, which would
+    # otherwise blow up (tens of GB) on realistic-length, many-band batches.
+    conv_length = T + decay_samples - 1
+    spectrum = torch.fft.rfft(rect_flat, n=conv_length, dim=-1) * torch.fft.rfft(ir, n=conv_length)
+    transduced = torch.fft.irfft(spectrum, n=conv_length, dim=-1)[:, :T]
 
     return transduced.view(*orig_shape)
 
