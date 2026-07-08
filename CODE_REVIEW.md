@@ -200,6 +200,33 @@ least-squares solve cluster (21%), and two GIL-holding numba kernels (17%).
      Practical guidance: the torch backend suits differentiable use on short
      segments; it is not a high-throughput training loss as-is.
 
+### Decomposition performance (2026-07)
+
+Profiled `decompose_distortion_components` on a 5 s stereo clip:
+- **numpy: 5.8 s.** Dominated by `upfirdn` resampling (~46%, scipy-optimized) and
+  the per-frame least-squares solve cluster (~22%, 2337 tiny posv solves). Both are
+  algorithmically fundamental (the Hohmann filterbank decimates each subband to its
+  own rate; the LS solve is per frame/band). Already well-optimized; remaining
+  levers are non-trivial refactors with trade-offs: (a) vectorize the per-frame LS
+  like the torch backend (batched LU + regularization, ~1e-14 numeric change vs the
+  posv+pinv fallback — the fallback would need a hybrid slow-path for the ~49/2337
+  ill-conditioned frames), ~15%; (b) batch the analysis/synthesis resampling across
+  sources+channels to cut `upfirdn` call overhead, bit-identical but a real refactor,
+  modest gain.
+- **torch: was 13.1 s (2.2× slower than numpy!).** Cause: the resampler used
+  `conv1d`/`conv_transpose1d`, which on **float64 fall back to torch's unoptimized
+  reference kernels** (`slow_conv2d`/`slow_conv_transpose2d`) — ~65% of runtime.
+  **FIXED** by reimplementing upfirdn via FFT convolution (bit-identical to ~1e-15,
+  differentiable): **13.1 s → 10.9 s (~17%)**. Less than the ~2.2× seen on real data
+  because the complex analytic subbands need the full FFT (2× the real rfft). The
+  FFT is now ~69% of torch decompose; further gains would need reducing FFT work
+  (marginal) or the numpy-style LS trade-offs.
+
+For pure decomposition speed, **numpy remains the faster backend** (5.8 s vs 10.9 s);
+the torch fix narrows the gap and benefits the differentiable path. Neither backend
+has a large *clean* (bit-identical, low-risk) decomposition win left — the cost is
+the fundamental per-subband resampling.
+
 ### Hands-on performance investigation (2026-07, torch installed)
 
 Re-profiled `predict_perceptual_evaluation_scores` on the stereo reference clip
