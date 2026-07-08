@@ -49,7 +49,7 @@ def baseline_signals():
     # 440 Hz target sine, 1200 Hz interference noise
     target = np.sin(2.0 * np.pi * 440.0 * t)[:, np.newaxis]
     interf = np.sin(2.0 * np.pi * 1200.0 * t)[:, np.newaxis]
-    estimate = target + 0.1 * interf + 0.01 * np.random.randn(num_samples, 1)
+    estimate = target + 0.1 * interf + 0.01 * np.random.default_rng(seed=7).standard_normal((num_samples, 1))
 
     return target, interf, estimate, fs
 
@@ -562,9 +562,10 @@ def test_synthesis_temporal_alignment_parity(matlab_ref_resources):
 def test_differential_auditory_internal_representation(baseline_signals):
     """
     Parity check for the auditory model (haircell transduction + nerve adaptation
-    + modulation filtering) between the NumPy and torch backends. The torch path
-    uses differentiable surrogates (softplus, FIR-truncated IIRs), so we assert a
-    high correlation rather than bit-exact equality.
+    + modulation filtering) between the NumPy and torch backends. With the FFT
+    haircell and the straight-through max in the adaptation loop, the torch forward
+    matches numpy to floating-point precision, so this asserts a tight bound. (A
+    regression to the plain softplus max drops this to ~0.9 on longer signals.)
     """
     from peass.backend_numpy.auditory_model import generate_auditory_internal_representation as air_np
     from peass.backend_torch.auditory_model import generate_auditory_internal_representation_torch as air_th
@@ -586,4 +587,4 @@ def test_differential_auditory_internal_representation(baseline_signals):
     a = rep_np[:, :min_len, :].ravel()
     b = rep_th_np[:, :min_len, :].ravel()
     corr = np.corrcoef(a, b)[0, 1]
-    assert corr > 0.95, f"Auditory internal representation parity too low: corr={corr:.4f}"
+    assert corr > 0.999, f"Auditory internal representation parity too low: corr={corr:.4f}"
