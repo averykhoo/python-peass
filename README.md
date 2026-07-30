@@ -184,6 +184,54 @@ non-linearities and IIR recursions of the reference with smooth, backprop-safe
 surrogates (softplus, FIR-truncated filters). As a result its outputs match the
 NumPy backend by high correlation rather than to floating-point precision.
 
+### NumPy backend performance and numerical reproducibility
+
+The NumPy backend carries a few single-threaded optimizations (no threads or
+subprocesses are spawned; the speedup comes from SIMD and from removing per-call
+overhead). Worth ~1.2x end-to-end on the reference example:
+
+| change | speedup contribution | bitwise effect |
+| --- | --- | --- |
+| Numba polyphase resampler replacing SciPy `upfirdn` | ~1.13x | reassociated, see below |
+| LAPACK `?posv` called directly instead of `scipy.linalg.solve(assume_a='pos')` | 11x on that call | **bit-identical** |
+| sources pre-padded once instead of a per-frame `np.vstack` | — | **bit-identical** |
+| hoisted the conjugate transpose that was built twice per frame | — | **bit-identical** |
+| one block-diagonal matmul instead of one per source | — | ~1 ULP (1.9e-15) |
+
+None of these is an approximation: every one computes the same quantity in exact
+arithmetic. Two of them reassociate floating-point sums, and floating-point addition
+is not associative, so output is not bitwise identical to older releases.
+
+The observed difference is ~2e-11 absolute (~1e-10 of full scale). It looks larger in
+relative terms for `artifacts` (~1e-9) purely because that component is a difference
+of comparable quantities, so cancellation shrinks the denominator; `true_target` shows
+2.5e-15. Correlation against the previous output is 1.0 to all 15 digits, and the four
+quality features (and hence OPS/TPS/IPS/APS) agree to 10 significant figures.
+
+**To remove the dominant term**, disable the Numba resampler before the first call:
+
+```python
+import peass.backend_numpy.gammatone as gammatone
+gammatone.USE_NUMBA_RESAMPLER = False
+```
+
+That falls back to the SciPy path (itself bit-exact against the pre-optimization
+resampler) and costs the ~1.13x. Measured against the pre-optimization output, this
+takes the difference from 2.3e-11 down to 1.9e-15 — *not* to zero, because the
+block-diagonal projection matmul in `perform_least_squares_projection` also
+reassociates, at about 1 ULP. If you need exactly zero difference, revert that hunk
+too; it is worth ~1.03x on its own.
+
+Do *not* instead edit `fastmath=False` onto the resampler kernels: that is bit-exact
+but measures ~5% **slower** than SciPy, so it loses both ways, and it requires
+clearing Numba's on-disk cache to take effect.
+
+Note that this backend was never bitwise reproducible *across machines*: any BLAS
+build or CPU that reassociates differently is subject to the same ~1e-10 amplification,
+because the per-frame least-squares systems are ill-conditioned (regularized at only
+1e-15). Treat ~1e-10 as the backend's reproducibility floor rather than expecting
+exactness.
+
 ### Parallel Execution
 
 To run the test suite across multiple CPU cores using `pytest-xdist`, execute:

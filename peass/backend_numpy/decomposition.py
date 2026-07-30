@@ -6,14 +6,12 @@ Interference, and Artifacts. Refactored using stride tricks, LAPACK posv solves,
 and zero-copy arrays.
 """
 import pathlib
-import warnings
 from functools import lru_cache
 
 import numpy as np
 import scipy.linalg as linalg
 import scipy.signal as signal
 import soundfile as sf
-from scipy.linalg import LinAlgWarning
 
 from peass.config import DecomposedFilePaths
 from peass.config import DecomposedWaveforms
@@ -24,6 +22,13 @@ from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
 from .gammatone import calculate_equivalent_rectangular_bandwidth
 from .gammatone import fast_resample_poly
+
+
+@lru_cache(maxsize=8)
+def _get_posv(dtype):
+    """Cached LAPACK ?posv handle for the given complex/real dtype."""
+    probe = np.empty((1, 1), dtype=dtype)
+    return linalg.get_lapack_funcs(('posv',), (probe, probe))[0]
 
 
 def validate_and_normalize_audio(
@@ -80,6 +85,19 @@ def perform_least_squares_projection(
     r"""
     Weighted least-squares projection of source estimate onto source subspaces.
     Executes entirely in BLAS/LAPACK without explicitly allocating massive memory blocks.
+
+    Solver note: this calls LAPACK ``?posv`` directly rather than
+    ``scipy.linalg.solve(..., assume_a='pos')``. It is the same Cholesky solve and is
+    bitwise identical, but SciPy's per-call input validation and condition-number
+    estimate cost several times more than the ~42x42 solve itself (11x measured over
+    2000 solves).
+
+    This does narrow the pseudo-inverse fallback. Previously a ``LinAlgWarning`` was
+    promoted to an error, so a merely ill-conditioned (but positive-definite) frame
+    also fell back to ``pinv``; now only a genuine non-positive-definite factorization
+    (``info != 0``) does. That matches MATLAB's ``[R, flag] = chol(...)`` test, which is
+    what this port mirrors. On the reference example the fallback fires 0 times in
+    2337 frames either way.
     """
     filter_length = 2 * filter_half_length + 1
     num_sources = true_sources.shape[1]
@@ -117,37 +135,52 @@ def perform_least_squares_projection(
     # --- SYSTEM BENCHMARK: NEW METHOD (Memory-efficient Gram calculation) ---
     # Avoids allocating massive temporary weighted_sources / weighted_estimates matrices in memory
     window_sq = (analysis_window ** 2)[:, np.newaxis]
-    gram_matrix = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
-    rhs_vector = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
+    # Build the conjugate transpose once; it was previously materialised twice.
+    conjugate_transpose = toeplitz_matrix.conj().T
+    gram_matrix = conjugate_transpose @ (window_sq * toeplitz_matrix)
+    rhs_vector = conjugate_transpose @ (window_sq * source_estimates)
 
     # In-place diagonal regularization
     regularization_lambda = 10.0 ** -15
     gram_matrix.flat[::gram_matrix.shape[0] + 1] += regularization_lambda
 
-    # Promote LinAlgWarning to an exception locally so the fallback is triggered
-    with warnings.catch_warnings():
-        warnings.simplefilter("error", LinAlgWarning)
-        # Offload directly to LAPACK posv (Cholesky solve in compiled C/Fortran)
-        try:
-            projection_weights = linalg.solve(gram_matrix, rhs_vector, assume_a='pos')
-        except (linalg.LinAlgError, ValueError, LinAlgWarning):
-            # Fallback to pseudo-inverse if singular or highly ill-conditioned
-            weighted_toeplitz = toeplitz_matrix * analysis_window[:, np.newaxis]
-            weighted_estimates = source_estimates * analysis_window[:, np.newaxis]
-            projection_weights = linalg.pinv(weighted_toeplitz) @ weighted_estimates
+    # Call LAPACK ?posv straight through: identical Cholesky solve, but without
+    # SciPy's per-call validation, condition-number estimate and warnings machinery,
+    # which cost several times more than the 42x42 solve itself. A nonzero `info`
+    # means "not positive definite", mirroring MATLAB's chol() flag test.
+    posv = _get_posv(gram_matrix.dtype)
+    _, projection_weights, info = posv(gram_matrix, rhs_vector, lower=False,
+                                       overwrite_a=False, overwrite_b=False)
+    if info != 0:
+        # Fallback to pseudo-inverse if singular or highly ill-conditioned
+        weighted_toeplitz = toeplitz_matrix * analysis_window[:, np.newaxis]
+        weighted_estimates = source_estimates * analysis_window[:, np.newaxis]
+        projection_weights = linalg.pinv(weighted_toeplitz) @ weighted_estimates
 
-    projections = np.zeros(
-        (num_samples, source_estimates.shape[1], num_sources),
-        dtype=source_estimates.dtype
+    # Assemble all per-source projections with ONE matmul against a block-diagonal
+    # weight matrix. num_sources separate (num_samples x filter_length) matmuls are
+    # dominated by per-call overhead at these sizes, so trading a few extra FLOPs for
+    # a single BLAS call is a net win (~1.03x end-to-end).
+    #
+    # The extra terms are exact zeros, so this is an exact equivalence, but a
+    # num_sources*filter_length GEMM accumulates in a different blocked order than
+    # num_sources small ones -- worth ~1 ULP (1.9e-15) against the previous output.
+    # This is the residual difference left over when USE_NUMBA_RESAMPLER is disabled;
+    # revert this hunk as well for bitwise-identical results. See the README section
+    # "NumPy backend performance and numerical reproducibility".
+    num_channels = source_estimates.shape[1]
+    block_diagonal_weights = np.zeros(
+        (num_sources * filter_length, num_sources * num_channels), dtype=projection_weights.dtype
     )
-    weighted_diagonal = analysis_window[:, np.newaxis]
     for source_idx in range(num_sources):
-        projections[:, :, source_idx] = weighted_diagonal * (
-                toeplitz_matrix[:, source_idx * filter_length: (source_idx + 1) * filter_length] @
-                projection_weights[source_idx * filter_length: (source_idx + 1) * filter_length, :]
-        )
+        block_diagonal_weights[
+            source_idx * filter_length: (source_idx + 1) * filter_length,
+            source_idx * num_channels: (source_idx + 1) * num_channels
+        ] = projection_weights[source_idx * filter_length: (source_idx + 1) * filter_length, :]
 
-    return projections
+    stacked = toeplitz_matrix @ block_diagonal_weights
+    stacked *= analysis_window[:, np.newaxis]
+    return stacked.reshape(num_samples, num_sources, num_channels).transpose(0, 2, 1)
 
 
 def perform_time_varying_least_squares_projection(
@@ -189,22 +222,16 @@ def perform_time_varying_least_squares_projection(
     )
     window_gain_accumulation = np.zeros((total_samples, 1))
 
+    # Pad the source array once up front. Previously every frame rebuilt its own
+    # support with np.vstack plus two zero allocations, even though the padding is
+    # empty for every interior frame; now each frame is a plain view.
+    edge_padding = np.zeros((filter_half_length, num_sources), dtype=true_sources.dtype)
+    padded_sources = np.vstack([edge_padding, true_sources, edge_padding])
+    frame_source_length = window_length + 2 * filter_half_length
+
     while window_end - window_length / 2.0 <= projections_accumulation.shape[0] - window_length + 1:
         frame_estimates = source_estimates[window_begin:window_end, :]
-
-        source_window_start = window_begin - filter_half_length
-        source_window_end = window_end + filter_half_length
-        pad_left = max(0, -source_window_start)
-        pad_right = max(0, source_window_end - true_sources.shape[0])
-        slice_start = max(0, source_window_start)
-        slice_end = min(true_sources.shape[0], source_window_end)
-
-        frame_sources_slice = true_sources[slice_start:slice_end, :]
-        frame_sources = np.vstack([
-            np.zeros((pad_left, num_sources), dtype=true_sources.dtype),
-            frame_sources_slice,
-            np.zeros((pad_right, num_sources), dtype=true_sources.dtype)
-        ])
+        frame_sources = padded_sources[window_begin:window_begin + frame_source_length, :]
 
         frame_projections = perform_least_squares_projection(
             frame_estimates, frame_sources, filter_half_length, analysis_window

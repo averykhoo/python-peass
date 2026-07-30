@@ -100,6 +100,69 @@ try:
         return output_matrix
 
 
+    @numba.njit(cache=True, fastmath=True)
+    def _numba_polyphase_decimate(
+            reversed_filter: np.ndarray,
+            padded_signal: np.ndarray,
+            down: int,
+            n_pre_remove: int,
+            out_len: int,
+            num_taps: int
+    ) -> np.ndarray:
+        """Pure decimation (up == 1): one stride-1 dot product per output sample.
+
+        The signal is pre-padded so the inner loop has a constant trip count with no
+        bounds arithmetic, which is what lets LLVM emit vectorized FMA for the
+        reduction. SciPy's upfirdn runs the equivalent loop scalar. Keeping the bounds
+        checks in here instead costs the vectorization entirely (measured 0.96x vs
+        SciPy), so the padding is load-bearing, not tidiness.
+
+        The taps and the products are identical to SciPy's; `fastmath` reassociates
+        the accumulation. See USE_NUMBA_RESAMPLER for the accuracy trade-off and the
+        opt-out.
+        """
+        num_rows = padded_signal.shape[0]
+        output = np.empty((num_rows, out_len), dtype=padded_signal.dtype)
+        for row_idx in range(num_rows):
+            row = padded_signal[row_idx]
+            for sample_idx in range(out_len):
+                base = (sample_idx + n_pre_remove) * down
+                accumulator = row[0] * 0.0
+                for tap_idx in range(num_taps):
+                    accumulator += reversed_filter[tap_idx] * row[base + tap_idx]
+                output[row_idx, sample_idx] = accumulator
+        return output
+
+
+    @numba.njit(cache=True, fastmath=True)
+    def _numba_polyphase_interpolate(
+            reversed_branches: np.ndarray,
+            padded_signal: np.ndarray,
+            up: int,
+            n_pre_remove: int,
+            out_len: int,
+            pad_left: int,
+            branch_length: int
+    ) -> np.ndarray:
+        """Interpolation (down == 1) via per-phase polyphase branches.
+
+        y[n] = sum_j branch[n % up][j] * x[n // up - branch_length + 1 + j]
+        """
+        num_rows = padded_signal.shape[0]
+        output = np.empty((num_rows, out_len), dtype=padded_signal.dtype)
+        for row_idx in range(num_rows):
+            row = padded_signal[row_idx]
+            for sample_idx in range(out_len):
+                position = sample_idx + n_pre_remove
+                phase = position % up
+                start = pad_left + (position // up) - branch_length + 1
+                accumulator = row[0] * 0.0
+                for tap_idx in range(branch_length):
+                    accumulator += reversed_branches[phase, tap_idx] * row[start + tap_idx]
+                output[row_idx, sample_idx] = accumulator
+        return output
+
+
 except ImportError:
     _HAS_NUMBA = False
 
@@ -561,6 +624,33 @@ class GammatoneSynthesizer:
 # NOT free even for the band-limited subband resamples, contrary to a prior note).
 DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR = 10
 
+# Use the Numba polyphase kernels below instead of SciPy's `upfirdn` for the subband
+# resampling. Worth ~1.13x on the whole decomposition, because SciPy runs its tap
+# loop scalar while these vectorize (see `_numba_polyphase_decimate`).
+#
+# TRADE-OFF: the kernels are compiled with `fastmath=True`, which is what permits
+# LLVM to split the reduction into several partial accumulators -- that IS the
+# vectorization. It also reassociates the sum, so results differ from SciPy by a few
+# ULP (~1e-15 per subband sample). The decomposition amplifies that to ~2e-11
+# absolute, i.e. ~1e-10 of full scale: the per-frame least-squares systems are
+# ill-conditioned (regularized at only 1e-15), and `artifacts` is a difference of
+# comparable quantities so cancellation shrinks the denominator. Correlation against
+# the previous output is 1.0 to all 15 digits and the four quality features agree to
+# 10 significant figures.
+#
+# TO UNDO: set this to False (or `peass.backend_numpy.gammatone.USE_NUMBA_RESAMPLER
+# = False` before the first call). That restores the SciPy path, which is bitwise
+# identical to the pre-optimization resampler, and takes the end-to-end difference
+# from 2.3e-11 to 1.9e-15 -- not to zero, because the block-diagonal projection
+# matmul in perform_least_squares_projection also reassociates by ~1 ULP. Revert that
+# hunk too if you need exactly zero. Do NOT instead set `fastmath=False` on the
+# kernels: that is also bit-exact but ~5% SLOWER than SciPy, so it loses on both
+# counts, and it needs the Numba on-disk cache cleared to take effect.
+#
+# Note this backend was never bitwise reproducible across machines anyway -- any
+# BLAS/CPU that reassociates differently gets the same ~1e-10 amplification.
+USE_NUMBA_RESAMPLER = True
+
 
 @lru_cache(maxsize=256)
 def get_resample_filter(up: int, down: int, half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR) -> tuple:
@@ -587,6 +677,30 @@ def get_resample_filter(up: int, down: int, half_length_factor: int = DEFAULT_RE
     return h_padded, up_reduced, down_reduced, n_pre_remove
 
 
+@lru_cache(maxsize=256)
+def get_polyphase_branches(up: int, down: int,
+                           half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR) -> tuple:
+    """Reversed full filter (for decimation) and reversed per-phase branches (for
+    interpolation), derived from the same Kaiser design as get_resample_filter."""
+    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down, half_length_factor)
+    num_taps = len(h_padded)
+    branch_length = -(-num_taps // up_reduced)
+    branches = np.zeros((up_reduced, branch_length))
+    for phase in range(up_reduced):
+        column = h_padded[phase::up_reduced]
+        # right-align so the zero padding lands on the reversed branch's leading taps
+        branches[phase, branch_length - len(column):] = column[::-1]
+    return (np.ascontiguousarray(h_padded[::-1]), np.ascontiguousarray(branches),
+            up_reduced, down_reduced, n_pre_remove, num_taps, branch_length)
+
+
+def _scipy_resample_poly(x, up_reduced, down_reduced, n_pre_remove, h_padded, axis, out_len):
+    y = signal.upfirdn(h_padded, x, up_reduced, down_reduced, axis=axis)
+    keep = [slice(None)] * y.ndim
+    keep[axis] = slice(n_pre_remove, n_pre_remove + out_len)
+    return y[tuple(keep)]
+
+
 def fast_resample_poly(
         x: np.ndarray,
         up: int,
@@ -597,16 +711,39 @@ def fast_resample_poly(
     if up == down:
         return x.copy()
 
-    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter(up, down, half_length_factor)
+    (reversed_filter, reversed_branches, up_reduced, down_reduced,
+     n_pre_remove, num_taps, branch_length) = get_polyphase_branches(up, down, half_length_factor)
 
     in_len = x.shape[axis]
     out_len = int(np.ceil(in_len * up_reduced / down_reduced))
 
-    # Run high-speed upfirdn
-    y = signal.upfirdn(h_padded, x, up_reduced, down_reduced, axis=axis)
+    # Defer to SciPy when Numba is unavailable, when the caller has opted out via
+    # USE_NUMBA_RESAMPLER, or for mixed small ratios (e.g. 3/2, 2/3) whose inner loop
+    # is too short to pay for the polyphase bookkeeping -- SciPy's Cython loop wins
+    # those. This branch is bitwise identical to the pre-optimization implementation.
+    if not _HAS_NUMBA or not USE_NUMBA_RESAMPLER or (up_reduced > 1 and down_reduced > 1):
+        h_padded = get_resample_filter(up, down, half_length_factor)[0]
+        return _scipy_resample_poly(x, up_reduced, down_reduced, n_pre_remove, h_padded, axis, out_len)
 
-    # Slice the output to keep only the centered portion of out_len samples
-    keep = [slice(None)] * y.ndim
-    keep[axis] = slice(n_pre_remove, n_pre_remove + out_len)
+    moved = np.moveaxis(x, axis, -1)
+    moved_shape = moved.shape
+    flat = np.ascontiguousarray(moved.reshape(-1, in_len))
 
-    return y[tuple(keep)]
+    if up_reduced == 1:
+        pad_left = num_taps - 1
+        required = max(pad_left + in_len, (out_len - 1 + n_pre_remove) * down_reduced + num_taps)
+        padded = np.zeros((flat.shape[0], required), dtype=flat.dtype)
+        padded[:, pad_left:pad_left + in_len] = flat
+        out = _numba_polyphase_decimate(
+            reversed_filter, padded, down_reduced, n_pre_remove, out_len, num_taps
+        )
+    else:
+        pad_left = branch_length - 1
+        max_position = ((out_len - 1 + n_pre_remove) * down_reduced) // up_reduced
+        padded = np.zeros((flat.shape[0], pad_left + max(in_len, max_position + 1)), dtype=flat.dtype)
+        padded[:, pad_left:pad_left + in_len] = flat
+        out = _numba_polyphase_interpolate(
+            reversed_branches, padded, up_reduced, n_pre_remove, out_len, pad_left, branch_length
+        )
+
+    return np.moveaxis(out.reshape(moved_shape[:-1] + (out_len,)), -1, axis)
