@@ -10,29 +10,41 @@
 
 ## deferred from the 2026-07 code review (not release-blocking)
 
-- perf: `backend_torch/auditory_model.py` runs the auditory-nerve adaptation as a
-  `torch.jit.script` per-sample loop at the up-sampled rate (~24 kHz). This is a
-  performance cliff for multi-second audio. It is an inherently sequential
-  *nonlinear* first-order recurrence (each timestep divides by the previous
-  state), so it cannot be exactly parallelized with an associative scan; any
-  speedup is an approximation that needs a torch runtime to verify against the
-  numpy reference (torch is not installed in the dev env). Left as-is.
 - perf/deprecation: the torch adaptation loop uses `@torch.jit.script`, which
-  torch 2.x deprecates in favor of `torch.compile`/`torch.export`. Migrating is
-  non-trivial (the loop is a sequential nonlinear recurrence) and orthogonal to
-  the perf cliff; revisit together. (The loop was unrolled for ~1.35x in 2026-07;
-  the haircell OOM was fixed via FFT convolution.)
-- perf/backprop: the torch metrics (auditory adaptation loop) dominate backprop —
-  ~10.5x backward/forward, ~76s for 0.5s audio — because it is BPTT through the
-  ~12000-step sequential recurrence (the decomposition's pinv backward is cheap by
-  comparison). A custom autograd.Function with a hand-derived analytic backward for
-  the 5-stage adaptation cascade would make training-scale backprop practical;
-  it's substantial and needs careful gradient validation. (The torch<->numpy score
-  divergence itself was fixed via the straight-through max in 2026-07.)
+  torch 2.x deprecates in favor of `torch.compile`/`torch.export`. `torch.compile`
+  would additionally fuse the ~7 per-timestep dispatches into one kernel, which is
+  exactly what this dispatch-bound loop wants — but it cannot be evaluated on this
+  machine: inductor's CPU backend needs MSVC `cl`, which is not installed
+  (`InductorError: Compiler: cl is not found`). Revisit on a box with a working
+  inductor backend or a CUDA runtime.
+- perf/backprop: the torch metrics (auditory adaptation loop) still dominate
+  backprop — ~1.2x backward/forward, ~39s for 2s audio (2026-07-30, after the
+  vectorized loop below) — because it is BPTT through the sequential recurrence
+  (the decomposition's pinv backward is cheap by comparison). The gradient path
+  cannot use the fast `_adaptation_loop_forward` since it needs the
+  straight-through max, so it runs ~4.7x slower than the no-grad path. A custom
+  autograd.Function with a hand-derived analytic backward for the 5-stage cascade
+  would make training-scale backprop practical; it's substantial and needs careful
+  gradient validation.
+- perf: the adaptation loop is now dispatch-bound at ~7 tensor ops per timestep.
+  Going meaningfully faster in pure torch needs either kernel fusion (see the
+  `torch.compile` item above) or an approximate parallelization — e.g. DEER-style
+  Newton iteration over the sequence, where each Newton step is a linear
+  recurrence solvable by associative scan. That is research-grade and would break
+  the current bit-level agreement with the NumPy reference, so it was not pursued.
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
+
+Resolved 2026-07-30 — torch backend ~5.7x faster end-to-end (10.8s -> 1.9s for 1s
+audio, 54.2s -> 9.7s for 5s; scores unchanged to 6 decimals). The adaptation-loop
+"cannot be exactly parallelized" note was true about the *time* axis but missed
+that the 5-stage *cascade* collapses exactly: every division at step t reads step
+t-1 state, so it is one `cumprod` + one divide rather than five interleaved pairs
+(~75 dispatches per timestep -> ~7). Also: FFT convolutions were running at
+arbitrary (often near-prime) lengths, and the resampler re-transformed its FIR
+filter on all ~200 calls per decomposition.
 
 Resolved 2026-07 (torch runtime now available locally, KMP_DUPLICATE_LIB_OK=TRUE):
 the `test_torch_decomposition` relaxed tolerance is the shared Gammatone
