@@ -4,6 +4,7 @@ File path: peass/core/dispatch.py
 """
 
 import pathlib
+import sys
 from typing import Any
 
 import numpy as np
@@ -19,14 +20,18 @@ def resolve_backend(estimate_signal: Any, source_signals: Any = None) -> BaseBac
     Inspects input types and resolves the appropriate execution backend.
     Enforces device and precision homogeneity for PyTorch tensors.
     """
-    has_torch = False
-    try:
-        import torch
-        has_torch = True
-    except ImportError:
-        pass
+    # Look torch up in sys.modules rather than importing it. A torch.Tensor cannot
+    # exist unless the caller already imported torch to construct it, so an absent
+    # entry here is proof the input is not a tensor -- the check is exact, not a
+    # heuristic. Importing it instead would drag the torch runtime into every
+    # NumPy-only process, which costs ~1s on first dispatch and, on Windows, loads a
+    # second Intel OpenMP runtime alongside conda MKL's; that combination aborts the
+    # interpreter outright (see "Intel OpenMP conflict on Windows" in README.md).
+    # This matches the TYPE_CHECKING-guarded import in peass/config.py: torch is an
+    # optional extra and must not be imported at runtime unless actually in use.
+    torch = sys.modules.get("torch")
 
-    if has_torch and isinstance(estimate_signal, torch.Tensor):
+    if torch is not None and isinstance(estimate_signal, torch.Tensor):
         devices = {estimate_signal.device}
         dtypes = {estimate_signal.dtype}
 

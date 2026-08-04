@@ -3,6 +3,10 @@ PEASS Test Suite - Backend Dispatcher
 File path: tests/unit/test_dispatch.py
 """
 
+import subprocess
+import sys
+import textwrap
+
 import numpy as np
 import pytest
 
@@ -23,6 +27,43 @@ def test_resolve_backend_numpy_for_ndarray():
     est = np.zeros((1000, 1))
     assert isinstance(resolve_backend(est), NumpyBackend)
     assert isinstance(resolve_backend(est, [np.zeros((1000, 1))]), NumpyBackend)
+
+
+@pytest.mark.unit
+@pytest.mark.skipif(not _HAS_TORCH, reason="Nothing to verify when torch is not installed at all.")
+def test_numpy_dispatch_does_not_import_torch(project_root):
+    """
+    Resolving a NumPy input must leave torch unimported, even when it is installed.
+
+    Dispatch answers "is this a tensor?" from `sys.modules`, which is exact: a
+    torch.Tensor cannot exist unless the caller already imported torch. Importing it
+    instead costs ~1s on first dispatch, and on Windows pulls a second Intel OpenMP
+    runtime in alongside conda MKL's, which aborts the interpreter outright
+    (OMP: Error #15) -- from pure-NumPy usage that never asked for torch.
+
+    Runs in a subprocess because torch is unavoidably imported in this one.
+    """
+    script = textwrap.dedent(
+        """
+        import sys
+
+        import numpy as np
+
+        from peass.backend_numpy import NumpyBackend
+        from peass.core.dispatch import resolve_backend
+
+        assert isinstance(resolve_backend(np.zeros((1000, 1))), NumpyBackend)
+        assert isinstance(resolve_backend(np.zeros((1000, 1)), [np.zeros((1000, 1))]), NumpyBackend)
+        assert "torch" not in sys.modules, "dispatch imported torch to resolve a NumPy input"
+        """
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=project_root,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 @pytest.mark.unit

@@ -24,6 +24,48 @@ conda install numpy scipy
 pip install "python-peass[numba]"
 ```
 
+### Intel OpenMP conflict on Windows
+
+If you install PyTorch as a PyPI wheel into a conda environment whose NumPy is built
+against MKL — the exact combination the section above recommends — the process can
+abort on the first call:
+
+```
+OMP: Error #15: Initializing libiomp5md.dll, but found libiomp5md.dll already initialized.
+```
+
+```
+Fatal Python error: Aborted
+```
+
+conda's MKL ships `Library/bin/libiomp5md.dll` and the torch wheel ships its own copy
+in `site-packages/torch/lib`; whichever initializes second kills the interpreter. There
+is no Python traceback, and the abort surfaces inside whichever MKL routine happened to
+trigger the second initialization, so it reads like a numerical bug in the backend
+rather than a link-time collision.
+
+**Merely having torch installed is not enough to trigger it.** Dispatch decides whether
+an input is a tensor by consulting `sys.modules`, so a process that never imports torch
+never loads the second runtime and NumPy-only usage is unaffected. (Dispatch used to
+import torch unconditionally, which made this abort reachable from pure-NumPy code that
+never asked for it; `test_numpy_dispatch_does_not_import_torch` guards against the
+regression.) You are exposed once torch is genuinely in the process — using the PyTorch
+backend, or importing torch yourself alongside an MKL-backed NumPy.
+
+The real fix is to leave only one OpenMP runtime in the environment, e.g. by taking
+NumPy and PyTorch from the same toolchain instead of mixing conda MKL with a PyPI
+wheel. Failing that, set one of these **before** the first import (both runtimes read
+their configuration at load time, so setting it afterwards is too late):
+
+| workaround | supported? | cost |
+| --- | --- | --- |
+| `KMP_DUPLICATE_LIB_OK=TRUE` | no — Intel documents it as an unsafe escape hatch | none measured; this is what the project's results are recorded under |
+| `MKL_THREADING_LAYER=SEQUENTIAL` | yes | single-threads MKL; shifts the last digit of BLAS reductions (~1e-14 relative) |
+
+The test suite sets `KMP_DUPLICATE_LIB_OK` for you in the root `conftest.py`, so
+`pytest` works out of the box; an explicit setting in your environment overrides it.
+Application code gets no such help — set it yourself, or fix the environment.
+
 ## Quick Start Examples
 
 ### 1. Perceptual Quality Score Evaluation
