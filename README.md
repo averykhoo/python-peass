@@ -286,20 +286,6 @@ pytest -n auto
 
 ## Known deviations from the MATLAB reference
 
-### `segmentation_factor` is accepted but ignored
-
-`DecompositionConfiguration.segmentation_factor` exists for API compatibility with the
-MATLAB `options.segmentationFactor`, but **nothing in this package reads it**. Setting it
-to anything other than `1` silently has no effect: the signal is always decomposed in one
-piece.
-
-MATLAB takes a separate code path when `segmentationFactor > 1`
-(`extractDistortionComponents.m`, the branch at ~lines 107-110 dispatching to
-`aux_segmentAndDecompose` at ~lines 270-386): it cuts the signal into that many segments,
-decomposes each independently with the shade-in/out suppressed on interior edges, and
-overlap-adds the four components under a periodic Hann window, dividing by the accumulated
-window. That path was never ported. It is tracked in `TODO.md`.
-
 ### +0.257% level offset against the MATLAB gold WAVs
 
 The port's decomposition output is a flat, frequency-independent factor **1.0025651**

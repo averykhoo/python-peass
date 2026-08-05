@@ -59,22 +59,33 @@ class DecompositionConfiguration:
     filter_length_seconds: float = 0.04
     shade_in_milliseconds: float = 10.0
     shade_out_milliseconds: float = 10.0
-    # ACCEPTED BUT IGNORED: nothing in this package reads `segmentation_factor`.
-    # Setting it to anything other than 1 silently has no effect -- the signal is
-    # always decomposed in one piece. MATLAB implements the split path in
+    # NOT IMPLEMENTED: only the default of 1 is accepted; anything else raises in
+    # `__post_init__` rather than being silently ignored. The field exists so that
+    # MATLAB's `options.segmentationFactor` maps onto a recognizable name instead of
+    # an opaque "unexpected keyword argument". MATLAB implements the split path in
     # `extractDistortionComponents.m` (the `segmentationFactor > 1` branch at
     # ~lines 107-110, dispatching to `aux_segmentAndDecompose` / `aux_cutWav` /
-    # `aux_mergeWav` at ~lines 270-386): it chops the signal into
-    # `segmentationFactor` segments, decomposes each independently with the shades
-    # suppressed on interior edges, and overlap-adds them under a periodic Hann
-    # window with normalization by the accumulated window. Porting those lines is
-    # what this field is waiting on; see TODO.md.
+    # `aux_mergeWav` at ~lines 270-386): it chops the signal into overlapping
+    # segments, decomposes each independently with the shades suppressed on interior
+    # edges, and overlap-adds them under a periodic Hann window with normalization by
+    # the accumulated window. It is purely a peak-memory relief valve. See ARCHIVE.md
+    # for why this was declined rather than ported, plus the full port spec.
     segmentation_factor: int = 1
     # Anti-aliasing FIR half-length as a multiple of the up/down ratio, used for
     # the polyphase resampling inside the decomposition. 10 matches SciPy/MATLAB
     # (near bit-exact reference agreement); lower values (e.g. 3) trade accuracy
     # for speed (~-6% component energy, correlation ~0.99 at 3x).
     resample_filter_half_length_factor: int = 10
+
+    def __post_init__(self) -> None:
+        if self.segmentation_factor != 1:
+            raise NotImplementedError(
+                f"segmentation_factor={self.segmentation_factor} is not supported; only 1 is. "
+                f"In MATLAB PEASS this option splits the signal into overlapping segments that "
+                f"are decomposed separately and overlap-added, purely to relieve peak memory "
+                f"('increase this integer if you experienced out of memory problems'). That path "
+                f"was never ported, so the signal is always decomposed in one piece."
+            )
 
 
 @dataclass(slots=True)
