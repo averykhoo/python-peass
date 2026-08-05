@@ -82,7 +82,40 @@ def _get_synthesizer_params_torch(delay_sec: float, fs: float, cfs_tuple: tuple,
 
 
 def calculate_erb(fc: torch.Tensor) -> torch.Tensor:
+    """
+    Glasberg & Moore ERB, matching the MATLAB reference's `erbBW.m`.
+
+    Used ONLY to pick the per-band decimation factor in the analysis filterbank
+    (`myPemoAnalysisFilterBank.m:53`), NOT to build the gammatone filter coefficients.
+    See GAMMATONE_ERB_INTERCEPT_HZ below for the (deliberately different) form used by
+    the filter constructor.
+    """
     return 24.7 * (0.00437 * fc + 1.0)
+
+
+# Gammatone filter bandwidth constants, from `gammatone/Gfb_set_constants.m` (GFB_L and
+# GFB_Q), i.e. equation (17) in Hohmann 2002. The filter constructor
+# (`gammatone/Gfb_Filter_new.m:61`) computes its audiological ERB as
+#     (GFB_L + fc / GFB_Q) * bandwidth_factor
+#
+# This is the SAME empirical fit as `calculate_erb` above, re-parameterized with one
+# constant rounded: 1 / (24.7 * 0.00437) = 9.264488..., which Hohmann rounds to 9.265.
+# The two therefore differ by ~5.5e-5 relative on the slope term. The MATLAB reference
+# deliberately keeps both forms and applies each in a different place -- Hohmann's
+# rounded form for the filter coefficients, Glasberg & Moore's form for the decimation
+# factors -- so do NOT collapse them onto one formula.
+GAMMATONE_ERB_INTERCEPT_HZ = 24.7  # GFB_L
+GAMMATONE_ERB_QUALITY_FACTOR = 9.265  # GFB_Q
+
+
+def calculate_audiological_erb(fc: torch.Tensor, bandwidth_factor: float = 1.0) -> torch.Tensor:
+    """
+    Audiological ERB used to derive the gammatone filter coefficients.
+
+    Mirrors `audiological_erb` in `gammatone/Gfb_Filter_new.m:61` (Hohmann 2002 eq. 13
+    and 17). Intentionally distinct from `calculate_erb`; see the constants above.
+    """
+    return (GAMMATONE_ERB_INTERCEPT_HZ + fc / GAMMATONE_ERB_QUALITY_FACTOR) * bandwidth_factor
 
 
 def get_erb_center_frequencies(filters_per_erb, low, center, high, device=None, dtype=None):
@@ -108,11 +141,15 @@ class GammatoneAnalyzerTorch:
     def __init__(self, fs, low, center, high, filters_per_erb, device, dtype):
         self.fs = fs
         self.center_frequencies = get_erb_center_frequencies(filters_per_erb, low, center, high, device, dtype)
+
+        # erbBW form: these bandwidths drive the decimation factors, not the filter coefficients
         self.bandwidths = calculate_erb(self.center_frequencies)
 
         # Gammatone Constants
+        # Hohmann's rounded form (Gfb_Filter_new.m:61), NOT the erbBW form used for decimation
+        audiological_bandwidths = calculate_audiological_erb(self.center_frequencies)
         gamma_const = (math.pi * math.factorial(6) * (2.0 ** -6) / (math.factorial(3) ** 2))
-        decay_const = self.bandwidths / gamma_const
+        decay_const = audiological_bandwidths / gamma_const
 
         lambda_decay = torch.exp(-2.0 * math.pi * decay_const / fs)
         phase_step = 2.0 * math.pi * self.center_frequencies / fs

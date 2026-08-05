@@ -59,6 +59,16 @@ class DecompositionConfiguration:
     filter_length_seconds: float = 0.04
     shade_in_milliseconds: float = 10.0
     shade_out_milliseconds: float = 10.0
+    # ACCEPTED BUT IGNORED: nothing in this package reads `segmentation_factor`.
+    # Setting it to anything other than 1 silently has no effect -- the signal is
+    # always decomposed in one piece. MATLAB implements the split path in
+    # `extractDistortionComponents.m` (the `segmentationFactor > 1` branch at
+    # ~lines 107-110, dispatching to `aux_segmentAndDecompose` / `aux_cutWav` /
+    # `aux_mergeWav` at ~lines 270-386): it chops the signal into
+    # `segmentationFactor` segments, decomposes each independently with the shades
+    # suppressed on interior edges, and overlap-adds them under a periodic Hann
+    # window with normalization by the accumulated window. Porting those lines is
+    # what this field is waiting on; see TODO.md.
     segmentation_factor: int = 1
     # Anti-aliasing FIR half-length as a multiple of the up/down ratio, used for
     # the polyphase resampling inside the decomposition. 10 matches SciPy/MATLAB

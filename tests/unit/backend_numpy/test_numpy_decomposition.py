@@ -10,8 +10,40 @@ import pytest
 
 from peass.backend_numpy.decomposition import DecompositionConfiguration
 from peass.backend_numpy.decomposition import decompose_distortion_components
+from peass.backend_numpy.decomposition import matlab_shade_length
+from peass.backend_numpy.decomposition import matlab_shade_window
 from peass.backend_numpy.decomposition import run_auditory_analysis_filterbank
 from peass.backend_numpy.decomposition import run_auditory_synthesis_filterbank
+
+# (fs, shade_ms) pairs exercised by the MATLAB-fidelity shade window tests. The
+# 44100/5.0, 44100/25.0 and 22050/10.0 entries land exactly on a .5 sample count,
+# which pins MATLAB's round-half-away-from-zero tie rule.
+SHADE_WINDOW_CASES = [
+    (8000.0, 10.0), (8000.0, 5.0), (8000.0, 25.0),
+    (16000.0, 10.0), (16000.0, 5.0), (16000.0, 25.0),
+    (22050.0, 10.0),
+    (44100.0, 10.0), (44100.0, 5.0), (44100.0, 25.0),
+    (48000.0, 10.0), (48000.0, 5.0), (48000.0, 25.0),
+    (8000.0, 0.125), (16000.0, 0.2),
+]
+
+
+def matlab_shade_window_reference(fs: float, shade_ms: float) -> np.ndarray:
+    """
+    Literal transcription of MATLAB `extractDistortionComponents.m` (v2.0.1)::
+
+        wShadeIn = hann(2*round(shadeInMs/1000*fs+1),'periodic');
+        wShadeIn = wShadeIn(2:end/2);
+
+    with ``hann(N,'periodic')[k] = 0.5*(1 - cos(2*pi*(k-1)/N))`` for 1-based k=1..N and
+    MATLAB's round-half-away-from-zero. Used as an independent oracle for the closed
+    form used in production.
+    """
+    n_total = 2 * int(np.floor(shade_ms / 1000.0 * fs + 1.0 + 0.5))
+    k = np.arange(1, n_total + 1)  # 1-based MATLAB index
+    full_hann = 0.5 * (1.0 - np.cos(2.0 * np.pi * (k - 1) / n_total))
+    # MATLAB w(2:end/2) keeps 1-based k = 2 .. N/2 -> 0-based 1 .. N//2 - 1
+    return full_hann[1:n_total // 2]
 
 
 def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10.0,
@@ -19,22 +51,77 @@ def apply_window_shading_helper(sig: np.ndarray, fs: float, shade_in: float = 10
     sig_shaded = sig.copy()
     num_samples = sig_shaded.shape[0]
 
-    fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
-    fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
+    fade_in_samples = matlab_shade_length(shade_in, fs) if shade_in > 0 else 0
+    fade_out_samples = matlab_shade_length(shade_out, fs) if shade_out > 0 else 0
 
-    if fade_in_samples > 1 and fade_in_samples <= num_samples:
-        time_steps = np.arange(fade_in_samples)
-        shade_in_window = 0.5 - 0.5 * np.cos(np.pi * time_steps / (fade_in_samples - 1))
+    if 0 < fade_in_samples <= num_samples:
+        shade_in_window = matlab_shade_window(fade_in_samples)
         for chan_idx in range(sig_shaded.shape[1]):
             sig_shaded[:fade_in_samples, chan_idx] *= shade_in_window
 
-    if fade_out_samples > 1 and fade_out_samples <= num_samples:
-        time_steps = np.arange(fade_out_samples)
-        shade_out_window = 0.5 + 0.5 * np.cos(np.pi * time_steps / (fade_out_samples - 1))
+    if 0 < fade_out_samples <= num_samples:
+        shade_out_window = matlab_shade_window(fade_out_samples)[::-1]
         for chan_idx in range(sig_shaded.shape[1]):
             sig_shaded[-fade_out_samples:, chan_idx] *= shade_out_window
 
     return sig_shaded
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fs, shade_ms", SHADE_WINDOW_CASES)
+def test_shade_window_matches_matlab_hann_slice(fs, shade_ms):
+    """
+    The production shade window must reproduce MATLAB's
+    `hann(2*round(ms/1000*fs+1),'periodic')` sliced with `(2:end/2)` exactly.
+    """
+    reference_window = matlab_shade_window_reference(fs, shade_ms)
+
+    fade_samples = matlab_shade_length(shade_ms, fs)
+    assert fade_samples == reference_window.size
+
+    produced_window = matlab_shade_window(fade_samples)
+    np.testing.assert_allclose(produced_window, reference_window, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fs, shade_ms", SHADE_WINDOW_CASES)
+def test_shade_window_is_strict_hann_interior(fs, shade_ms):
+    """
+    MATLAB drops both the leading zero and the unity midpoint of the Hann rise, so the
+    window is strictly inside (0, 1). A plain 0->1 ramp would violate this.
+    """
+    window = matlab_shade_window(matlab_shade_length(shade_ms, fs))
+
+    assert window.size > 0
+    assert np.all(window > 0.0)
+    assert np.all(window < 1.0)
+    # Strictly increasing rise
+    assert np.all(np.diff(window) > 0.0)
+
+
+@pytest.mark.unit
+def test_shade_out_window_is_exact_reverse_of_shade_in():
+    """MATLAB derives wShadeOut from wShadeIn via flipud(), so the two must mirror exactly."""
+    for fs, shade_ms in SHADE_WINDOW_CASES:
+        shade_in_window = matlab_shade_window(matlab_shade_length(shade_ms, fs))
+        shade_out_window = matlab_shade_window(matlab_shade_length(shade_ms, fs))[::-1]
+        np.testing.assert_array_equal(shade_out_window, shade_in_window[::-1])
+
+
+@pytest.mark.unit
+def test_shade_window_length_uses_matlab_tie_breaking():
+    """
+    MATLAB rounds halves away from zero; Python's built-in round() rounds half to even.
+    At 44.1 kHz a 5 ms shade is exactly 220.5 samples, which discriminates the two.
+    """
+    assert matlab_shade_length(5.0, 44100.0) == 221
+    assert matlab_shade_length(25.0, 44100.0) == 1103
+    assert matlab_shade_length(10.0, 22050.0) == 221
+    assert matlab_shade_length(10.0, 44100.0) == 441
+    # A single-sample window is well defined for the MATLAB formula (the old 0->1 ramp
+    # divided by zero here), and evaluates to the Hann midpoint-adjacent value.
+    assert matlab_shade_length(0.125, 8000.0) == 1
+    np.testing.assert_allclose(matlab_shade_window(1), [0.5], rtol=0.0, atol=1e-15)
 
 
 @pytest.mark.unit

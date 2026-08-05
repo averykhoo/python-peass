@@ -3,12 +3,15 @@ PEASS Test Suite - Gammatone Filterbank Mathematics Unit Tests
 File path: tests/unit/test_gammatone.py
 """
 
+import math
+
 import numpy as np
 import pytest
 
 from peass.backend_numpy.gammatone import GammatoneAnalyzer
 from peass.backend_numpy.gammatone import GammatoneFilter
 from peass.backend_numpy.gammatone import GammatoneSynthesizer
+from peass.backend_numpy.gammatone import calculate_audiological_equivalent_rectangular_bandwidth
 from peass.backend_numpy.gammatone import calculate_equivalent_rectangular_bandwidth
 from peass.backend_numpy.gammatone import convert_equivalent_rectangular_bandwidth_scale_to_frequency
 from peass.backend_numpy.gammatone import convert_frequency_to_equivalent_rectangular_bandwidth_scale
@@ -37,6 +40,124 @@ def test_calculate_erb_bandwidth_values():
 
     # At fc = 1000: ERB = 24.7 * (4.37 + 1.0) = 132.639
     assert np.isclose(calculate_equivalent_rectangular_bandwidth(1000.0), 132.639)
+
+
+def _recover_audiological_bandwidth_from_filter(filter_instance: GammatoneFilter) -> float:
+    """
+    Inverts the Hohmann 2002 eq. (14) chain to recover the audiological ERB that the
+    filter constructor actually used, straight from the constructed pole.
+
+    lambda = exp(-2*pi*b/fs)  ->  b = -ln(lambda) * fs / (2*pi)  ->  erb = b * a_gamma
+    """
+    order = filter_instance.filter_order
+    gamma_constant = (math.pi * math.factorial(2 * order - 2) * (2.0 ** -(2 * order - 2)) /
+                      (math.factorial(order - 1) ** 2))
+    decay_constant = -math.log(filter_instance.lambda_decay_factor) * filter_instance.sampling_frequency_hz / (
+            2.0 * math.pi)
+    return decay_constant * gamma_constant
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("center_frequency_hz", [20.0, 100.0, 440.0, 1000.0, 5000.0, 12000.0])
+def test_erb_bandwidth_helper_pins_erbbw_formula(center_frequency_hz):
+    """
+    Pins `calculate_equivalent_rectangular_bandwidth` to the Glasberg & Moore form used
+    by the MATLAB reference's `erbBW.m`: 24.7 * (0.00437 * fc + 1).
+
+    This helper feeds the per-band decimation factor (`myPemoAnalysisFilterBank.m:53`)
+    and NOTHING else. It must not be collapsed onto the gammatone filter constructor's
+    (GFB_L + fc/GFB_Q) form -- see
+    `test_gammatone_filter_bandwidth_pins_hohmann_formula`. The two formulas are the
+    same empirical fit with one constant rounded, so a refactor that unifies them looks
+    harmless and is not: MATLAB deliberately uses each in a different place, and parity
+    requires reproducing that split.
+    """
+    expected = 24.7 * (0.00437 * center_frequency_hz + 1.0)
+    assert calculate_equivalent_rectangular_bandwidth(center_frequency_hz) == pytest.approx(expected, rel=1e-15)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("center_frequency_hz", [20.0, 100.0, 440.0, 1000.0, 5000.0, 12000.0])
+def test_gammatone_filter_bandwidth_pins_hohmann_formula(center_frequency_hz):
+    """
+    Pins the gammatone filter constructor's bandwidth to `Gfb_Filter_new.m:61`:
+    audiological_erb = (GFB_L + fc / GFB_Q) * bandwidth_factor, with GFB_L = 24.7 and
+    GFB_Q = 9.265 (Hohmann 2002 eq. 17, `Gfb_set_constants.m`).
+
+    The constructor must NOT use the `erbBW.m` form 24.7 * (0.00437 * fc + 1), which is
+    the same fit with 1/(24.7*0.00437) = 9.264488... rounded to 9.265 and which belongs
+    at the decimation call site instead. The gap is only ~5.5e-5 relative on the slope
+    term, so this test asserts tightly enough to catch a silent swap back.
+    """
+    expected = 24.7 + center_frequency_hz / 9.265
+
+    # The standalone helper matches...
+    assert calculate_audiological_equivalent_rectangular_bandwidth(center_frequency_hz) == pytest.approx(
+        expected, rel=1e-15
+    )
+
+    # ...and so does the pole that the constructor actually built.
+    filter_instance = GammatoneFilter(sampling_frequency_hz=32000.0, center_frequency_hz=center_frequency_hz)
+    assert _recover_audiological_bandwidth_from_filter(filter_instance) == pytest.approx(expected, rel=1e-9)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bandwidth_factor", [0.5, 1.0, 2.0])
+def test_gammatone_filter_bandwidth_scales_with_bandwidth_factor(bandwidth_factor):
+    """
+    `Gfb_Filter_new.m:61` multiplies the whole audiological ERB by bandwidth_factor.
+    """
+    center_frequency_hz = 1000.0
+    expected = (24.7 + center_frequency_hz / 9.265) * bandwidth_factor
+
+    filter_instance = GammatoneFilter(
+        sampling_frequency_hz=32000.0,
+        center_frequency_hz=center_frequency_hz,
+        bandwidth_factor=bandwidth_factor
+    )
+    assert _recover_audiological_bandwidth_from_filter(filter_instance) == pytest.approx(expected, rel=1e-9)
+
+
+@pytest.mark.unit
+def test_two_erb_formulas_stay_distinct():
+    """
+    Guards the intent directly: the constructor's ERB and the erbBW helper are close but
+    must remain two separate expressions. If a refactor unifies them this test fails,
+    which is the point -- the MATLAB reference uses both, in different places.
+    """
+    center_frequency_hz = 10000.0
+    hohmann = calculate_audiological_equivalent_rectangular_bandwidth(center_frequency_hz)
+    glasberg_moore = calculate_equivalent_rectangular_bandwidth(center_frequency_hz)
+
+    assert hohmann != glasberg_moore
+    # Same fit, one rounded constant: agreement to ~5e-5 relative, but no closer.
+    assert hohmann == pytest.approx(glasberg_moore, rel=1e-4)
+    assert hohmann != pytest.approx(glasberg_moore, rel=1e-6)
+
+
+@pytest.mark.unit
+def test_analyzer_bandwidths_use_erbbw_for_decimation():
+    """
+    `GammatoneAnalyzer.bandwidths` is the decimation bandwidth, so it stays on the
+    erbBW form even though the analyzer's filters are built with the Hohmann form.
+    """
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=16000.0,
+        lower_cutoff_frequency_hz=100.0,
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=4000.0,
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+
+    np.testing.assert_allclose(
+        analyzer.bandwidths,
+        24.7 * (0.00437 * analyzer.center_frequencies + 1.0),
+        rtol=1e-15
+    )
+
+    for filter_instance in analyzer.filters:
+        expected = 24.7 + filter_instance.center_frequency_hz / 9.265
+        assert _recover_audiological_bandwidth_from_filter(filter_instance) == pytest.approx(expected, rel=1e-9)
 
 
 @pytest.mark.unit

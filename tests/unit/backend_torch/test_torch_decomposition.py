@@ -6,6 +6,102 @@ import torch
 from peass import DecompositionConfiguration
 from peass.backend_torch.decomposition import apply_window_shading_torch
 from peass.backend_torch.decomposition import decompose_distortion_components
+from peass.backend_torch.decomposition import matlab_shade_length
+from peass.backend_torch.decomposition import matlab_shade_window_torch
+
+# (fs, shade_ms) pairs exercised by the MATLAB-fidelity shade window tests. The
+# 44100/5.0, 44100/25.0 and 22050/10.0 entries land exactly on a .5 sample count,
+# which pins MATLAB's round-half-away-from-zero tie rule.
+SHADE_WINDOW_CASES = [
+    (8000.0, 10.0), (8000.0, 5.0), (8000.0, 25.0),
+    (16000.0, 10.0), (16000.0, 5.0), (16000.0, 25.0),
+    (22050.0, 10.0),
+    (44100.0, 10.0), (44100.0, 5.0), (44100.0, 25.0),
+    (48000.0, 10.0), (48000.0, 5.0), (48000.0, 25.0),
+    (8000.0, 0.125), (16000.0, 0.2),
+]
+
+
+def matlab_shade_window_reference(fs: float, shade_ms: float) -> torch.Tensor:
+    """
+    Literal transcription of MATLAB `extractDistortionComponents.m` (v2.0.1)::
+
+        wShadeIn = hann(2*round(shadeInMs/1000*fs+1),'periodic');
+        wShadeIn = wShadeIn(2:end/2);
+
+    with ``hann(N,'periodic')[k] = 0.5*(1 - cos(2*pi*(k-1)/N))`` for 1-based k=1..N and
+    MATLAB's round-half-away-from-zero. Independent oracle for the production closed form.
+    """
+    n_total = 2 * int(math.floor(shade_ms / 1000.0 * fs + 1.0 + 0.5))
+    k = torch.arange(1, n_total + 1, dtype=torch.float64)  # 1-based MATLAB index
+    full_hann = 0.5 * (1.0 - torch.cos(2.0 * math.pi * (k - 1) / n_total))
+    # MATLAB w(2:end/2) keeps 1-based k = 2 .. N/2 -> 0-based 1 .. N//2 - 1
+    return full_hann[1:n_total // 2]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fs, shade_ms", SHADE_WINDOW_CASES)
+def test_torch_shade_window_matches_matlab_hann_slice(fs, shade_ms):
+    """
+    The torch shade window must reproduce MATLAB's
+    `hann(2*round(ms/1000*fs+1),'periodic')` sliced with `(2:end/2)` exactly.
+    """
+    reference_window = matlab_shade_window_reference(fs, shade_ms)
+
+    fade_samples = matlab_shade_length(shade_ms, fs)
+    assert fade_samples == reference_window.numel()
+
+    produced_window = matlab_shade_window_torch(fade_samples, torch.device("cpu"), torch.float64)
+    torch.testing.assert_close(produced_window, reference_window, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fs, shade_ms", SHADE_WINDOW_CASES)
+def test_torch_shade_window_is_strict_hann_interior(fs, shade_ms):
+    """
+    MATLAB drops both the leading zero and the unity midpoint of the Hann rise, so the
+    window is strictly inside (0, 1). A plain 0->1 ramp would violate this.
+    """
+    window = matlab_shade_window_torch(
+        matlab_shade_length(shade_ms, fs), torch.device("cpu"), torch.float64
+    )
+
+    assert window.numel() > 0
+    assert bool(torch.all(window > 0.0))
+    assert bool(torch.all(window < 1.0))
+    assert bool(torch.all(torch.diff(window) > 0.0))
+
+
+@pytest.mark.unit
+def test_torch_shade_out_window_is_exact_reverse_of_shade_in():
+    """MATLAB derives wShadeOut from wShadeIn via flipud(), so the two must mirror exactly."""
+    fs = 44100.0
+    num_samples = 4410
+    signal = torch.ones(num_samples, 2, dtype=torch.float64)
+    shaded = apply_window_shading_torch(signal, fs, 10.0, 10.0)
+
+    fade_samples = matlab_shade_length(10.0, fs)
+    shade_in_applied = shaded[:fade_samples, 0]
+    shade_out_applied = shaded[-fade_samples:, 0]
+
+    torch.testing.assert_close(shade_out_applied, shade_in_applied.flip(0), rtol=0.0, atol=0.0)
+    assert bool(torch.all(shade_in_applied > 0.0))
+    assert bool(torch.all(shade_in_applied < 1.0))
+
+
+@pytest.mark.unit
+def test_torch_shade_window_matches_numpy_backend():
+    """Both backends must produce bit-comparable shade windows for the same (fs, ms)."""
+    from peass.backend_numpy.decomposition import matlab_shade_length as np_shade_length
+    from peass.backend_numpy.decomposition import matlab_shade_window as np_shade_window
+
+    for fs, shade_ms in SHADE_WINDOW_CASES:
+        fade_samples = matlab_shade_length(shade_ms, fs)
+        assert fade_samples == np_shade_length(shade_ms, fs)
+
+        torch_window = matlab_shade_window_torch(fade_samples, torch.device("cpu"), torch.float64)
+        numpy_window = torch.from_numpy(np_shade_window(fade_samples))
+        torch.testing.assert_close(torch_window, numpy_window, rtol=0.0, atol=1e-15)
 
 
 @pytest.mark.unit

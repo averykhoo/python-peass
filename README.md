@@ -284,6 +284,72 @@ pytest -n auto
 
 ---
 
+## Known deviations from the MATLAB reference
+
+### `segmentation_factor` is accepted but ignored
+
+`DecompositionConfiguration.segmentation_factor` exists for API compatibility with the
+MATLAB `options.segmentationFactor`, but **nothing in this package reads it**. Setting it
+to anything other than `1` silently has no effect: the signal is always decomposed in one
+piece.
+
+MATLAB takes a separate code path when `segmentationFactor > 1`
+(`extractDistortionComponents.m`, the branch at ~lines 107-110 dispatching to
+`aux_segmentAndDecompose` at ~lines 270-386): it cuts the signal into that many segments,
+decomposes each independently with the shade-in/out suppressed on interior edges, and
+overlap-adds the four components under a periodic Hann window, dividing by the accumulated
+window. That path was never ported. It is tracked in `TODO.md`.
+
+### +0.257% level offset against the MATLAB gold WAVs
+
+The port's decomposition output is a flat, frequency-independent factor **1.0025651**
+(+0.0223 dB) larger in amplitude than the MATLAB v2.0.1 gold WAVs in
+`tests/resources/matlab_reference/`, on all four output components. This is understood,
+deliberate, and **not fixed**.
+
+The cause is resampler filter normalization. `scipy.signal.firwin` defaults to
+`scale=True`, which normalizes the Kaiser-windowed sinc to exactly unit DC gain
+(`peass/backend_numpy/gammatone.py:707`, `peass/backend_torch/utils.py:85`). MATLAB's
+`resample` filter is *not* DC-normalized; its raw DC gain is 0.9993253. The decomposition
+performs four resamples per signal path (16k→24k, decimate by `Ndec`, interpolate by
+`Ndec`, 24k→16k), so MATLAB accumulates:
+
+| step | MATLAB filter DC gain |
+| --- | --- |
+| 16k → 24k and 24k → 16k | 0.999394194 each |
+| decimate by `Ndec` and interpolate by `Ndec` | 0.999325320 each |
+| product | 0.997441484 |
+| reciprocal | **1.00256514** |
+
+against a measured 1.0025651. Because the filter half-length is `10*pqmax` and the cutoff
+is `1/(2*pqmax)`, the tap set is scale-invariant in `pqmax`, so the factor is identical for
+every `Ndec` from 14 to 409 — which is why the discrepancy is perfectly frequency-flat
+rather than a filter-shape difference.
+
+Confirmed by a literal line-by-line MATLAB transcription: flipping only that one
+normalization moves the ratio from 1.0025651 to 1.0000001, and the remaining 5.4e-4
+residual is pure PCM16 quantization noise (0.575 LSB rms measured, 0.577 expected for a sum
+of four independent 16-bit roundings, white spectrum).
+
+Note also that the gold WAVs are byte-identical to the precomputed outputs shipped in the
+PEASS distribution's `example/` folder, and the v2.0 and v2.0.1 shipped outputs are
+identical to each other — the authors never regenerated them for 2.0.1. They are stale
+artifacts, not a fresh run of the v2.0.1 source.
+
+**Why it is not fixed:** a resampler should preserve DC gain. Matching the reference would
+mean deliberately introducing a 0.26% (0.022 dB) attenuation to chase a reference that is
+itself arguably wrong.
+
+The offset originally went unflagged because the regression test asserted on
+cross-correlation, which is scale-invariant, plus a `0.5 < ratio < 2.0` sanity band that
+0.26% passes trivially. `tests/regression/test_matlab_regression.py` now asserts the RMS
+ratio *equals* 1.0025651 to within 1e-3 instead, so the known offset is locked rather than
+merely tolerated: any new gain regression, in either direction, breaks the test. The worst
+measured deviation from the constant is 1.5e-5, on the `artifacts` component — the quietest
+of the four, and so the one whose gold WAV sits closest to the PCM16 quantization floor.
+
+---
+
 ## References
 
 1. **V. Emiya, E. Vincent, N. Harlander, and V. Hohmann**,

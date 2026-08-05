@@ -7,6 +7,18 @@
   examples here: https://www.jetbrains.com/help/pycharm/performing-tests.html#run-tests-in-parallel
 - add reflection padding milliseconds as a configurable option, it's helpful for short files (especially under 1s), 
   see `test_torch_decomposition.py:test_torch_decomposition_gain_invariance_with_padding` for details
+- implement `segmentation_factor` — it is declared on `DecompositionConfiguration`
+  (`peass/config.py`) but nothing reads it, so any value other than `1` is silently
+  ignored. MATLAB does the work in `extractDistortionComponents.m`: the
+  `options.segmentationFactor > 1` branch at ~lines 107-110 short-circuits into
+  `aux_segmentAndDecompose` (~lines 270-386), which cuts every source and the estimate
+  into `segmentationFactor` segments of `ceil(nSamples/segmentationFactor)` samples via
+  `aux_cutWav`, recurses with `segmentationFactor = 1` and with `shadeInMs`/`shadeOutMs`
+  forced to 0 except on the first/last segment respectively, then `aux_mergeWav`
+  overlap-adds each of the four components under a periodic Hann window and divides by the
+  accumulated window where it is non-zero. The config field already exists, so the public
+  API surface does not change — this is purely a decomposition-path implementation, plus
+  removing the "accepted but ignored" notes in `peass/config.py` and README.
 
 ## deferred from the 2026-07 code review (not release-blocking)
 
@@ -36,6 +48,32 @@
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
+
+Closed investigation (do not reopen) — the +0.257% level offset against the MATLAB gold
+WAVs is root-caused and deliberately **not** fixed. Our decomposition output is a flat
+factor 1.0025651 larger in amplitude than `tests/resources/matlab_reference/` on all four
+components, because `scipy.signal.firwin` defaults to `scale=True` (unit DC gain) while
+MATLAB's `resample` filter is not DC-normalized (raw DC gain 0.9993253); four resamples per
+path give 0.999394194^2 * 0.999325320^2 = 0.997441484, whose reciprocal is 1.00256514. It
+is frequency-flat because the tap set is scale-invariant in `pqmax`. A line-by-line MATLAB
+transcription confirms flipping only that normalization takes the ratio to 1.0000001, with
+the residual being PCM16 quantization noise. The gold WAVs are also stale — byte-identical
+to the v2.0 shipped outputs, never regenerated for 2.0.1. Full write-up in README under
+"Known deviations from the MATLAB reference".
+
+Resolved — gammatone filter constructor now uses MATLAB's ERB form `24.7 + fc/9.265`
+(`Gfb_Filter_new.m` / `Gfb_set_constants.m`, Hohmann 2002 eq. 17) instead of the
+algebraically-equivalent-in-intent `erbBW` form `24.7*(0.00437*fc + 1)`. MATLAB-parity fix;
+numerical impact on typical clips is negligible.
+
+Resolved — shade-in/shade-out window now matches MATLAB's
+`hann(2*round(ms/1000*fs + 1), 'periodic')(2:end/2)` strict-interior ramp instead of a full
+0→1 ramp. MATLAB-parity fix; the shape difference is confined to the first/last few
+milliseconds and is negligible on typical clips. The same fix also corrected the window
+*length*: MATLAB's `round` breaks ties away from zero while Python/NumPy round half to
+even, so `round(ms/1000*fs)` was one sample short wherever the product lands exactly on
+`.5` — which includes the common cases 44100 Hz @ 5 ms and @ 25 ms, and 22050 Hz @ 10 ms.
+Length is now `floor(x + 0.5)`.
 
 Resolved 2026-07-30 — torch backend ~5.7x faster end-to-end (10.8s -> 1.9s for 1s
 audio, 54.2s -> 9.7s for 5s; scores unchanged to 6 decimals). The adaptation-loop

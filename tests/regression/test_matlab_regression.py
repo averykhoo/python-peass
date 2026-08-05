@@ -14,6 +14,26 @@ from tests.conftest import to_backend_format
 from tests.conftest import to_numpy_format
 
 
+# The port's decomposition output is a flat, frequency-independent factor larger in
+# amplitude than the MATLAB gold WAVs: `scipy.signal.firwin` normalizes the resampler
+# to unit DC gain (`scale=True`) while MATLAB's `resample` filter is not DC-normalized.
+# Four resamples per signal path give 0.999394194**2 * 0.999325320**2 = 0.997441484,
+# whose reciprocal is this constant. The deviation is understood and deliberately not
+# fixed -- see README, "Known deviations from the MATLAB reference".
+#
+# Asserting the ratio *against* this constant, rather than inside a wide sanity band,
+# turns the known offset into a lock: any new gain regression, in either direction,
+# now breaks this test.
+_MATLAB_RESAMPLER_GAIN_OFFSET = 1.0025651
+
+# Worst measured deviation from the constant across all four components and both
+# channels is 1.5e-5, on `artifacts` -- the quietest component, whose gold WAV sits
+# closest to the PCM16 quantization floor. 1e-3 leaves ~60x headroom for platform
+# FFT/LAPACK variation while still being ~500x tighter than the 0.5..2.0 band it
+# replaces.
+_GAIN_TOLERANCE = 1e-3
+
+
 @pytest.mark.regression
 def test_regression_against_matlab_references(matlab_ref_resources, peass_backend):
     """
@@ -53,9 +73,11 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
     ]
 
     # With full-order resampling (the default) the NumPy backend matches MATLAB to
-    # ~0.9999; the torch backend deliberately uses differentiable approximations
-    # (softplus, FIR-truncated IIRs) and is held to a looser bound.
-    corr_threshold = 0.999 if backend_type == "numpy" else 0.95
+    # ~0.9999. The torch backend's differentiable approximations (softplus,
+    # FIR-truncated IIRs) live in the PEMO-Q metric rather than this decomposition
+    # path, so it measures 1.00000 here too; the looser bound is kept only as
+    # headroom for float64 CUDA, not because torch is known to be worse.
+    corr_threshold = 0.999 if backend_type == "numpy" else 0.99
 
     for py_val, gold_filename, label in validation_map:
         gold_val, _ = sf.read(matlab_ref_resources / gold_filename)
@@ -77,12 +99,15 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
                     f"Regression failure on {backend_type} (device: {device}): "
                     f"{label} (CH{ch}) correlation is {corr:.4f}"
                 )
-                # Correlation is blind to gain/offset, so also assert the energy
-                # (RMS) is within a sane band of the reference to catch scale errors.
+                # Correlation is blind to gain, so also assert the energy (RMS) ratio
+                # equals the known, root-caused resampler-normalization offset.
                 rms_ratio = np.sqrt(np.mean(py_ch ** 2)) / (np.sqrt(np.mean(gold_ch ** 2)) + 1e-20)
-                assert 0.5 < rms_ratio < 2.0, (
+                gain_error = rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET - 1.0
+                assert abs(gain_error) < _GAIN_TOLERANCE, (
                     f"Energy scale mismatch on {backend_type} (device: {device}): "
-                    f"{label} (CH{ch}) RMS ratio is {rms_ratio:.4f}"
+                    f"{label} (CH{ch}) RMS ratio is {rms_ratio:.7f}, expected "
+                    f"{_MATLAB_RESAMPLER_GAIN_OFFSET} +/- {_GAIN_TOLERANCE:.0e} "
+                    f"(relative error {gain_error:+.2e})"
                 )
 
 

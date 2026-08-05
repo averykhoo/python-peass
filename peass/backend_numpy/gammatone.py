@@ -170,8 +170,44 @@ except ImportError:
 def calculate_equivalent_rectangular_bandwidth(center_frequency_hz: float) -> float:
     """
     Computes the Equivalent Rectangular Bandwidth of auditory filters.
+
+    This is the Glasberg & Moore form used by the MATLAB reference's `erbBW.m`. It is
+    used ONLY to pick the per-band decimation factor in the analysis filterbank
+    (`myPemoAnalysisFilterBank.m:53`), NOT to build the gammatone filter coefficients.
+    See GAMMATONE_ERB_INTERCEPT_HZ below for the (deliberately different) form used by
+    the filter constructor.
     """
     return 24.7 * (0.00437 * center_frequency_hz + 1.0)
+
+
+# Gammatone filter bandwidth constants, from `gammatone/Gfb_set_constants.m` (GFB_L and
+# GFB_Q), i.e. equation (17) in Hohmann 2002. The filter constructor
+# (`gammatone/Gfb_Filter_new.m:61`) computes its audiological ERB as
+#     (GFB_L + fc / GFB_Q) * bandwidth_factor
+#
+# This is the SAME empirical fit as `calculate_equivalent_rectangular_bandwidth` above,
+# re-parameterized with one constant rounded: 1 / (24.7 * 0.00437) = 9.264488..., which
+# Hohmann rounds to 9.265. The two therefore differ by ~5.5e-5 relative on the slope
+# term. The MATLAB reference deliberately keeps both forms and applies each in a
+# different place -- Hohmann's rounded form for the filter coefficients, Glasberg &
+# Moore's form for the decimation factors -- so do NOT collapse them onto one formula.
+GAMMATONE_ERB_INTERCEPT_HZ = 24.7  # GFB_L
+GAMMATONE_ERB_QUALITY_FACTOR = 9.265  # GFB_Q
+
+
+def calculate_audiological_equivalent_rectangular_bandwidth(
+        center_frequency_hz: float,
+        bandwidth_factor: float = 1.0
+) -> float:
+    """
+    Computes the audiological ERB used to derive gammatone filter coefficients.
+
+    Mirrors `audiological_erb` in `gammatone/Gfb_Filter_new.m:61` (Hohmann 2002 eq. 13
+    and 17). Intentionally distinct from `calculate_equivalent_rectangular_bandwidth`;
+    see the constants above.
+    """
+    return (GAMMATONE_ERB_INTERCEPT_HZ +
+            center_frequency_hz / GAMMATONE_ERB_QUALITY_FACTOR) * bandwidth_factor
 
 
 def convert_frequency_to_equivalent_rectangular_bandwidth_scale(frequency_hz: float) -> float:
@@ -226,7 +262,10 @@ class GammatoneFilter:
         self.sampling_frequency_hz: float = sampling_frequency_hz
         self.center_frequency_hz: float = center_frequency_hz
 
-        audiological_bandwidth = calculate_equivalent_rectangular_bandwidth(center_frequency_hz) * bandwidth_factor
+        # Hohmann's rounded form (Gfb_Filter_new.m:61), NOT the erbBW form used for decimation
+        audiological_bandwidth = calculate_audiological_equivalent_rectangular_bandwidth(
+            center_frequency_hz, bandwidth_factor
+        )
         gamma_constant = (np.pi * math.factorial(2 * filter_order - 2) * (2.0 ** -(2 * filter_order - 2)) /
                           (math.factorial(filter_order - 1) ** 2))
         decay_constant = audiological_bandwidth / gamma_constant
@@ -321,6 +360,7 @@ class GammatoneAnalyzer:
             GammatoneFilter(sampling_frequency_hz, freq, filter_order, bandwidth_factor)
             for freq in self.center_frequencies
         ]
+        # erbBW form: these bandwidths drive the decimation factors, not the filter coefficients
         self.bandwidths: np.ndarray = calculate_equivalent_rectangular_bandwidth(self.center_frequencies)
         self.original_sampling_frequency_hz: float = sampling_frequency_hz
         self.decimation_factors: np.ndarray = np.ones(len(self.filters), dtype=int)

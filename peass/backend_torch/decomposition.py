@@ -425,12 +425,52 @@ def run_auditory_synthesis_filterbank_torch(
     return reconstructed[..., delay_samples:]
 
 
+def matlab_shade_length(shade_milliseconds: float, sampling_frequency_hz: float) -> int:
+    """
+    Length in samples of a PEASS shade window, matching MATLAB
+    `extractDistortionComponents.m` (v2.0.1, lines ~155-165).
+
+    MATLAB builds a periodic Hann of length ``N = 2*round(ms/1000*fs + 1)`` and keeps
+    ``w(2:end/2)``, i.e. ``N/2 - 1 = round(ms/1000*fs)`` samples. MATLAB's ``round``
+    breaks ties away from zero, whereas Python rounds half to even, so the tie rule is
+    spelled out here (it matters at e.g. fs=44100 with shadeMs=5 or 25, where
+    ms/1000*fs lands exactly on .5).
+    """
+    return int(math.floor(shade_milliseconds / 1000.0 * sampling_frequency_hz + 0.5))
+
+
+def matlab_shade_window_torch(fade_samples: int, device, dtype) -> torch.Tensor:
+    """
+    MATLAB-exact PEASS shade-in window of ``fade_samples`` (= R) samples.
+
+    Reference: `extractDistortionComponents.m` (v2.0.1)::
+
+        wShadeIn = hann(2*round(options.shadeInMs/1000*fs+1),'periodic');
+        wShadeIn = wShadeIn(2:end/2);
+
+    With ``hann(N,'periodic')[k] = 0.5*(1 - cos(2*pi*(k-1)/N))`` for 1-based k=1..N and
+    ``N = 2*(R+1)``, the slice keeps k = 2..N/2, which collapses to
+
+        w[n] = 0.5 * (1 - cos(pi*(n+1)/(R+1)))      for n = 0..R-1
+
+    This is the strict INTERIOR of a Hann rise: MATLAB drops both the leading zero
+    (k=1) and the unity midpoint (k=N/2+1), so the window never reaches exactly 0 or
+    exactly 1. Do NOT "simplify" it back to a full 0->1 ramp (``pi*n/(R-1)``) - that
+    deviates from the reference by ~1.3e-3 at 44.1 kHz and ~7e-3 at 8 kHz, and it is
+    undefined for R=1 whereas this form is well defined for every R >= 1.
+
+    The shade-out window is this window reversed (MATLAB applies ``flipud``).
+    """
+    time_steps = torch.arange(1, fade_samples + 1, device=device, dtype=dtype)
+    return 0.5 * (1.0 - torch.cos(math.pi * time_steps / (fade_samples + 1)))
+
+
 def apply_window_shading_torch(sig: torch.Tensor, fs: float, shade_in: float, shade_out: float) -> torch.Tensor:
     shaded = sig.clone()
     num_samples = shaded.shape[0]
 
-    fade_in_samples = int(round(shade_in / 1000.0 * fs)) if shade_in > 0 else 0
-    fade_out_samples = int(round(shade_out / 1000.0 * fs)) if shade_out > 0 else 0
+    fade_in_samples = matlab_shade_length(shade_in, fs) if shade_in > 0 else 0
+    fade_out_samples = matlab_shade_length(shade_out, fs) if shade_out > 0 else 0
 
     if fade_in_samples + fade_out_samples > num_samples:
         raise ValueError(
@@ -438,14 +478,14 @@ def apply_window_shading_torch(sig: torch.Tensor, fs: float, shade_in: float, sh
             f"exceeds the signal length ({num_samples} samples)."
         )
 
-    if fade_in_samples > 1:
-        t = torch.arange(fade_in_samples, device=sig.device, dtype=sig.dtype)
-        win = 0.5 - 0.5 * torch.cos(math.pi * t / (fade_in_samples - 1))
+    if fade_in_samples > 0:
+        win = matlab_shade_window_torch(fade_in_samples, sig.device, sig.dtype)
         shaded[:fade_in_samples, :] *= win.unsqueeze(1)
 
-    if fade_out_samples > 1:
-        t = torch.arange(fade_out_samples, device=sig.device, dtype=sig.dtype)
-        win = 0.5 + 0.5 * torch.cos(math.pi * t / (fade_out_samples - 1))
+    if fade_out_samples > 0:
+        # MATLAB obtains the fade-out via flipud() of the same window; deriving it
+        # by reversal (rather than a separate cosine) keeps the two exactly consistent.
+        win = matlab_shade_window_torch(fade_out_samples, sig.device, sig.dtype).flip(0)
         shaded[-fade_out_samples:, :] *= win.unsqueeze(1)
 
     return shaded
