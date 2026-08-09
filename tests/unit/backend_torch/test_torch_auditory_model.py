@@ -1,7 +1,9 @@
 import math
 
+import pytest
 import torch
 
+from peass.backend_torch import auditory_model
 from peass.backend_torch.auditory_model import simulate_auditory_nerve_adaptation
 from peass.backend_torch.auditory_model import simulate_inner_haircell_transduction
 from peass.backend_torch.utils import smoothmax
@@ -55,3 +57,55 @@ def test_haircell_scales_to_long_many_band_batches():
     out = simulate_inner_haircell_transduction(x, 24000.0)
     assert out.shape == x.shape
     assert torch.isfinite(out).all()
+
+
+@pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
+def test_numba_adaptation_kernel_is_bit_identical_to_scripted_loop():
+    """The Numba kernel is a hand transcription of ``_adaptation_loop_forward``.
+
+    Nothing in the type system keeps the two in lockstep, so this pins them: any
+    reassociation in either -- an FMA contraction, a reordered EMA -- compounds
+    through the feedback cascade and silently shifts every score. Bit equality, not
+    a tolerance, is the assertion, because that is what was measured when the kernel
+    landed and anything less would not be noticed until it was large.
+    """
+    fs = 24000.0
+    abs_thresh, gains, thresholds = auditory_model._get_adaptation_constants(fs, "cpu", torch.float64)
+
+    for rows, steps in ((7, 500), (27, 4000)):
+        flat = torch.rand(rows, steps, dtype=torch.float64, generator=torch.Generator().manual_seed(0)) * 1e-3
+
+        expected = auditory_model._adaptation_loop_forward(flat, thresholds, gains, abs_thresh)
+        frames = torch.clamp(flat, min=abs_thresh).t().contiguous()
+        actual = torch.from_numpy(auditory_model._numba_adaptation_loop(
+            frames.numpy(), thresholds.numpy(), gains.numpy()
+        )).t().contiguous()
+
+        assert torch.equal(actual, expected), (
+            f"numba/torch adaptation drift at ({rows}, {steps}): "
+            f"max|diff| = {(actual - expected).abs().max().item():.3e}"
+        )
+
+
+@pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
+def test_adaptation_dispatch_agrees_across_fast_and_fallback_paths(monkeypatch):
+    """The public entry point must not depend on whether the Numba path is taken."""
+    subbands = torch.rand(9, 3000, dtype=torch.float64, generator=torch.Generator().manual_seed(1)) * 1e-3
+
+    fast = simulate_auditory_nerve_adaptation(subbands, 24000.0)
+    monkeypatch.setattr(auditory_model, "_HAS_NUMBA", False)
+    fallback = simulate_auditory_nerve_adaptation(subbands, 24000.0)
+
+    assert torch.equal(fast, fallback)
+
+
+def test_adaptation_gradient_path_is_unaffected_by_the_fast_forward():
+    """The fast paths are forward-only; a grad-requiring input must still backprop."""
+    subbands = (torch.rand(4, 400, dtype=torch.float64, generator=torch.Generator().manual_seed(2)) * 1e-3)
+    subbands.requires_grad_(True)
+
+    simulate_auditory_nerve_adaptation(subbands, 24000.0).sum().backward()
+
+    assert subbands.grad is not None
+    assert torch.isfinite(subbands.grad).all()
+    assert subbands.grad.abs().max() > 0
