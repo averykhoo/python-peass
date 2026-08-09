@@ -239,12 +239,20 @@ therefore runs as a Numba kernel instead, which removes the dispatch entirely:
 | 1 s mono | 1.97 s | 0.85 s | 2.32x |
 | 5 s mono | 9.25 s | 4.24 s | 2.18x |
 
-Output is **bit-identical**, not merely close: the kernel is an operation-for-operation
-transcription of the torch loop (running product, divide, then `c*(1-g) + s*g` as two
-multiplies and an add, with `fastmath=False` denying LLVM the FMA contraction that
-would otherwise reassociate it). `torch.equal` holds on every measured shape, and all
-eight reported scores compare equal with `==`. `tests/unit/backend_torch/test_torch_auditory_model.py`
-pins the two implementations together so they cannot drift apart unnoticed.
+The kernel is an operation-for-operation transcription of the torch loop (running
+product, divide, then `c*(1-g) + s*g` as two multiplies and an add, with
+`fastmath=False` keeping LLVM from reassociating it). On the reference platform —
+Windows, CPython 3.10, torch 2.12.1+cpu, numba 0.65.1 — it is exactly **bit-identical**:
+`torch.equal` holds at every measured shape and all eight reported scores compare equal
+with `==`.
+
+That equality is not portable, and should not be relied on as an invariant. Whether a
+toolchain contracts `a*b + c` into a single FMA differs by LLVM and torch build; CPython
+3.14 was measured 1.8e-14 from this kernel where 3.10 was exactly equal. What holds
+everywhere is agreement to ~1e-14 relative, which is still fourteen orders below any
+real transcription error — a wrong stage ordering costs O(1). `tests/unit/backend_torch/test_torch_auditory_model.py`
+pins the two implementations together at that tolerance, with the measurements that set
+it recorded alongside.
 
 Any other case — CUDA/MPS, `float32`, a gradient-requiring input, or Numba not
 installed — falls back to the TorchScript loop, which is unchanged. Training is

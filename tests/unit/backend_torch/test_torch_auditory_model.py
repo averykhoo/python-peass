@@ -59,15 +59,39 @@ def test_haircell_scales_to_long_many_band_batches():
     assert torch.isfinite(out).all()
 
 
-@pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
-def test_numba_adaptation_kernel_is_bit_identical_to_scripted_loop():
-    """The Numba kernel is a hand transcription of ``_adaptation_loop_forward``.
+# Cross-implementation agreement tolerance for the adaptation recurrence.
+#
+# The Numba kernel is a hand transcription of the torch loop, and on the reference
+# platform (Windows, CPython 3.10, torch 2.12.1+cpu, numba 0.65.1) the two are exactly
+# bit-identical -- `torch.equal` holds at every shape measured. That is *not* portable,
+# and asserting it as though it were is what originally broke CI: on CPython 3.14 the
+# two diverged by 1.8e-14 absolute. Cross-implementation bit-equality depends on
+# whether the toolchain contracts `a*b + c` into an FMA, which differs by LLVM and torch
+# build. (Locally the kernel compiles to separate `vmulsd`/`vaddsd`, no FMA.)
+#
+# The tolerance is set from measurement, not taste. Perturbations of this recurrence
+# fall into two cleanly separated bands:
+#
+#   roundoff        FMA contraction ~2.6e-16 rel, algebraically-equal EMA
+#                   reassociation 1.5e-14 rel
+#   real bugs       using the updated state in the running product 4.4e+00 rel,
+#                   resetting the running product per stage 1.0e+00 rel
+#
+# Fourteen orders apart, so 1e-12 catches every transcription error while tolerating
+# every toolchain difference. Tightening this to exact equality does not buy accuracy,
+# it just re-breaks on the next compiler.
+_ADAPTATION_RTOL = 1e-12
+_ADAPTATION_ATOL = 1e-12
 
-    Nothing in the type system keeps the two in lockstep, so this pins them: any
-    reassociation in either -- an FMA contraction, a reordered EMA -- compounds
-    through the feedback cascade and silently shifts every score. Bit equality, not
-    a tolerance, is the assertion, because that is what was measured when the kernel
-    landed and anything less would not be noticed until it was large.
+
+@pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
+def test_numba_adaptation_kernel_matches_the_torch_loop():
+    """Pin the Numba kernel to ``_adaptation_loop_forward``.
+
+    Nothing in the type system keeps a hand transcription in lockstep with the loop it
+    transcribes, so this is what catches an index, stage or ordering slip -- each of
+    which lands at O(1) relative error through the feedback cascade, not near this
+    tolerance. See the note above for why it is a tolerance rather than bit equality.
     """
     fs = 24000.0
     abs_thresh, gains, thresholds = auditory_model._get_adaptation_constants(fs, "cpu", torch.float64)
@@ -81,9 +105,9 @@ def test_numba_adaptation_kernel_is_bit_identical_to_scripted_loop():
             frames.numpy(), thresholds.numpy(), gains.numpy()
         )).t().contiguous()
 
-        assert torch.equal(actual, expected), (
-            f"numba/torch adaptation drift at ({rows}, {steps}): "
-            f"max|diff| = {(actual - expected).abs().max().item():.3e}"
+        torch.testing.assert_close(
+            actual, expected, rtol=_ADAPTATION_RTOL, atol=_ADAPTATION_ATOL,
+            msg=lambda built: f"numba/torch adaptation drift at ({rows}, {steps}):\n{built}"
         )
 
 
@@ -96,7 +120,7 @@ def test_adaptation_dispatch_agrees_across_fast_and_fallback_paths(monkeypatch):
     monkeypatch.setattr(auditory_model, "_HAS_NUMBA", False)
     fallback = simulate_auditory_nerve_adaptation(subbands, 24000.0)
 
-    assert torch.equal(fast, fallback)
+    torch.testing.assert_close(fast, fallback, rtol=_ADAPTATION_RTOL, atol=_ADAPTATION_ATOL)
 
 
 def test_adaptation_gradient_path_is_unaffected_by_the_fast_forward():

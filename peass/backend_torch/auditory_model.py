@@ -33,10 +33,16 @@ try:
         ``frames`` is the already-clamped, already-transposed (num_steps, num_rows)
         view, so this kernel owns nothing but the recurrence itself. The operation
         order is deliberately identical to the torch version -- running product,
-        divide, then ``c*(1-g) + s*g`` as two multiplies and an add -- because the
-        cascade is a 120000-step feedback path where any reassociation compounds.
-        ``fastmath=False`` is what keeps that promise: it denies LLVM the FMA
-        contraction that would otherwise fold the multiply-add and drift.
+        divide, then ``c*(1-g) + s*g`` as two multiplies and an add -- and
+        ``fastmath=False`` keeps LLVM from reassociating it.
+
+        That buys exact bit-equality with the torch loop on the reference platform,
+        but do not read it as a portable guarantee: whether a toolchain contracts
+        ``a*b + c`` into an FMA varies by LLVM and torch build, and CPython 3.14 was
+        measured 1.8e-14 from this kernel where 3.10 was exactly equal. The agreement
+        that *is* portable is ~1e-14 relative, which is still fourteen orders below
+        any real transcription error -- see the tolerance note in
+        ``tests/unit/backend_torch/test_torch_auditory_model.py``.
 
         The win is not arithmetic, it is dispatch: the torch loop pays ~7 kernel
         launches per timestep on tensors holding one element per band, so it is

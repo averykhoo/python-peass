@@ -170,12 +170,24 @@ element per band, so wall clock tracked kernel launches, not arithmetic — 61.9
 torch runtime at 5 s. Running it as a Numba kernel removes the dispatch entirely
 (43-280x on the kernel in isolation, depending on shape).
 
-Bit-identical rather than merely close, because the kernel is an operation-for-operation
-transcription: running product over the previous step's state, divide, then
-`c*(1-g) + s*g` as two multiplies and an add, under `fastmath=False` so LLVM cannot
-contract the multiply-add into an FMA. The in-place state update is equivalent to
-torch's cumprod-then-update because each stage is folded into the running product
-*before* that stage is overwritten. `torch.equal` holds at every shape measured.
+The kernel is an operation-for-operation transcription: running product over the
+previous step's state, divide, then `c*(1-g) + s*g` as two multiplies and an add, under
+`fastmath=False` so LLVM does not reassociate it. The in-place state update is
+equivalent to torch's cumprod-then-update because each stage is folded into the running
+product *before* that stage is overwritten.
+
+On the reference platform this is exactly bit-identical (`torch.equal` at every shape
+measured). **That was over-claimed as universal and broke CI on CPython 3.14**, where
+the two diverge by 1.8e-14 — cross-implementation bit-equality depends on whether the
+toolchain contracts `a*b + c` into an FMA, which varies by LLVM and torch build. The
+local kernel compiles to separate `vmulsd`/`vaddsd`; a newer LLVM need not.
+
+The portable invariant, and what the test now asserts, is ~1e-12. That is not a
+weakening: measured, perturbations fall into two cleanly separated bands — roundoff
+(FMA contraction 2.6e-16 relative, algebraically-equal EMA reassociation 1.5e-14) and
+real transcription errors (using the updated state in the running product 4.4e+00,
+resetting the running product per stage 1.0e+00). Fourteen orders apart, so the
+tolerance catches every real bug and survives every toolchain.
 
 Gated on CPU + `float64` + no-grad + Numba present; everything else keeps the
 TorchScript loop. The differentiable path was not touched, so training is unaffected —
