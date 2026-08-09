@@ -83,6 +83,25 @@ def test_haircell_scales_to_long_many_band_batches():
 _ADAPTATION_RTOL = 1e-12
 _ADAPTATION_ATOL = 1e-12
 
+# The public entry point needs a looser bound than the raw kernel, and not because it
+# is any less exact -- it is the same roundoff, run through an amplifier.
+# ``simulate_auditory_nerve_adaptation`` finishes with
+#
+#     100/(1 - final_thresh) * (adapted - final_thresh),  final_thresh = 0.6978305849
+#
+# i.e. a 330.94x scale-up around a subtraction. Outputs span four orders (median 161,
+# minimum 0.024), and for the ~0.3% of samples that land near ``final_thresh`` the
+# cancellation shrinks the denominator until relative error is meaningless: CI measured
+# 7.9e-11 relative at a point whose output value is 0.036, from an absolute error of
+# 8.7e-15 in ``adapted`` -- the same 1-ULP roundoff the kernel test tolerates at 1e-12.
+#
+# So this bound is set on absolute error at the output scale: roundoff in ``adapted``
+# (~1e-14) times 330.94 is ~3e-12, and 1e-9 leaves ~300x margin. A real transcription
+# error is O(1) in ``adapted``, hence ~1e2 here -- caught by eleven orders. This is the
+# same cancellation the README already documents for the `artifacts` component.
+_ADAPTED_OUTPUT_RTOL = 1e-9
+_ADAPTED_OUTPUT_ATOL = 1e-9
+
 
 @pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
 def test_numba_adaptation_kernel_matches_the_torch_loop():
@@ -113,14 +132,18 @@ def test_numba_adaptation_kernel_matches_the_torch_loop():
 
 @pytest.mark.skipif(not auditory_model._HAS_NUMBA, reason="numba is an optional extra")
 def test_adaptation_dispatch_agrees_across_fast_and_fallback_paths(monkeypatch):
-    """The public entry point must not depend on whether the Numba path is taken."""
+    """The public entry point must not depend on whether the Numba path is taken.
+
+    Bounded at the output scale rather than relatively -- see the note above for why
+    the affine tail makes relative error unusable near ``final_thresh``.
+    """
     subbands = torch.rand(9, 3000, dtype=torch.float64, generator=torch.Generator().manual_seed(1)) * 1e-3
 
     fast = simulate_auditory_nerve_adaptation(subbands, 24000.0)
     monkeypatch.setattr(auditory_model, "_HAS_NUMBA", False)
     fallback = simulate_auditory_nerve_adaptation(subbands, 24000.0)
 
-    torch.testing.assert_close(fast, fallback, rtol=_ADAPTATION_RTOL, atol=_ADAPTATION_ATOL)
+    torch.testing.assert_close(fast, fallback, rtol=_ADAPTED_OUTPUT_RTOL, atol=_ADAPTED_OUTPUT_ATOL)
 
 
 def test_adaptation_gradient_path_is_unaffected_by_the_fast_forward():
