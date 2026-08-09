@@ -358,6 +358,31 @@ To run the test suite across multiple CPU cores using `pytest-xdist`, execute:
 pytest -n auto
 ```
 
+### What CI actually covers
+
+Worth knowing before trusting a green tick, because the two workflows differ sharply:
+
+| workflow | trigger | coverage |
+| --- | --- | --- |
+| `branch-tests.yml` | push to any non-`main` branch | ubuntu, **3.14 only** |
+| `pr-tests.yml` | pull request | ubuntu 3.10 / 3.12 / 3.14, ubuntu 3.14 **without Numba**, windows 3.14 |
+| `main-tests.yml` | push to `main` | ubuntu 3.14 |
+
+A green branch run is therefore weaker evidence than it looks. Two paths it cannot
+exercise at all:
+
+- **The TorchScript path.** `torch.jit.script` is unsupported on Python 3.14, so the
+  guarded scripting in `backend_torch/auditory_model.py` fails there and the eager
+  fallback runs. Only the PR job's 3.10 and 3.12 legs actually script the adaptation
+  loop — i.e. only a PR verifies the faster of the two fallback paths, and only a PR
+  can catch a `jit.script` deprecation warning escaping the scoped filter.
+- **The Numba-free fallback**, which only the `remove-numba` PR leg covers.
+
+Open a pull request before merging anything that touches those paths. As a bonus, the
+`remove-numba` leg doubles as an independent measurement of the Numba speedup: on
+identical hardware and interpreter it measured 185s against 76s, a 2.4x gap consistent
+with the 2.18-2.32x benchmarked locally.
+
 ---
 
 ## Known deviations from the MATLAB reference

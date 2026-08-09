@@ -3,6 +3,22 @@
 Open work only. Settled items — landed fixes, closed investigations, declined options —
 live in `ARCHIVE.md`.
 
+**Ground rules for performance work**, since they have decided every call so far and are
+not obvious from the code:
+
+1. **The library's own code spawns no threads, no subprocesses, no multiprocessing.**
+   Speed comes from efficiency — SIMD/AVX, better memory traffic, fewer allocations,
+   less redundant work, better algorithms. Numba `prange` was measured at 1.8x and
+   declined on exactly this basis (`ARCHIVE.md`). BLAS threading inherited from the
+   user's NumPy is a separate matter and is fine.
+2. **Bit-identical changes land; near-exact ones get documented instead.** That is why
+   the torch decomposition stack below is measured, prototyped, and still unlanded at
+   2.10-2.45x. If you want to change that bar, it is a decision to raise explicitly,
+   not to assume.
+3. **Measure, don't estimate** — and be careful what you claim from one machine. Two
+   entries in `ARCHIVE.md` exist because a platform-specific observation was written
+   down as a universal invariant.
+
 - train a different model on the peass data (which was removed in PR #3, commit `7ad923b3` on 2026-06-06 17:01)
   - get more data from https://www.audiolabs-erlangen.de/resources/2019-WASPAA-SEBASS
 - use peass decomposition as an ablation for haspi metrics
@@ -32,7 +48,8 @@ live in `ARCHIVE.md`.
   and ~30 min export for 2s of audio, re-exported per input length. Revisit only on a
   machine with a working inductor backend or a CUDA runtime. Note this is now much
   less urgent: the Numba kernel already delivers the fusion this item was chasing,
-  on the CPU path, with zero deviation.
+  on the CPU path, at ~1e-14 (exactly zero on the reference platform — see
+  `ARCHIVE.md` for why that is not a portable guarantee).
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);

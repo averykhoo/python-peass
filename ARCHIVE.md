@@ -75,6 +75,38 @@ implementation, plus dropping the `__post_init__` guard and its test.
 
 ## Closed investigations (do not reopen)
 
+### Two CI failures from over-claimed test invariants (2026-08-09)
+
+Both were defects in the *tests*, not the code, and both came from writing down a
+measurement taken on one machine as though it were a guarantee. Recorded because the
+failure mode is easy to repeat and the second one is genuinely subtle.
+
+**Bit-equality across toolchains.** The Numba adaptation kernel is exactly
+bit-identical to the torch loop on the reference platform, and the test asserted
+`torch.equal`. CI (Linux, CPython 3.14) failed at 1.8e-14: whether a toolchain
+contracts `a*b + c` into a single FMA varies by LLVM and torch build. The local kernel
+compiles to separate `vmulsd`/`vaddsd`; a newer LLVM need not. The fix is a tolerance
+chosen by measurement rather than taste — perturbations fall into two cleanly separated
+bands, roundoff (FMA contraction 2.6e-16 relative, algebraically-equal EMA
+reassociation 1.5e-14) and real transcription errors (updated state in the running
+product 4.4e+00, running product reset per stage 1.0e+00). Fourteen orders apart.
+
+**Relative tolerance across a cancellation.** The follow-up fix was still wrong for the
+*public entry point*, which failed at 7.9e-11 relative while the raw kernel passed.
+Not a second divergence — the same roundoff, amplified.
+`simulate_auditory_nerve_adaptation` ends with
+`100/(1 - final_thresh) * (adapted - final_thresh)` where `final_thresh` is
+0.6978305849: a 330.94x scale-up wrapped around a subtraction. Outputs span four orders
+(median 161, minimum 0.024), and for the ~0.3% of samples near `final_thresh` the
+cancellation shrinks the denominator until relative error is meaningless. The worst
+relative point had an output value of 0.036 and back-solved to an absolute error of
+8.7e-15 in `adapted` — the same 1-ULP roundoff the kernel test already tolerated.
+
+The lesson for this codebase specifically: **relative tolerance is the wrong instrument
+downstream of a subtraction of comparable quantities**, which this pipeline does in at
+least two places (here, and the `artifacts` component the README already documents).
+Bound those on absolute error at the output scale instead.
+
 ### Decomposition optimisations that measured worse, or not at all (2026-08-09)
 
 From a decomposition-focused profile of both backends. Each of these is the kind of
