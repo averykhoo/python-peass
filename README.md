@@ -226,11 +226,46 @@ non-linearities and IIR recursions of the reference with smooth, backprop-safe
 surrogates (softplus, FIR-truncated filters). As a result its outputs match the
 NumPy backend by high correlation rather than to floating-point precision.
 
+### PyTorch backend performance
+
+The auditory-nerve adaptation recurrence is sequential in time and tiny per step
+(one element per band), so in torch it is bound by kernel-launch latency rather
+than by arithmetic — roughly 7 dispatches per timestep, and a 5 s clip is 120000
+timesteps. On the common path (CPU, `float64`, no gradient required) the recurrence
+therefore runs as a Numba kernel instead, which removes the dispatch entirely:
+
+| clip | before | after | speedup |
+| --- | --- | --- | --- |
+| 1 s mono | 1.97 s | 0.85 s | 2.32x |
+| 5 s mono | 9.25 s | 4.24 s | 2.18x |
+
+Output is **bit-identical**, not merely close: the kernel is an operation-for-operation
+transcription of the torch loop (running product, divide, then `c*(1-g) + s*g` as two
+multiplies and an add, with `fastmath=False` denying LLVM the FMA contraction that
+would otherwise reassociate it). `torch.equal` holds on every measured shape, and all
+eight reported scores compare equal with `==`. `tests/unit/backend_torch/test_torch_auditory_model.py`
+pins the two implementations together so they cannot drift apart unnoticed.
+
+Any other case — CUDA/MPS, `float32`, a gradient-requiring input, or Numba not
+installed — falls back to the TorchScript loop, which is unchanged. Training is
+unaffected: the differentiable path was never touched.
+
 ### NumPy backend performance and numerical reproducibility
 
-The NumPy backend carries a few single-threaded optimizations (no threads or
-subprocesses are spawned; the speedup comes from SIMD and from removing per-call
-overhead). Worth ~1.2x end-to-end on the reference example:
+The NumPy backend carries a few single-threaded optimizations: **this package's own
+code spawns no threads and no subprocesses**, and the speedup comes from SIMD and from
+removing per-call overhead. That is a deliberate constraint — see `ARCHIVE.md` for the
+Numba `prange` work that was declined under it despite measuring 1.8x.
+
+To be precise about what that does and does not promise: BLAS threading is inherited
+from whatever NumPy you installed, and is *not* covered by it. On a stock MKL build
+this backend already runs multi-threaded inside BLAS — measured cpu/wall of 3.86 on a
+900x900 dgemm and 4.05 on the small gemms the least-squares loop issues, dropping to
+~0.9 under `MKL_NUM_THREADS=1`. If you need genuine single-threaded execution, set that
+environment variable; the package will not do it for you. Worth knowing that the tiny
+least-squares gemms measured *faster* at one thread than at four.
+
+The optimizations are worth ~1.2x end-to-end on the reference example:
 
 | change | speedup contribution | bitwise effect |
 | --- | --- | --- |
@@ -239,6 +274,24 @@ overhead). Worth ~1.2x end-to-end on the reference example:
 | sources pre-padded once instead of a per-frame `np.vstack` | — | **bit-identical** |
 | hoisted the conjugate transpose that was built twice per frame | — | **bit-identical** |
 | one block-diagonal matmul instead of one per source | — | ~1 ULP (1.9e-15) |
+| batched per-band Gram/RHS build instead of per frame | ~1.15x | **bit-identical** |
+| analysis modulation matrix cached and shared with synthesis | ~1.18x | **bit-identical** |
+
+The last two landed later (2026-08-09) and are worth a further ~1.28-1.32x on the
+decomposition between them. Both are bitwise exact, verified byte-level (a `uint8`
+view, so signed zeros count) across seven configurations — mono, two-stage, 3-source,
+all-silent, half-silent, stereo, and a 0.1 s clip.
+
+Batching is bitwise rather than merely close because stacked `matmul` dispatches the
+same per-frame GEMM shapes and layouts, so nothing is reassociated; the win is not the
+matmul at all but the ~64% of per-frame cost that was Python and NumPy call overhead.
+Keeping it exact meant preserving three things that look redundant: the silence bypass
+writes explicit zeros (letting `toeplitz @ 0` stand in is numerically equal but can
+yield `-0.0`), the analysis and synthesis window multiplies stay separate rather than
+folding into one factor, and the synthesis modulation matrix recomputes column `t = 0`
+directly instead of conjugating it — at `t = 0` the exponent's sign is multiplied away,
+so both directions give `1+0j` and conjugation returns `1-0j`: equal in value, wrong in
+bits.
 
 None of these is an approximation: every one computes the same quantity in exact
 arithmetic. Two of them reassociate floating-point sums, and floating-point addition
@@ -269,10 +322,25 @@ but measures ~5% **slower** than SciPy, so it loses both ways, and it requires
 clearing Numba's on-disk cache to take effect.
 
 Note that this backend was never bitwise reproducible *across machines*: any BLAS
-build or CPU that reassociates differently is subject to the same ~1e-10 amplification,
-because the per-frame least-squares systems are ill-conditioned (regularized at only
-1e-15). Treat ~1e-10 as the backend's reproducibility floor rather than expecting
-exactness.
+build or CPU that reassociates differently is subject to the same amplification. Treat
+~1e-10 as the backend's reproducibility floor rather than expecting exactness.
+
+**Re-measured 2026-08-09 — the figures above are stale.** They predate the MATLAB-parity
+correctness fixes (ERB form, shade window shape and length, resampler gain offset), and
+they no longer reproduce. Profiled over all 2338 real frames of the mono two-source
+example, the per-frame systems are **well**-conditioned: median condition number 900,
+p99 2.5e5, max 1.8e6, and not a single frame above 1e8 — so the "ill-conditioned
+systems" explanation no longer describes this code. (The torch backend's Gram measures
+the same 1.8e6 maximum independently.) On that configuration the Numba kernels now sit
+3.1e-15 from the `USE_NUMBA_RESAMPLER = False` SciPy path, four orders tighter than the
+~2e-11 quoted above.
+
+The amplification is also strongly *configuration*-dependent. The larger figures belong
+to the multi-source stereo case, where the sensitivity comes from *correlated sources* —
+six correlated Toeplitz columns — rather than from any frame being intrinsically
+ill-conditioned. Keep ~1e-10 as the floor to design against for multi-source stereo, but
+expect ~1e-15 on simple mono material, and do not reach for the `1e-15` diagonal
+regularization as though every frame needed it.
 
 ### Parallel Execution
 
