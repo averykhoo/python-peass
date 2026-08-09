@@ -3,8 +3,10 @@ PEASS PyTorch Auditory Nerve Model
 File path: peass/backend_torch/auditory_model.py
 """
 import math
+import warnings
 from functools import lru_cache
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -12,6 +14,68 @@ from .gammatone import GammatoneAnalyzerTorch
 from .utils import fast_resample_poly_torch
 from .utils import next_fast_fft_length
 from ..config import ModulationProcessingType
+
+# -----------------------------------------------------------------------------
+# NUMBA JIT COMPILATION (WITH SAFE IMPORT FALLBACK)
+# -----------------------------------------------------------------------------
+# Mirrors the numpy backend's idiom: numba is an optional extra, so the kernel is
+# defined only if it imports, and every call site keeps a working torch fallback.
+try:
+    import numba
+
+    _HAS_NUMBA = True
+
+
+    @numba.njit(cache=True, fastmath=False)
+    def _numba_adaptation_loop(frames: np.ndarray, thresholds: np.ndarray, gains: np.ndarray) -> np.ndarray:
+        """Native transcription of ``_adaptation_loop_forward``'s inner loop.
+
+        ``frames`` is the already-clamped, already-transposed (num_steps, num_rows)
+        view, so this kernel owns nothing but the recurrence itself. The operation
+        order is deliberately identical to the torch version -- running product,
+        divide, then ``c*(1-g) + s*g`` as two multiplies and an add -- and
+        ``fastmath=False`` keeps LLVM from reassociating it.
+
+        That buys exact bit-equality with the torch loop on the reference platform,
+        but do not read it as a portable guarantee: whether a toolchain contracts
+        ``a*b + c`` into an FMA varies by LLVM and torch build, and CPython 3.14 was
+        measured 1.8e-14 from this kernel where 3.10 was exactly equal. The agreement
+        that *is* portable is ~1e-14 relative, which is still fourteen orders below
+        any real transcription error -- see the tolerance note in
+        ``tests/unit/backend_torch/test_torch_auditory_model.py``.
+
+        The win is not arithmetic, it is dispatch: the torch loop pays ~7 kernel
+        launches per timestep on tensors holding one element per band, so it is
+        latency-bound on the dispatcher rather than on FLOPs.
+        """
+        num_steps, num_rows = frames.shape
+        state = np.empty((5, num_rows), dtype=frames.dtype)
+        for stage_idx in range(5):
+            for row_idx in range(num_rows):
+                state[stage_idx, row_idx] = thresholds[stage_idx]
+
+        input_weight = 1.0 - gains
+
+        outputs = np.empty((num_steps, num_rows), dtype=frames.dtype)
+        for step_idx in range(num_steps):
+            for row_idx in range(num_rows):
+                floored = frames[step_idx, row_idx]
+                # Running product over the *previous* step's state. Each stage is
+                # folded in before that stage is overwritten, which is what makes
+                # the in-place update equivalent to torch's cumprod-then-update.
+                running_product = 1.0
+                compressed = 0.0
+                for stage_idx in range(5):
+                    running_product *= state[stage_idx, row_idx]
+                    compressed = floored / running_product
+                    updated = compressed * input_weight[stage_idx] + state[stage_idx, row_idx] * gains[stage_idx]
+                    state[stage_idx, row_idx] = max(updated, thresholds[stage_idx])
+                outputs[step_idx, row_idx] = compressed
+
+        return outputs
+
+except ImportError:
+    _HAS_NUMBA = False
 
 
 @lru_cache(maxsize=4)
@@ -74,7 +138,6 @@ def simulate_inner_haircell_transduction(subbands: torch.Tensor, fs: float) -> t
     return transduced.view(*orig_shape)
 
 
-@torch.jit.script
 def _straight_through_max(value: torch.Tensor, floor: torch.Tensor) -> torch.Tensor:
     """max(value, floor) in the forward pass, softplus gradient in the backward.
 
@@ -95,7 +158,6 @@ def _straight_through_max(value: torch.Tensor, floor: torch.Tensor) -> torch.Ten
     return hard.detach() + (soft - soft.detach())
 
 
-@torch.jit.script
 def _raw_adaptation_loop(subbands_flat: torch.Tensor, thresholds: torch.Tensor, gains: torch.Tensor,
                          abs_thresh: float) -> torch.Tensor:
     """Differentiable 5-stage adaptation recurrence (straight-through max).
@@ -124,7 +186,6 @@ def _raw_adaptation_loop(subbands_flat: torch.Tensor, thresholds: torch.Tensor, 
     return torch.stack(outputs, dim=1)
 
 
-@torch.jit.script
 def _adaptation_loop_forward(subbands_flat: torch.Tensor, thresholds: torch.Tensor, gains: torch.Tensor,
                              abs_thresh: float) -> torch.Tensor:
     """Gradient-free 5-stage adaptation recurrence.
@@ -171,6 +232,30 @@ def _adaptation_loop_forward(subbands_flat: torch.Tensor, thresholds: torch.Tens
     return outputs.t().contiguous()
 
 
+# TorchScript is deprecated in favour of torch.compile/torch.export, but neither is
+# usable here: inductor's CPU backend needs an MSVC/GCC toolchain that is not a
+# reasonable install requirement, and torch.export fully unrolls this loop at ~9
+# graph nodes per timestep (~437k nodes for 2s of audio, re-exported per input
+# length). Scripting is still worth ~2x on this function, so it stays until a
+# replacement actually exists. The two other loops in this module were scripted for
+# ~1.05x -- inside noise -- and have been dropped rather than carry the warning.
+#
+# Applied as a call rather than a decorator purely so the deprecation filter can be
+# scoped to this one site instead of silencing the category process-wide.
+#
+# Guarded because torch documents jit.script as unsupported on Python 3.14+ ("may
+# break"), and this runs at import time -- an unguarded failure here would take the
+# whole backend down rather than costing some speed. The plain Python function is a
+# correct, if slower, stand-in, and on the common CPU/float64 path the Numba kernel
+# above means this fallback is not even on the hot path.
+try:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=r".*torch\.jit\.script.*", category=DeprecationWarning)
+        _adaptation_loop_forward = torch.jit.script(_adaptation_loop_forward)
+except Exception:  # pragma: no cover - depends on the interpreter/torch combination
+    pass
+
+
 def simulate_auditory_nerve_adaptation(subbands: torch.Tensor, fs: float) -> torch.Tensor:
     abs_thresh, gains, thresholds = _get_adaptation_constants(fs, str(subbands.device), subbands.dtype)
 
@@ -180,6 +265,17 @@ def simulate_auditory_nerve_adaptation(subbands: torch.Tensor, fs: float) -> tor
     flat = subbands.reshape(-1, T)
     if torch.is_grad_enabled() and flat.requires_grad:
         adapted = _raw_adaptation_loop(flat, thresholds, gains, abs_thresh)
+    elif _HAS_NUMBA and flat.device.type == "cpu" and flat.dtype == torch.float64:
+        # The recurrence is sequential in time and tiny per step (one element per
+        # band), so the torch path is bound by kernel-launch latency, not by work.
+        # A native kernel removes the dispatch entirely; the clamp and transpose stay
+        # in torch so the kernel receives exactly the buffer the scripted loop would.
+        frames = torch.clamp(flat, min=abs_thresh).t().contiguous()
+        adapted = torch.from_numpy(_numba_adaptation_loop(
+            frames.numpy(),
+            thresholds.numpy(),
+            gains.numpy(),
+        )).t().contiguous()
     else:
         adapted = _adaptation_loop_forward(flat, thresholds, gains, abs_thresh)
     adapted = adapted.view(*orig_shape)

@@ -126,6 +126,14 @@ def perform_least_squares_projection(
     Weighted least-squares projection of source estimate onto source subspaces.
     Executes entirely in BLAS/LAPACK without explicitly allocating massive memory blocks.
 
+    This is the single-frame reference statement of the projection. The decomposition
+    itself no longer calls it per frame -- ``perform_time_varying_least_squares_projection``
+    below runs the identical arithmetic a batch of frames at a time -- but it is kept as
+    the readable definition, and the torch backend is diffed against it frame by frame in
+    ``tests/regression/test_differential_numpy_vs_torch.py``. Any change here has to be
+    mirrored there, which
+    ``test_batched_projection_matches_single_frame_bitwise`` enforces.
+
     Solver note: this calls LAPACK ``?posv`` directly rather than
     ``scipy.linalg.solve(..., assume_a='pos')``. It is the same Cholesky solve and is
     bitwise identical, but SciPy's per-call input validation and condition-number
@@ -223,6 +231,15 @@ def perform_least_squares_projection(
     return stacked.reshape(num_samples, num_sources, num_channels).transpose(0, 2, 1)
 
 
+# Frames solved per batched Gram/RHS build. The stacked Toeplitz buffer is
+# BATCH x window_length x (num_sources*filter_length) complex; what matters is that
+# this makes its footprint independent of clip length, since without it a 60 s clip
+# would stack ~3000 frames per band at once. Measured on the two-source reference
+# example the stack peaks at 12.6 MB, or ~38 MB counting the transient conjugate and
+# windowed copies that feed the two matmuls, and it scales with num_sources.
+LEAST_SQUARES_FRAME_BATCH = 256
+
+
 def perform_time_varying_least_squares_projection(
         source_estimates: np.ndarray,
         true_sources: np.ndarray,
@@ -232,6 +249,22 @@ def perform_time_varying_least_squares_projection(
 ) -> np.ndarray:
     r"""
     Time-varying least-squares subband decomposer.
+
+    Frames are built and solved in batches rather than one at a time. Every frame in a
+    band shares ``window_length`` and ``filter_length``, so the band's whole Toeplitz
+    stack is a single strided gather and the Gram/RHS products collapse into two
+    batched ``matmul`` calls; only the small Cholesky solves stay in a Python loop.
+    Worth ~1.15x on the decomposition, and the win is *not* the matmul -- measured per
+    frame, roughly two thirds of the cost was per-frame Python and NumPy call overhead
+    (the ``as_strided``/``hstack`` Toeplitz build alone was ~24%), which batching
+    removes.
+
+    This is **bitwise** identical to solving frame by frame: stacked ``matmul``
+    dispatches the same per-frame GEMM shapes and memory layouts, so nothing is
+    reassociated. ``perform_least_squares_projection`` above remains the single-frame
+    statement of the same arithmetic -- it is the reference implementation and the
+    oracle the torch backend is diffed against -- and
+    ``test_batched_projection_matches_single_frame_bitwise`` pins the two together.
     """
     filter_half_length = (filter_length - 1) // 2
     if (filter_length - 1) % 2 != 0:
@@ -248,14 +281,6 @@ def perform_time_varying_least_squares_projection(
     analysis_window = np.sqrt(np.flipud(hann_window))
     synthesis_window = np.sqrt(np.flipud(hann_window))
 
-    synthesis_weights = np.zeros((window_length, num_channels, num_sources))
-    for channel_idx in range(num_channels):
-        for source_idx in range(num_sources):
-            synthesis_weights[:, channel_idx, source_idx] = synthesis_window
-
-    window_begin = 0
-    window_end = window_begin + window_length
-
     projections_accumulation = np.zeros(
         (total_samples, num_channels, num_sources),
         dtype=true_sources.dtype
@@ -269,21 +294,138 @@ def perform_time_varying_least_squares_projection(
     padded_sources = np.vstack([edge_padding, true_sources, edge_padding])
     frame_source_length = window_length + 2 * filter_half_length
 
+    window_begin = 0
+    window_end = window_begin + window_length
+    frame_starts = []
     while window_end - window_length / 2.0 <= projections_accumulation.shape[0] - window_length + 1:
-        frame_estimates = source_estimates[window_begin:window_end, :]
-        frame_sources = padded_sources[window_begin:window_begin + frame_source_length, :]
-
-        frame_projections = perform_least_squares_projection(
-            frame_estimates, frame_sources, filter_half_length, analysis_window
-        )
-
-        projections_accumulation[window_begin:window_end, :, :] += (
-                frame_projections[:window_length, :, :] * synthesis_weights
-        )
-        window_gain_accumulation[window_begin:window_end, 0] += synthesis_window * analysis_window
-
+        frame_starts.append(window_begin)
         window_begin += hop_size
         window_end += hop_size
+
+    if not frame_starts:
+        return projections_accumulation[:-(window_length - 1), :, :]
+
+    window_sq = (analysis_window ** 2)[:, np.newaxis]
+    # The per-frame loop recomputed this product on every iteration.
+    frame_window_gain = synthesis_window * analysis_window
+    stacked_width = num_sources * filter_length
+
+    # Per-source contiguous columns, so the stacked Toeplitz is a pure stride trick:
+    # view[frame, sample, tap] = column[frame*hop_size + sample + tap]. Gathering from
+    # a column of `padded_sources` directly would work too, just with a wider stride;
+    # the copied values -- and therefore every downstream rounding -- are the same.
+    source_columns = [np.ascontiguousarray(padded_sources[:, idx]) for idx in range(num_sources)]
+    element_stride = source_columns[0].strides[0]
+    # Flat C-order view of the same buffer, used to evaluate the silence bypass for a
+    # whole batch in one reduction.
+    flat_sources = padded_sources.reshape(-1)
+
+    for batch_start in range(0, len(frame_starts), LEAST_SQUARES_FRAME_BATCH):
+        batch_starts = frame_starts[batch_start:batch_start + LEAST_SQUARES_FRAME_BATCH]
+        num_frames = len(batch_starts)
+        first_start = batch_starts[0]
+
+        # --- SILENCE BYPASS OPTIMIZATION (batched) ---
+        # Each row below is one frame's (frame_source_length x num_sources) source
+        # block laid out in C order, i.e. exactly the buffer the per-frame code reduced
+        # with `np.sum(true_sources.real**2 + true_sources.imag**2)`. Same elements in
+        # the same order, so the pairwise summation -- and hence the threshold decision
+        # -- is unchanged.
+        source_blocks = np.lib.stride_tricks.as_strided(
+            flat_sources[first_start * num_sources:],
+            shape=(num_frames, frame_source_length * num_sources),
+            strides=(hop_size * num_sources * element_stride, element_stride),
+            writeable=False
+        )
+        if np.iscomplexobj(source_blocks):
+            frame_energy = np.sum(source_blocks.real ** 2 + source_blocks.imag ** 2, axis=1)
+        else:
+            frame_energy = np.sum(source_blocks ** 2, axis=1)
+        frame_is_live = frame_energy >= 1e-13
+
+        if not frame_is_live.any():
+            # Every frame in this batch projects to exact zeros; only the window gain
+            # still has to be accumulated.
+            for window_begin in batch_starts:
+                window_gain_accumulation[window_begin:window_begin + window_length, 0] += frame_window_gain
+            continue
+
+        toeplitz_stack = np.empty(
+            (num_frames, window_length, stacked_width), dtype=padded_sources.dtype
+        )
+        for source_idx in range(num_sources):
+            strided_view = np.lib.stride_tricks.as_strided(
+                source_columns[source_idx][first_start:],
+                shape=(num_frames, window_length, filter_length),
+                strides=(hop_size * element_stride, element_stride, element_stride),
+                writeable=False
+            )
+            # Reverse each row to match toeplitz(col, row) semantics perfectly
+            toeplitz_stack[:, :, source_idx * filter_length:(source_idx + 1) * filter_length] = (
+                strided_view[:, :, ::-1]
+            )
+
+        estimate_frames = np.lib.stride_tricks.as_strided(
+            source_estimates[first_start:],
+            shape=(num_frames, window_length, num_channels),
+            strides=(hop_size * source_estimates.strides[0],
+                     source_estimates.strides[0], source_estimates.strides[1]),
+            writeable=False
+        )
+
+        # Build the conjugate transpose once; it feeds both the Gram and the RHS.
+        conjugate_transpose = toeplitz_stack.conj().transpose(0, 2, 1)
+        gram_matrices = conjugate_transpose @ (window_sq * toeplitz_stack)
+        rhs_vectors = conjugate_transpose @ (window_sq * estimate_frames)
+
+        # In-place diagonal regularization, one diagonal per stacked matrix
+        regularization_lambda = 10.0 ** -15
+        gram_matrices.reshape(num_frames, -1)[:, ::stacked_width + 1] += regularization_lambda
+
+        posv = _get_posv(gram_matrices.dtype)
+        block_diagonal_weights = np.zeros(
+            (num_frames, stacked_width, num_sources * num_channels), dtype=gram_matrices.dtype
+        )
+        for frame_idx in range(num_frames):
+            if not frame_is_live[frame_idx]:
+                continue
+            _, projection_weights, info = posv(
+                gram_matrices[frame_idx], rhs_vectors[frame_idx],
+                lower=False, overwrite_a=False, overwrite_b=False
+            )
+            if info != 0:
+                # Fallback to pseudo-inverse if singular or highly ill-conditioned
+                weighted_toeplitz = toeplitz_stack[frame_idx] * analysis_window[:, np.newaxis]
+                weighted_estimates = estimate_frames[frame_idx] * analysis_window[:, np.newaxis]
+                projection_weights = linalg.pinv(weighted_toeplitz) @ weighted_estimates
+            for source_idx in range(num_sources):
+                block_diagonal_weights[
+                    frame_idx,
+                    source_idx * filter_length: (source_idx + 1) * filter_length,
+                    source_idx * num_channels: (source_idx + 1) * num_channels
+                ] = projection_weights[source_idx * filter_length: (source_idx + 1) * filter_length, :]
+
+        frame_projections = toeplitz_stack @ block_diagonal_weights
+        # A bypassed frame contributes a literal `np.zeros(...)` in the per-frame code.
+        # Leaving it to `toeplitz @ 0` would be numerically equal but can yield -0.0
+        # (0.0 * negative), so write the zeros explicitly and keep even the sign of
+        # zero identical.
+        frame_projections[~frame_is_live] = 0.0
+        frame_projections *= analysis_window[:, np.newaxis]
+        # Second, separate multiply by the synthesis window. The per-frame code applies
+        # the analysis window inside the projection and the synthesis window during the
+        # overlap-add; collapsing them into one `analysis*synthesis` factor would round
+        # differently, so the two multiplies stay distinct.
+        frame_projections *= synthesis_window[:, np.newaxis]
+        frame_projections = frame_projections.reshape(
+            num_frames, window_length, num_sources, num_channels
+        )
+
+        for frame_idx, window_begin in enumerate(batch_starts):
+            projections_accumulation[window_begin:window_begin + window_length, :, :] += (
+                frame_projections[frame_idx].transpose(0, 2, 1)
+            )
+            window_gain_accumulation[window_begin:window_begin + window_length, 0] += frame_window_gain
 
     valid_indices = (window_gain_accumulation[:, 0] != 0)
     for source_idx in range(num_sources):
@@ -398,11 +540,16 @@ def run_auditory_analysis_filterbank(
     num_bands = subbands_output.shape[0]
 
     if modulation_matrix is None:
-        time_steps = np.arange(subbands_output.shape[1])
-        center_frequencies = analyzer.center_frequencies[:, np.newaxis]
-        modulation_matrix = np.exp(-2j * np.pi / sampling_frequency_hz * center_frequencies * time_steps)
+        # Cached, and shared with synthesis: `get_synthesis_modulation_matrix` reuses
+        # this matrix by conjugation rather than running np.exp a second time.
+        modulation_matrix = get_analysis_modulation_matrix(
+            sampling_frequency_hz, subbands_output.shape[1], analyzer.center_frequencies
+        )
 
-    subbands_output = subbands_output * modulation_matrix
+    # In-place: `process` hands back a freshly allocated complex buffer that nothing
+    # else holds a reference to, so this saves an allocation and a full copy of a
+    # (bands x samples) complex128 array without changing a single rounding.
+    subbands_output *= modulation_matrix
 
     equivalent_bandwidths = calculate_equivalent_rectangular_bandwidth(analyzer.center_frequencies)
     decimation_alpha = 2.0
@@ -433,21 +580,52 @@ def run_auditory_analysis_filterbank(
 
 
 # -----------------------------------------------------------------------------
-# SYNTHESIS MODULATION MATRIX CACHE (Using functools.lru_cache)
+# MODULATION MATRIX CACHE
 # -----------------------------------------------------------------------------
+#
+# Analysis demodulates each band by exp(-i*w*t) and synthesis remodulates it by
+# exp(+i*w*t) at the same centre frequencies and rate, so the two matrices are exact
+# conjugates -- and *bitwise* so, because `-2j*pi/fs*f*t` is the exact IEEE negation of
+# `2j*pi/fs*f*t` and cos/sin are exactly even/odd about zero. Synthesis needs a few
+# hundred columns more than analysis (each band is padded up to a whole number of
+# decimated samples), so it conjugates the analysis matrix and only calls np.exp on the
+# overhang. On a 5 s clip that turns a ~0.35 s np.exp over a (bands x samples) grid into
+# a ~0.03 s conjugation; the matrix build was 11.5% of the decomposition.
+#
+# The cache is a plain dict rather than lru_cache because the synthesis lookup has to
+# find an analysis entry of a *different* length, which lru_cache cannot express. It is
+# bounded for the same reason the old lru_cache was: every entry is a full
+# (num_bands x num_samples) complex matrix, so a long-lived process scoring many
+# different-length signals must not accumulate them.
+_MODULATION_MATRIX_CACHE: dict[tuple, np.ndarray] = {}
+_MODULATION_MATRIX_CACHE_SIZE = 4
 
-# Bounded cache: keyed on signal length, so each distinct length holds a full
-# (num_bands x max_samples) complex matrix. Cap it so long-lived processes that
-# score many different-length signals don't accumulate unbounded memory.
-@lru_cache(maxsize=8)
-def _get_synthesis_modulation_matrix_cached(
+
+def _store_modulation_matrix(cache_key: tuple, matrix: np.ndarray) -> np.ndarray:
+    """Insert into the bounded modulation cache, evicting in insertion order."""
+    while len(_MODULATION_MATRIX_CACHE) >= _MODULATION_MATRIX_CACHE_SIZE:
+        _MODULATION_MATRIX_CACHE.pop(next(iter(_MODULATION_MATRIX_CACHE)))
+    _MODULATION_MATRIX_CACHE[cache_key] = matrix
+    return matrix
+
+
+def get_analysis_modulation_matrix(
         sampling_frequency: float,
         max_samples_length: int,
-        center_frequencies_tuple: tuple
+        center_frequencies: np.ndarray
 ) -> np.ndarray:
-    center_frequencies = np.array(center_frequencies_tuple)
+    """Cached ``exp(-2j*pi*f/fs * t)`` for ``t = 0 .. max_samples_length - 1``."""
+    center_frequencies = np.asarray(center_frequencies)
+    cache_key = ('analysis', sampling_frequency, tuple(center_frequencies))
+    cached = _MODULATION_MATRIX_CACHE.get(cache_key)
+    # Only an exact length hit is reused: slicing a longer matrix would hand back a
+    # non-contiguous view, and the caller multiplies a whole subband block by it.
+    if cached is not None and cached.shape[1] == max_samples_length:
+        return cached
+
     time_steps = np.arange(max_samples_length)
-    return np.exp(2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
+    matrix = np.exp(-2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps)
+    return _store_modulation_matrix(cache_key, matrix)
 
 
 def get_synthesis_modulation_matrix(
@@ -455,12 +633,51 @@ def get_synthesis_modulation_matrix(
         max_samples_length: int,
         center_frequencies: np.ndarray
 ) -> np.ndarray:
-    """Helper to lazily compute and cache the synthesis modulation matrix."""
-    return _get_synthesis_modulation_matrix_cached(
-        sampling_frequency,
-        max_samples_length,
-        tuple(center_frequencies)
-    )
+    """
+    Cached ``exp(+2j*pi*f/fs * t)`` for ``t = 0 .. max_samples_length - 1``, derived
+    from the analysis matrix by conjugation wherever the two overlap (see above).
+    """
+    center_frequencies = np.asarray(center_frequencies)
+    frequencies_key = tuple(center_frequencies)
+    cache_key = ('synthesis', sampling_frequency, frequencies_key)
+    cached = _MODULATION_MATRIX_CACHE.get(cache_key)
+    if cached is not None and cached.shape[1] == max_samples_length:
+        return cached
+
+    matrix = np.empty((center_frequencies.size, max_samples_length), dtype=complex)
+    analysis_matrix = _MODULATION_MATRIX_CACHE.get(('analysis', sampling_frequency, frequencies_key))
+    shared_length = 0 if analysis_matrix is None else min(max_samples_length, analysis_matrix.shape[1])
+    if shared_length > 0:
+        np.conjugate(analysis_matrix[:, :shared_length], out=matrix[:, :shared_length])
+        # t = 0 is the one column conjugation gets "wrong". Both directions evaluate
+        # exp(0+0j) = 1+0j there -- the sign of the exponent has been multiplied away --
+        # so conjugating yields 1-0j: equal in value, different bit pattern from the
+        # +0.0 a direct np.exp leaves behind. Every t >= 1 column really is an exact
+        # conjugate, because the two arguments are exact IEEE negations and cos/sin are
+        # exactly even/odd.
+        #
+        # To be clear about why this recompute exists: it is *not* needed for
+        # correctness. Measured, feeding the -0.0 column straight through leaves all
+        # four output components byte-identical and every score unchanged -- the
+        # +-0.0 cross terms in the complex multiply are absorbed by addition, and
+        # nothing downstream divides by these values or takes a branch cut (angle/log/
+        # complex sqrt) where a zero's sign would survive. It exists so that
+        # "bit-identical" stays literally true and checkable by a one-line byte
+        # comparison, instead of degrading to "value-identical modulo signed zeros",
+        # which no test can assert cheaply and which would have to be re-argued by hand
+        # every time a new consumer of this matrix appears. It costs one np.exp over a
+        # single column per cache miss.
+        matrix[:, :1] = np.exp(
+            2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * np.arange(1)
+        )
+    if shared_length < max_samples_length:
+        # `arange(a, b)` and `arange(b)[a:]` hold the same exactly-representable
+        # integers, so the tail rounds identically to a full-length np.exp.
+        time_steps = np.arange(shared_length, max_samples_length)
+        matrix[:, shared_length:] = np.exp(
+            2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps
+        )
+    return _store_modulation_matrix(cache_key, matrix)
 
 
 def run_auditory_synthesis_filterbank(
@@ -501,8 +718,10 @@ def run_auditory_synthesis_filterbank(
             else:
                 processed_subbands[band_idx, :curr_len] = upsampled_subband
 
-    # Retrieve cached modulation matrix to bypass np.exp re-calculations
-    processed_subbands = processed_subbands * get_synthesis_modulation_matrix(
+    # Retrieve cached modulation matrix to bypass np.exp re-calculations. Multiplied
+    # in place -- `processed_subbands` is the local zero-filled buffer from above, and
+    # the cached matrix is only ever read, so the cache entry is not disturbed.
+    processed_subbands *= get_synthesis_modulation_matrix(
         sampling_frequency, max_samples_length, analyzer.center_frequencies
     )
 

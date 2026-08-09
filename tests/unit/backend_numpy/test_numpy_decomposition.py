@@ -7,11 +7,17 @@ import pathlib
 
 import numpy as np
 import pytest
+import scipy.signal as signal
 
+from peass.backend_numpy import decomposition as decomposition_module
 from peass.backend_numpy.decomposition import DecompositionConfiguration
 from peass.backend_numpy.decomposition import decompose_distortion_components
+from peass.backend_numpy.decomposition import get_analysis_modulation_matrix
+from peass.backend_numpy.decomposition import get_synthesis_modulation_matrix
 from peass.backend_numpy.decomposition import matlab_shade_length
 from peass.backend_numpy.decomposition import matlab_shade_window
+from peass.backend_numpy.decomposition import perform_least_squares_projection
+from peass.backend_numpy.decomposition import perform_time_varying_least_squares_projection
 from peass.backend_numpy.decomposition import run_auditory_analysis_filterbank
 from peass.backend_numpy.decomposition import run_auditory_synthesis_filterbank
 
@@ -288,3 +294,279 @@ def test_decomposition_in_bounds_delay_parameterized(synthetic_signal):
     # on transient edges, which is physically correct.
     assert np.max(np.abs(waveforms.interference)) < 5e-2
     assert np.max(np.abs(waveforms.artifacts)) < 5e-2
+
+
+def time_varying_projection_frame_by_frame_reference(
+        source_estimates: np.ndarray,
+        true_sources: np.ndarray,
+        filter_length: int,
+        window_length: int,
+        hop_size: int
+) -> np.ndarray:
+    """
+    Literal frame-at-a-time transcription of the time-varying projection, driving the
+    single-frame `perform_least_squares_projection` exactly as the production code did
+    before the per-band batching landed. This is the oracle that pins the batched
+    implementation to bitwise parity.
+    """
+    filter_half_length = (filter_length - 1) // 2
+    pad_length = filter_length - 1 + window_length - 1
+    true_sources = np.pad(true_sources, ((0, pad_length), (0, 0)), mode='constant')
+    source_estimates = np.pad(source_estimates, ((0, pad_length), (0, 0)), mode='constant')
+
+    total_samples, num_sources = true_sources.shape
+    num_channels = source_estimates.shape[1]
+
+    hann_window = signal.windows.hann(window_length, sym=False)
+    analysis_window = np.sqrt(np.flipud(hann_window))
+    synthesis_window = np.sqrt(np.flipud(hann_window))
+
+    synthesis_weights = np.zeros((window_length, num_channels, num_sources))
+    for channel_idx in range(num_channels):
+        for source_idx in range(num_sources):
+            synthesis_weights[:, channel_idx, source_idx] = synthesis_window
+
+    projections_accumulation = np.zeros((total_samples, num_channels, num_sources),
+                                        dtype=true_sources.dtype)
+    window_gain_accumulation = np.zeros((total_samples, 1))
+
+    edge_padding = np.zeros((filter_half_length, num_sources), dtype=true_sources.dtype)
+    padded_sources = np.vstack([edge_padding, true_sources, edge_padding])
+    frame_source_length = window_length + 2 * filter_half_length
+
+    window_begin = 0
+    window_end = window_begin + window_length
+    while window_end - window_length / 2.0 <= projections_accumulation.shape[0] - window_length + 1:
+        frame_projections = perform_least_squares_projection(
+            source_estimates[window_begin:window_end, :],
+            padded_sources[window_begin:window_begin + frame_source_length, :],
+            filter_half_length,
+            analysis_window
+        )
+        projections_accumulation[window_begin:window_end, :, :] += (
+                frame_projections[:window_length, :, :] * synthesis_weights
+        )
+        window_gain_accumulation[window_begin:window_end, 0] += synthesis_window * analysis_window
+        window_begin += hop_size
+        window_end += hop_size
+
+    valid_indices = (window_gain_accumulation[:, 0] != 0)
+    for source_idx in range(num_sources):
+        projections_accumulation[valid_indices, :, source_idx] /= window_gain_accumulation[valid_indices, :]
+
+    return projections_accumulation[:-(window_length - 1), :, :]
+
+
+def make_subband_projection_case(num_sources: int, num_channels: int, num_samples: int,
+                                 silent_prefix: int = 0, seed: int = 7):
+    """
+    Complex subband-shaped inputs for the least-squares projection, in the layout the
+    filterbank hands over.
+    """
+    rng = np.random.default_rng(seed)
+    sources = (rng.standard_normal((num_samples, num_sources))
+               + 1j * rng.standard_normal((num_samples, num_sources)))
+    if silent_prefix:
+        sources[:silent_prefix, :] = 0.0
+    estimates = (rng.standard_normal((num_samples, num_channels))
+                 + 1j * rng.standard_normal((num_samples, num_channels)))
+    return estimates, sources
+
+
+# (num_sources, num_channels, num_samples, silent_prefix, filter_length, window_length,
+#  hop_size). The hop-3 cases produce more frames than one LEAST_SQUARES_FRAME_BATCH,
+# so the seam between batches is covered; the silent_prefix cases drive the silence
+# bypass, including one where every frame of the leading batch is bypassed.
+BATCHED_PROJECTION_CASES = [
+    (2, 1, 900, 0, 11, 133, 33),
+    (2, 1, 900, 0, 11, 40, 3),
+    (2, 1, 900, 600, 11, 40, 3),
+    (2, 1, 400, 400, 11, 133, 33),
+    (3, 1, 500, 0, 7, 61, 15),
+    (2, 2, 500, 0, 11, 61, 15),
+    (1, 1, 300, 0, 3, 45, 11),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "num_sources, num_channels, num_samples, silent_prefix, filter_length, window_length, hop_size",
+    BATCHED_PROJECTION_CASES
+)
+def test_batched_projection_matches_single_frame_bitwise(
+        num_sources, num_channels, num_samples, silent_prefix,
+        filter_length, window_length, hop_size
+):
+    """
+    The batched per-band Gram/RHS build must be *bitwise* identical to solving one
+    frame at a time, not merely close: it issues the same per-frame GEMM shapes, so
+    nothing is reassociated. If this ever has to be loosened to `allclose`, the
+    batching has started reordering arithmetic and the bit-identity claim in
+    `perform_time_varying_least_squares_projection` no longer holds.
+
+    Compared as bytes rather than with `==` so that even the sign of zero has to
+    match -- which is what the explicit zeroing of bypassed frames exists to preserve.
+    """
+    estimates, sources = make_subband_projection_case(
+        num_sources, num_channels, num_samples, silent_prefix
+    )
+
+    batched = perform_time_varying_least_squares_projection(
+        estimates, sources, filter_length, window_length, hop_size
+    )
+    reference = time_varying_projection_frame_by_frame_reference(
+        estimates, sources, filter_length, window_length, hop_size
+    )
+
+    assert batched.shape == reference.shape
+    assert batched.dtype == reference.dtype
+    assert np.array_equal(batched.view(np.uint8), reference.view(np.uint8))
+
+
+@pytest.mark.unit
+def test_batched_projection_cases_span_more_than_one_batch():
+    """
+    Guards the parametrization above: the seam between two batches is only exercised if
+    at least one case really produces more frames than `LEAST_SQUARES_FRAME_BATCH`.
+    """
+    num_samples, filter_length, window_length, hop_size = 900, 11, 40, 3
+    total_samples = num_samples + filter_length - 1 + window_length - 1
+    frame_count = len(range(0, total_samples - window_length, hop_size))
+    assert frame_count > decomposition_module.LEAST_SQUARES_FRAME_BATCH
+
+
+@pytest.mark.unit
+def test_silent_sources_project_to_exact_zero():
+    """
+    The silence bypass must yield exact zeros, and the batched energy reduction has to
+    agree with the per-frame `np.sum` it replaced on where the threshold falls.
+    """
+    rng = np.random.default_rng(3)
+    sources = np.zeros((400, 2), dtype=complex)
+    estimates = rng.standard_normal((400, 1)) + 1j * rng.standard_normal((400, 1))
+
+    projections = perform_time_varying_least_squares_projection(estimates, sources, 11, 61, 15)
+
+    assert np.count_nonzero(projections) == 0
+
+
+# -----------------------------------------------------------------------------
+# Modulation matrix sharing between analysis and synthesis
+# -----------------------------------------------------------------------------
+
+MODULATION_CASES = [
+    (24000.0, 512, np.array([100.0, 437.5, 1000.0, 4321.0])),
+    (24000.0, 4096, np.array([20.0, 1000.0, 11999.0])),
+    (12000.0, 1000, np.array([250.0, 2500.0])),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("sampling_frequency, num_samples, center_frequencies", MODULATION_CASES)
+def test_modulation_matrices_are_bitwise_conjugates(sampling_frequency, num_samples, center_frequencies):
+    """
+    Sharing one np.exp between analysis and synthesis rests on `exp(+ix)` being the
+    *bitwise* conjugate of `exp(-ix)`: the two arguments are exact IEEE negations and
+    cos/sin are exactly even/odd about zero. Asserted against a freshly evaluated
+    np.exp so a NumPy or libm change that broke the symmetry fails here rather than
+    silently perturbing the decomposition.
+
+    The identity holds bitwise for every t >= 1 but *not* for t = 0, where the sign of
+    the exponent has been multiplied away and both directions land on 1+0j -- so
+    conjugating gives 1-0j, equal in value but not in bytes. That is pinned below too,
+    because it is exactly why `get_synthesis_modulation_matrix` recomputes column 0
+    instead of conjugating it.
+    """
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+
+    time_steps = np.arange(num_samples)
+    expected_analysis = np.exp(
+        -2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps
+    )
+    expected_synthesis = np.exp(
+        2j * np.pi / sampling_frequency * center_frequencies[:, np.newaxis] * time_steps
+    )
+
+    assert np.array_equal(expected_synthesis[:, 1:].view(np.uint8),
+                          np.conjugate(expected_analysis[:, 1:]).view(np.uint8))
+    # t = 0: equal in value, opposite in the sign of the zero imaginary part.
+    assert np.array_equal(expected_synthesis[:, 0], np.conjugate(expected_analysis[:, 0]))
+    assert not np.array_equal(expected_synthesis[:, :1].view(np.uint8),
+                              np.conjugate(expected_analysis[:, :1]).view(np.uint8))
+
+    # The public getters must nonetheless reproduce a direct np.exp byte for byte.
+    analysis = get_analysis_modulation_matrix(sampling_frequency, num_samples, center_frequencies)
+    synthesis = get_synthesis_modulation_matrix(sampling_frequency, num_samples, center_frequencies)
+    assert np.array_equal(analysis.view(np.uint8), expected_analysis.view(np.uint8))
+    assert np.array_equal(synthesis.view(np.uint8), expected_synthesis.view(np.uint8))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("sampling_frequency, num_samples, center_frequencies", MODULATION_CASES)
+def test_modulation_matrix_prefix_identity(sampling_frequency, num_samples, center_frequencies):
+    """
+    Synthesis needs a few hundred more columns than analysis produced, so it reuses the
+    analysis matrix as a prefix and only exponentiates the overhang. That is valid only
+    if a length-N build is bitwise the first N columns of a longer one.
+    """
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    short_matrix = get_analysis_modulation_matrix(
+        sampling_frequency, num_samples, center_frequencies
+    ).copy()
+
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    long_matrix = get_analysis_modulation_matrix(
+        sampling_frequency, num_samples + 337, center_frequencies
+    )
+
+    assert np.array_equal(long_matrix[:, :num_samples].view(np.uint8), short_matrix.view(np.uint8))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("sampling_frequency, num_samples, center_frequencies", MODULATION_CASES)
+def test_synthesis_modulation_matrix_is_independent_of_cache_state(
+        sampling_frequency, num_samples, center_frequencies
+):
+    """
+    Synthesis takes the conjugate shortcut when an analysis matrix is cached and falls
+    back to a plain np.exp when it is not. The cold path, the fully shared path, and
+    the mixed path -- where the cached analysis matrix is shorter than the request, so
+    only the overhang is exponentiated -- must agree to the last bit.
+    """
+    overhang_length = num_samples + 337
+
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    cold = get_synthesis_modulation_matrix(
+        sampling_frequency, overhang_length, center_frequencies
+    ).copy()
+
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    get_analysis_modulation_matrix(sampling_frequency, overhang_length, center_frequencies)
+    fully_shared = get_synthesis_modulation_matrix(
+        sampling_frequency, overhang_length, center_frequencies
+    ).copy()
+
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    get_analysis_modulation_matrix(sampling_frequency, num_samples, center_frequencies)
+    partially_shared = get_synthesis_modulation_matrix(
+        sampling_frequency, overhang_length, center_frequencies
+    )
+
+    assert np.array_equal(fully_shared.view(np.uint8), cold.view(np.uint8))
+    assert np.array_equal(partially_shared.view(np.uint8), cold.view(np.uint8))
+
+
+@pytest.mark.unit
+def test_modulation_matrix_cache_stays_bounded():
+    """
+    Every entry is a full (num_bands x num_samples) complex matrix, so an unbounded
+    cache would be a memory leak in a process scoring many different-length signals.
+    """
+    decomposition_module._MODULATION_MATRIX_CACHE.clear()
+    center_frequencies = np.array([100.0, 1000.0])
+
+    for num_samples in range(64, 64 + 8 * 16, 16):
+        get_analysis_modulation_matrix(24000.0, num_samples, center_frequencies)
+        get_synthesis_modulation_matrix(24000.0, num_samples, center_frequencies)
+        assert (len(decomposition_module._MODULATION_MATRIX_CACHE)
+                <= decomposition_module._MODULATION_MATRIX_CACHE_SIZE)
