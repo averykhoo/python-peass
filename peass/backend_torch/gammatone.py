@@ -107,6 +107,18 @@ def calculate_erb(fc: torch.Tensor) -> torch.Tensor:
 GAMMATONE_ERB_INTERCEPT_HZ = 24.7  # GFB_L
 GAMMATONE_ERB_QUALITY_FACTOR = 9.265  # GFB_Q
 
+# Target size of one frequency-domain intermediate in `GammatoneAnalyzerTorch.process`,
+# which chunks its batch to stay under it. Not a correctness limit: rows are filtered
+# independently, so any value gives identical output.
+#
+# This is a memory bound, NOT a speedup -- measured 2026-08-10, mono 1.313 s vs 1.306 s
+# and stereo 3.724 s vs 3.739 s against no chunking at all, i.e. neutral either way.
+# What it buys is that the two `(rows, num_bands, N_fft)` complex intermediates stop
+# scaling with the batch: 8 rows (4 sources x stereo) would otherwise allocate ~1 GB
+# twice over to produce a few hundred MB of subbands. Tighter budgets do start to cost
+# (134 MB measured 1.342 s / 3.868 s), so do not lower this expecting a win.
+_FFT_CHUNK_BUDGET_BYTES = 256 * 1024 * 1024
+
 
 def calculate_audiological_erb(fc: torch.Tensor, bandwidth_factor: float = 1.0) -> torch.Tensor:
     """
@@ -165,6 +177,20 @@ class GammatoneAnalyzerTorch:
         """
         Massively parallel FFT evaluation of 4th-order complex IIR filters.
         x shape: (*, T) -> Returns (*, num_bands, T)
+
+        The frequency-domain product and its inverse transform run in row chunks rather
+        than over the whole batch at once. Both intermediates are
+        ``(rows, num_bands, N_fft)`` complex, and ``N_fft`` is the transform length --
+        roughly 1.5x the signal -- so at full batch they are by far the largest
+        allocations in the pipeline. Chunking caps them at ``_FFT_CHUNK_BUDGET_BYTES``
+        without changing the arithmetic, since every row is filtered independently.
+        See that constant: this is a memory bound and measured speed-neutral, not a
+        speedup.
+
+        The valid region is also copied out rather than returned as a slice. The slice
+        keeps its ``N_fft``-wide parent buffer alive for as long as the caller holds
+        the result -- through the modulation multiply, in practice -- which is ~1.5x
+        the memory the subbands actually need.
         """
         original_shape = x.shape[:-1]
         T = x.shape[-1]
@@ -172,22 +198,30 @@ class GammatoneAnalyzerTorch:
         x_flat = x.reshape(-1, T)
         pad_len = int(0.2 * self.fs)
         N_fft = 2 ** math.ceil(math.log2(T + pad_len))
-
-        # Convert audio to freq domain
-        X = torch.fft.fft(x_flat.to(torch.complex128), n=N_fft, dim=-1)
+        num_bands = len(self.center_frequencies)
 
         # Global module cache call!
         H = _get_gammatone_H_torch(
             N_fft, self.fs, tuple(self.center_frequencies.tolist()),
             tuple(self.norms.tolist()), tuple(self.coefs.tolist()), str(x.device)
         )
+        H = H.unsqueeze(0)
 
-        Y = X.unsqueeze(1) * H.unsqueeze(0)
-        y = torch.fft.ifft(Y, n=N_fft, dim=2)
-        y = y[..., :T]
+        bytes_per_row = num_bands * N_fft * 16
+        rows_per_chunk = max(1, _FFT_CHUNK_BUDGET_BYTES // bytes_per_row)
 
-        # Slice valid region (linear convolution match)
-        return y.view(*original_shape, len(self.center_frequencies), T)
+        chunks = []
+        for start in range(0, x_flat.shape[0], rows_per_chunk):
+            rows = x_flat[start:start + rows_per_chunk]
+            spectrum = torch.fft.fft(rows.to(torch.complex128), n=N_fft, dim=-1)
+            filtered = torch.fft.ifft(spectrum.unsqueeze(1) * H, n=N_fft, dim=2)
+            # Copy out the valid (linear-convolution) region so the N_fft-wide buffer
+            # is released at the end of the iteration instead of being kept alive by
+            # a view for the rest of the decomposition.
+            chunks.append(filtered[..., :T].contiguous())
+
+        combined = chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=0)
+        return combined.view(*original_shape, num_bands, T)
 
 
 class GammatoneSynthesizerTorch:

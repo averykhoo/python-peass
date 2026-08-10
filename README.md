@@ -228,6 +228,41 @@ NumPy backend by high correlation rather than to floating-point precision.
 
 ### PyTorch backend performance
 
+#### Decomposition
+
+The decomposition is ~2.2x faster as of 2026-08-10 (mono 2.850 s -> 1.268 s, stereo
+7.286 s -> 3.531 s on the reference 5 s example). Two changes account for it, neither
+an approximation — both compute the same quantity, and output agrees with the previous
+release to 1.8e-13 of each component's peak, correlation 1.0 to all 15 digits:
+
+- **The resampler is a polyphase GEMM rather than an FFT convolution** for pure
+  interpolation and pure decimation, which is 196 of its 198 calls. Two things made the
+  FFT a poor fit here, and neither was a tuning problem. The filterbank has 32 bands
+  with 32 *distinct* decimation factors, so grouping bands by factor yields 32 groups of
+  one or two rows and the FFT has no batch dimension left to parallelise over. And the
+  FFT works at the *undecimated* length regardless of the rate: a band decimated by 1229
+  transformed a 121500-point spectrum to produce 98 output samples. Because the filter
+  is 21 taps per polyphase phase whatever the rate, the honest operation is a small
+  dense GEMM. Resampling fell from 60.4% of the decomposition to 32.9%.
+
+  Complex subbands are additionally split into real and imaginary rows first: the FIR is
+  real, but torch promotes it and runs full complex arithmetic, four real multiplies per
+  tap where one will do. The split is exact — the discarded terms are the products of a
+  complex multiply by a real number's zero imaginary part.
+
+- **The per-frame solve uses `cholesky_ex`/`cholesky_solve` rather than
+  `torch.linalg.pinv`.** The Gram matrix is Hermitian positive-semidefinite by
+  construction and pinv's cutoff never truncated anything, so the SVD was an expensive
+  way to solve a linear system. `cholesky_ex` reports failure per matrix, which gives
+  the same graceful handling of rank-deficient and silent frames that motivated pinv —
+  those frames fall back to it, and agree with the old path to 1.7e-16.
+
+Note that `GammatoneAnalyzerTorch.process` chunks its batch to bound the two
+frequency-domain intermediates. That is a memory bound, not a speedup; it measured
+neutral. See `_FFT_CHUNK_BUDGET_BYTES`.
+
+#### Adaptation loop
+
 The auditory-nerve adaptation recurrence is sequential in time and tiny per step
 (one element per band), so in torch it is bound by kernel-launch latency rather
 than by arithmetic — roughly 7 dispatches per timestep, and a 5 s clip is 120000
@@ -278,6 +313,7 @@ The optimizations are worth ~1.2x end-to-end on the reference example:
 | change | speedup contribution | bitwise effect |
 | --- | --- | --- |
 | Numba polyphase resampler replacing SciPy `upfirdn` | ~1.13x | reassociated, see below |
+| vectorizable rewrite of those two Numba kernels (2026-08-10) | ~1.47x | reassociated, same class |
 | LAPACK `?posv` called directly instead of `scipy.linalg.solve(assume_a='pos')` | 11x on that call | **bit-identical** |
 | sources pre-padded once instead of a per-frame `np.vstack` | — | **bit-identical** |
 | hoisted the conjugate transpose that was built twice per frame | — | **bit-identical** |
@@ -285,8 +321,20 @@ The optimizations are worth ~1.2x end-to-end on the reference example:
 | batched per-band Gram/RHS build instead of per frame | ~1.15x | **bit-identical** |
 | analysis modulation matrix cached and shared with synthesis | ~1.18x | **bit-identical** |
 
-The last two landed later (2026-08-09) and are worth a further ~1.28-1.32x on the
-decomposition between them. Both are bitwise exact, verified byte-level (a `uint8`
+The kernel rewrite landed 2026-08-10 and takes the decomposition from 2.436 s to
+1.644 s mono (1.48x) and 4.972 s to 3.430 s stereo (1.45x) on the reference example.
+It is the same two kernels doing the same arithmetic, restructured so LLVM can
+vectorize it: the decimating tap loop became an `np.dot` that Numba lowers to `ddot`,
+and the interpolating kernel's loops were inverted so the polyphase phase index is
+innermost and contiguous — an AXPY, against the ~0.42 GMAC/s the original strided
+reduction managed. Accuracy against the SciPy path is unchanged to slightly better
+(8.8e-15 vs 9.1e-15 decimating, 4.0e-16 vs 5.9e-16 interpolating), so it stays inside
+the accuracy class this section already describes rather than widening it. One
+behaviour change: `float32`/`complex64` input now promotes to double exactly as the
+SciPy fallback does, where the old kernels kept single precision.
+
+The batching and modulation-cache entries landed earlier (2026-08-09) and are worth a
+further ~1.28-1.32x on the decomposition between them. Both are bitwise exact, verified byte-level (a `uint8`
 view, so signed zeros count) across seven configurations — mono, two-stage, 3-source,
 all-silent, half-silent, stereo, and a 0.1 s clip.
 
