@@ -75,14 +75,14 @@ Everything here must respect the no-threads/no-subprocess constraint (see
 ### torch
 
 - **P4, was 1.08x — fuse the synthesis modulation/phase/delay/gain chain**
-  (`decomposition.py:412` + `gammatone.py:204-222`). Currently four full passes over a
+  (`decomposition.py:459` + `gammatone.py:238-256`). Currently four full passes over a
   246 MB block plus a gathered index tensor. Cache `mod_matrix * phase_factors`, use
   `x.real*c.real - x.imag*c.imag` instead of a complex multiply then `.real`, and
   replace `gather`/`where`/`einsum` with a 32-iteration shift-accumulate. Measured
   298.6 ms -> 135.3 ms (2.21x) in isolation, deviation 4.3e-16, but allocator-bound so
   worth less end-to-end than that implies. Effort: medium.
 - **P5, hypothesis, removes 109 ms — fold the modulation into the polyphase filters**
-  (`decomposition.py:335` and `:412`). Complex-exponential modulation distributes
+  (`decomposition.py:382` and `:459`). Complex-exponential modulation distributes
   through convolution exactly, so the two full-length modulation multiplies (60.0 ms
   analysis + 48.6 ms synthesis) disappear into the 21-tap filters, and the two cached
   modulation matrices (61 MB + 62 MB) can be dropped. Exact in real arithmetic,
@@ -90,7 +90,7 @@ Everything here must respect the no-threads/no-subprocess constraint (see
 
 ### numpy
 
-- **Synthesis scatter in place** (`decomposition.py:494-505`), ~93 ms of ~246 MB of
+- **Synthesis scatter in place** (`decomposition.py:706-721`), ~93 ms of ~246 MB of
   copies that `fast_resample_poly` could write directly into. Effort: small. This is
   the only numpy item from the 2026-08-09 pass that has not landed.
 

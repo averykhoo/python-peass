@@ -12,9 +12,10 @@ move it back to `TODO.md`.
 
 ### Numba `parallel=True`/`prange` on the NumPy kernels (2026-08-08)
 
-Profiled and prototyped: annotating the five Numba kernels
-(`backend_numpy/gammatone.py:20, 64, 103, 137` and `backend_numpy/auditory_model.py:27`)
-with `parallel=True` and parallelising over bands — or over flattened `row x out_len`
+Profiled and prototyped: annotating the five Numba kernels then present (the
+`@numba.njit` kernels in `backend_numpy/gammatone.py`, plus
+`_numba_fused_auditory_kernel` in `backend_numpy/auditory_model.py`) with
+`parallel=True` and parallelising over bands — or over flattened `row x out_len`
 for the two polyphase kernels — measured **1.63x at 1s, 1.87x at 5s mono, 1.83x at 5s
 stereo**, and was **bit-identical** (`max|diff| = 0.0` on all four waveforms and all
 four features, every case). The parallel axis is over genuinely independent work
@@ -44,6 +45,14 @@ explicitly. This does not reverse the decision — the distinction between "the 
 fans out" and "the library calls a BLAS the user configured" is exactly the one that
 keeps behaviour predictable and controllable from outside — but anyone reopening this
 should argue against the real invariant rather than the overstated one.
+
+Amended 2026-08-10: there are six kernels in `backend_numpy/gammatone.py` now, not
+four — the two polyphase kernels were each split into a real and a complex twin (see
+"Decomposition: torch ~2.2x, numpy ~1.47x"). Nothing about the decision changes; the
+parallel axis is still over independent work items, and the constraint is still a
+design one. But the measured 1.63-1.87x was against the *old* scalar kernels, and
+those are now 1.9-2.2x faster single-threaded, so the headroom `prange` would buy is
+smaller than the number above suggests. Re-measure before arguing from it.
 
 ### `segmentation_factor` — fail loudly instead of porting (2026-08-05)
 

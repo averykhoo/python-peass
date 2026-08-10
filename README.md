@@ -308,7 +308,10 @@ this backend already runs multi-threaded inside BLAS — measured cpu/wall of 3.
 environment variable; the package will not do it for you. Worth knowing that the tiny
 least-squares gemms measured *faster* at one thread than at four.
 
-The optimizations are worth ~1.2x end-to-end on the reference example:
+The 2026-08-08/09 entries below are worth ~1.2x end-to-end on the reference example;
+the 2026-08-10 kernel rewrite adds a further ~1.47x on the decomposition specifically.
+The two are quoted against different scopes and are deliberately not multiplied into a
+single cumulative figure, because no end-to-end run was measured across both:
 
 | change | speedup contribution | bitwise effect |
 | --- | --- | --- |
@@ -334,9 +337,9 @@ behaviour change: `float32`/`complex64` input now promotes to double exactly as 
 SciPy fallback does, where the old kernels kept single precision.
 
 The batching and modulation-cache entries landed earlier (2026-08-09) and are worth a
-further ~1.28-1.32x on the decomposition between them. Both are bitwise exact, verified byte-level (a `uint8`
-view, so signed zeros count) across seven configurations — mono, two-stage, 3-source,
-all-silent, half-silent, stereo, and a 0.1 s clip.
+further ~1.28-1.32x on the decomposition between them. Both are bitwise exact, verified
+byte-level (a `uint8` view, so signed zeros count) across seven configurations — mono,
+two-stage, 3-source, all-silent, half-silent, stereo, and a 0.1 s clip.
 
 Batching is bitwise rather than merely close because stacked `matmul` dispatches the
 same per-frame GEMM shapes and layouts, so nothing is reassociated; the win is not the
@@ -444,7 +447,7 @@ deliberate, and **not fixed**.
 
 The cause is resampler filter normalization. `scipy.signal.firwin` defaults to
 `scale=True`, which normalizes the Kaiser-windowed sinc to exactly unit DC gain
-(`peass/backend_numpy/gammatone.py:707`, `peass/backend_torch/utils.py:85`). MATLAB's
+(`peass/backend_numpy/gammatone.py:797`, `peass/backend_torch/utils.py:85`). MATLAB's
 `resample` filter is *not* DC-normalized; its raw DC gain is 0.9993253. The decomposition
 performs four resamples per signal path (16k→24k, decimate by `Ndec`, interpolate by
 `Ndec`, 24k→16k), so MATLAB accumulates:
