@@ -12,9 +12,10 @@ move it back to `TODO.md`.
 
 ### Numba `parallel=True`/`prange` on the NumPy kernels (2026-08-08)
 
-Profiled and prototyped: annotating the five Numba kernels
-(`backend_numpy/gammatone.py:20, 64, 103, 137` and `backend_numpy/auditory_model.py:27`)
-with `parallel=True` and parallelising over bands — or over flattened `row x out_len`
+Profiled and prototyped: annotating the five Numba kernels then present (the
+`@numba.njit` kernels in `backend_numpy/gammatone.py`, plus
+`_numba_fused_auditory_kernel` in `backend_numpy/auditory_model.py`) with
+`parallel=True` and parallelising over bands — or over flattened `row x out_len`
 for the two polyphase kernels — measured **1.63x at 1s, 1.87x at 5s mono, 1.83x at 5s
 stereo**, and was **bit-identical** (`max|diff| = 0.0` on all four waveforms and all
 four features, every case). The parallel axis is over genuinely independent work
@@ -44,6 +45,14 @@ explicitly. This does not reverse the decision — the distinction between "the 
 fans out" and "the library calls a BLAS the user configured" is exactly the one that
 keeps behaviour predictable and controllable from outside — but anyone reopening this
 should argue against the real invariant rather than the overstated one.
+
+Amended 2026-08-10: there are six kernels in `backend_numpy/gammatone.py` now, not
+four — the two polyphase kernels were each split into a real and a complex twin (see
+"Decomposition: torch ~2.2x, numpy ~1.47x"). Nothing about the decision changes; the
+parallel axis is still over independent work items, and the constraint is still a
+design one. But the measured 1.63-1.87x was against the *old* scalar kernels, and
+those are now 1.9-2.2x faster single-threaded, so the headroom `prange` would buy is
+smaller than the number above suggests. Re-measure before arguing from it.
 
 ### `segmentation_factor` — fail loudly instead of porting (2026-08-05)
 
@@ -106,6 +115,41 @@ The lesson for this codebase specifically: **relative tolerance is the wrong ins
 downstream of a subtraction of comparable quantities**, which this pipeline does in at
 least two places (here, and the `artifacts` component the README already documents).
 Bound those on absolute error at the output scale instead.
+
+### Batching the torch analysis and synthesis passes — obsoleted by the GEMM (2026-08-10)
+
+`TODO.md` carried this as **P3, 1.09x**: sources and estimate go through two independent
+passes over an identical filterbank, and the four distortion components go through four
+independent synthesis passes, so `cat` them into one wider batch each. Implemented both,
+measured all four on/off combinations twice on a quiet machine:
+
+| analysis merged | synthesis merged | mono | stereo |
+| --- | --- | --- | --- |
+| no | no | 1.211 / 1.348 s | 3.553 / 3.461 s |
+| no | yes | 1.174 / 1.234 s | 3.466 / 3.695 s |
+| yes | no | 1.231 / 1.298 s | 3.634 / 3.848 s |
+| yes | yes | 1.205 / 1.201 s | 3.708 / 3.787 s |
+
+Within noise on mono and mildly *negative* on stereo, so both were reverted. The
+original 1.09x was real when it was measured — but it was measured against the FFT
+resampler, whose whole problem was having no batch dimension to parallelise over. The
+polyphase GEMM removed that, and with it the reason to widen the batch. Merging also
+raises the peak frequency-domain footprint, which is the likely source of the stereo
+regression.
+
+Two lessons worth keeping: a prototyped speedup is only valid against the code it was
+prototyped on, and a first attempt at this was measured while a dozen unrelated agents
+were saturating the machine, producing a 5.5-11.1 s spread on a 3.5 s workload and two
+mutually contradictory conclusions. Check the machine is idle before A/B-ing anything
+at this scale.
+
+The related **memory** finding did land: `GammatoneAnalyzerTorch.process` now chunks its
+batch (`_FFT_CHUNK_BUDGET_BYTES`) and copies out the valid region instead of returning a
+slice of the `N_fft`-wide buffer. Measured speed-neutral at 256 MB (mono 1.313 vs
+1.306 s, stereo 3.724 vs 3.739 s) and kept purely so the two
+`(rows, num_bands, N_fft)` intermediates stop scaling with batch width — 8 rows would
+otherwise allocate ~1 GB twice to produce a few hundred MB of subbands. Tighter budgets
+do start to cost (134 MB: 1.342 / 3.868 s).
 
 ### Decomposition optimisations that measured worse, or not at all (2026-08-09)
 
@@ -192,6 +236,82 @@ deviations from the MATLAB reference".
 ---
 
 ## Resolved
+
+### Decomposition: torch ~2.2x, numpy ~1.47x (2026-08-10)
+
+Measured on `tests/resources/database/exp01_*` with a *nonlinear* estimate
+(`tanh(3*mix)/3` plus shaped noise) so `artifacts` is not numerically degenerate — a
+plain linear mix lies exactly in the span of the sources, which makes that component
+come out at ~1e-14 and turns any comparison of it into noise-vs-noise. Warmed, min of
+six repeats.
+
+| | before | after | speedup |
+| --- | --- | --- | --- |
+| torch mono | 2.850 s | 1.268 s | **2.25x** |
+| torch stereo | 7.286 s | 3.531 s | **2.06x** |
+| numpy mono | 2.436 s | 1.644 s | **1.48x** |
+| numpy stereo | 4.972 s | 3.430 s | **1.45x** |
+
+Worst deviation against the previous output, relative to each component's own peak:
+numpy 4.9e-14, torch 1.8e-13, correlation 1.0 to all 15 digits on all four components.
+None of these is an approximation — every one computes the same quantity, and the
+differences are reassociation only.
+
+**torch — polyphase GEMM instead of FFT convolution** (`backend_torch/utils.py`), the
+dominant win. Resampling was 60.4% of the decomposition over 198 calls. Two structural
+problems, not tuning ones: the filterbank has 32 bands with 32 *distinct* decimation
+factors, so band grouping yields 32 groups of one or two rows and the FFT has no batch
+dimension to parallelise over; and the FFT works at the *undecimated* length either
+way, so a band decimated by 1229 transformed a 121500-point spectrum to produce 98
+output samples, and its matching synthesis upsample transformed 121500 points to filter
+327. With `half_length_factor = 10` the filter is 21 taps *per polyphase phase*
+regardless of rate, so the real operation is a small dense GEMM. Interpolation becomes
+`(batch*in_len, 21) @ (21, up)` whose `(q, p)` output grid is already in output order;
+decimation contracts the input block against all 21 phases at once
+(`M = X @ kernel^T`, then `y[n] = sum_j M[n+j, j]`), which is one GEMM plus a
+shifted-diagonal sum rather than 21 matrix-vector products. Resampling fell to 32.9%.
+
+Complex signals are additionally split into real and imaginary rows first. The FIR is
+real, but torch promotes it and runs full complex arithmetic — four real multiplies per
+tap where one will do. That split is exact: the discarded terms are the `a*0`/`b*0`
+products of a complex multiply by a real number.
+
+Verified against the FFT path at 2.3e-15 worst relative deviation over 100+ rate and
+length combinations, cross-checked against `scipy.signal.resample_poly`, with gradients
+matching. `tests/unit/backend_torch/test_torch_utils.py` is new — the torch resampler
+previously had no direct test coverage at all.
+
+**torch — `cholesky_ex`/`cholesky_solve` instead of `torch.linalg.pinv`**
+(`backend_torch/decomposition.py`). The Gram is Hermitian PSD by construction, and
+pinv's rcond cutoff never truncated anything, so the SVD was an expensive way to solve
+`Gx = R`. `cholesky_ex` reports failure per matrix in `info`, giving the same
+rank-deficient fallback the numpy backend already gets from LAPACK `?posv`. Frames it
+rejects — above all silent frames, whose Gram is identically zero — still fall back to
+`pinv` and still resolve to the same minimum-norm solution (verified to 1.7e-16). The
+failing frames also get an identity shim before the batched refactorization, because a
+failed Cholesky leaves uninitialized values that `cholesky_solve` can turn into inf/NaN
+and poison the autograd graph even though the values are discarded.
+
+The numpy backend's 1e-15 diagonal regularization was deliberately *not* copied: against
+a minimum eigenvalue of ~3.4e-10 it is a ~3e-6 relative perturbation.
+
+**numpy — vectorizable resampler kernels** (`backend_numpy/gammatone.py`). The decimate
+kernel's tap loop became `np.dot` on contiguous float64, which numba lowers to `ddot`
+(1.90x on the call; the win is AVX, not BLAS threading — measured at
+`MKL_NUM_THREADS=1`). The interpolate kernel's loops were inverted so the phase index
+`p` is innermost and contiguous, accumulating into an L1-resident length-`up` buffer:
+an AXPY LLVM fully vectorizes, against ~0.42 GMAC/s for the original per-output-sample
+reduction over strided branch taps. 2.22x on the call. Complex input is split into
+real/imag planes — `ddot` needs real operands — and the complex kernels write
+`complex128` directly, so the wrapper's recombine pass is gone. Padding buffers use
+`np.empty` with only the pad edges zeroed rather than `np.zeros`, skipping a memset of
+a region immediately overwritten; that alone took decimate from 1.27x to 1.90x.
+
+Accuracy versus the SciPy path is unchanged to slightly better (scale-relative 8.8e-15
+vs 9.1e-15 decimating, 4.0e-16 vs 5.9e-16 interpolating), so this stays inside the
+accuracy class `USE_NUMBA_RESAMPLER` already documents. One behaviour change: float32
+and complex64 input now promote to float64/complex128 exactly as the SciPy fallback
+does, where the old numba path kept float32.
 
 ### Torch adaptation recurrence ~2.2-2.3x via a Numba kernel (2026-08-08)
 

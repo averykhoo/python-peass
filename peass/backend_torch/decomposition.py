@@ -35,6 +35,54 @@ def _get_synthesis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, d
     return torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
 
 
+def _solve_hermitian_batch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
+    r"""Solve ``gram @ x = rhs`` for a batch of Hermitian positive-semidefinite Grams.
+
+    ``gram`` is ``T^H diag(w^2) T``: Hermitian and positive semidefinite by
+    construction, so a Cholesky factorization is the right solver. This used to call
+    ``torch.linalg.pinv`` unconditionally, on the grounds that it degrades gracefully
+    on rank-deficient frames without a host sync. It does, but it pays an SVD of every
+    frame for it. Profiled over the 2338-matrix stack of the mono reference example:
+    pinv 409 ms, ``pinv(hermitian=True)`` 318 ms, ``lstsq`` 92 ms, ``ldl`` 28 ms,
+    Cholesky 21 ms.
+
+    ``cholesky_ex`` reports failure per matrix in ``info`` rather than raising, which
+    is exactly the rank-deficiency test the NumPy backend already performs with LAPACK
+    ``?posv`` (``backend_numpy/decomposition.py``). Frames it rejects fall back to
+    ``pinv``, so the degenerate cases -- above all the silent frames, whose Gram is
+    identically zero and which the NumPy backend bypasses explicitly -- still resolve
+    to the same minimum-norm solution as before.
+
+    The ``info.any()`` test does force a device sync on CUDA. That is one sync per
+    band per solve (32 bands), against an SVD per frame; the trade is not close.
+
+    Deliberately NOT done here: the NumPy backend's 1e-15 diagonal regularization.
+    The Gram's minimum eigenvalue on real data is ~3.4e-10, so 1e-15 is a ~3e-6
+    relative perturbation -- measured at 1e-5 relative deviation on the solution, far
+    worse than anything the Cholesky switch itself costs.
+    """
+    factor, info = torch.linalg.cholesky_ex(gram)
+    if not bool(info.any()):
+        return torch.cholesky_solve(rhs, factor)
+
+    if gram.dim() == 2:
+        # Single-frame twin: nothing to salvage, take the min-norm solve directly.
+        return torch.linalg.pinv(gram, hermitian=True) @ rhs
+
+    # A failed Cholesky leaves uninitialized values behind, and solving against them
+    # can produce inf/NaN that poisons the autograd graph even though the values are
+    # discarded below. Add the identity on exactly the failing frames -- the Gram is
+    # PSD, so that is guaranteed positive definite -- and refactor the batch.
+    size = gram.shape[-1]
+    degenerate = info != 0
+    shim = degenerate.to(gram.dtype).view(-1, 1, 1) * torch.eye(
+        size, dtype=gram.dtype, device=gram.device
+    )
+    weights = torch.cholesky_solve(rhs, torch.linalg.cholesky_ex(gram + shim)[0]).clone()
+    weights[degenerate] = torch.linalg.pinv(gram[degenerate], hermitian=True) @ rhs[degenerate]
+    return weights
+
+
 def get_real_dtype(dtype: torch.dtype) -> torch.dtype:
     """Helper returning the corresponding real-valued dtype counterpart of any dtype."""
     if dtype in (torch.complex128, torch.complex64):
@@ -113,9 +161,9 @@ def perform_least_squares_projection_torch(
     Gram = toeplitz_matrix.conj().T @ (window_sq * toeplitz_matrix)
     RHS = toeplitz_matrix.conj().T @ (window_sq * source_estimates)
 
-    # Directly solve without CPU stall/fallback
-    # Always use linalg.pinv for async-safe SVD truncation of ill-conditioned matrices
-    projection_weights = torch.linalg.pinv(Gram) @ RHS
+    # Same Cholesky-with-pinv-fallback solve as the batched path, so the two stay the
+    # exact single-frame/batched twins the differential tests compare.
+    projection_weights = _solve_hermitian_batch(Gram, RHS)
     projections = torch.zeros((num_samples, source_estimates.shape[1], num_sources), dtype=source_estimates.dtype,
                               device=source_estimates.device)
     weighted_diagonal = analysis_window.unsqueeze(1)
@@ -184,8 +232,7 @@ def perform_time_varying_least_squares_projection_torch(
     Gram = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * toeplitz_batched)
     RHS = toeplitz_batched.conj().transpose(1, 2) @ (window_sq * est_frames)
 
-    # STABILITY FIX: Always use linalg.pinv for async-safe SVD truncation of ill-conditioned matrices
-    weights = torch.linalg.pinv(Gram) @ RHS
+    weights = _solve_hermitian_batch(Gram, RHS)
 
     # weights shape: (NumFrames, num_sources * filter_length, num_channels)
     weights_unflat = weights.view(NumFrames, num_sources, filter_length, num_channels)
@@ -560,6 +607,12 @@ def decompose_distortion_components(
     sources_stacked = torch.stack(shaded_sources, dim=0)  # (S, T, C)
     sources_flat = sources_stacked.transpose(1, 2).reshape(S * C, N_samples)
 
+    # Sources and estimate stay two separate passes over the filterbank. Merging them
+    # into one wider batch was tried (2026-08-10) on the grounds that the batch is
+    # what the FFT parallelises over: measured within noise on mono and slightly
+    # negative on stereo, because it also raises the peak frequency-domain footprint.
+    # The batching argument had force when resampling was an FFT starved of batch;
+    # the polyphase GEMM path in `utils.py` removed that.
     subbands_sources_flat, analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(
         sources_flat, sampling_frequency_hz, half_length_factor=resample_factor
     )
@@ -605,11 +658,14 @@ def decompose_distortion_components(
         decomp_interf.append(int_b)
         decomp_artifacts.append(art_b)
 
-    # Batched Gammatone Synthesis
-    subband_true_batched = [decomp_true[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
-    subband_target_batched = [decomp_target[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
-    subband_interf_batched = [decomp_interf[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
-    subband_artif_batched = [decomp_artifacts[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
+    # Batched Gammatone Synthesis, one pass per distortion component. Concatenating
+    # the four into a single 4*C-row batch was measured alongside the analysis merge
+    # above and behaved the same way: no reliable gain, higher peak memory.
+    components = (decomp_true, decomp_target, decomp_interf, decomp_artifacts)
+    subband_true_batched, subband_target_batched, subband_interf_batched, subband_artif_batched = (
+        [component[b].squeeze(-1).transpose(0, 1) for b in range(num_bands)]
+        for component in components
+    )
 
     def clip_pad(val, target):
         L = val.shape[0]

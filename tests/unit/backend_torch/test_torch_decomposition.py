@@ -105,6 +105,35 @@ def test_torch_shade_window_matches_numpy_backend():
 
 
 @pytest.mark.unit
+def test_torch_hermitian_solve_falls_back_on_rank_deficient_frames():
+    """The Cholesky solver must reproduce `pinv` on frames it cannot factorize.
+
+    `_solve_hermitian_batch` replaced an unconditional `torch.linalg.pinv` with
+    `cholesky_ex` plus a per-matrix fallback. Silent frames make the Gram identically
+    zero and genuinely rank-deficient ones make it merely singular, so both have to
+    keep resolving to the same minimum-norm solution `pinv` gave -- and, just as
+    importantly, the batched factorization must not leak inf/NaN out of the frames it
+    failed on. Nothing else in the suite exercises the failing branch directly.
+    """
+    from peass.backend_torch.decomposition import _solve_hermitian_batch
+
+    generator = torch.Generator().manual_seed(0)
+    size, batch = 9, 6
+    factor = torch.randn(batch, size, size, dtype=torch.float64, generator=generator)
+    gram = factor @ factor.transpose(1, 2) + size * torch.eye(size, dtype=torch.float64)
+    gram[1] = 0.0  # silent frame
+    gram[3] = gram[3][:, :1] @ gram[3][:1, :]  # rank 1, not positive definite
+    rhs = torch.randn(batch, size, 2, dtype=torch.float64, generator=generator)
+
+    _, info = torch.linalg.cholesky_ex(gram)
+    assert bool(info.any()), "test no longer exercises the fallback branch"
+
+    solved = _solve_hermitian_batch(gram, rhs)
+    assert bool(torch.isfinite(solved).all())
+    torch.testing.assert_close(solved, torch.linalg.pinv(gram) @ rhs, rtol=0.0, atol=1e-12)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("device_str", ["cpu", "cuda", "mps"])
 def test_torch_decomposition_algebraic_reconstruction(device_str):
     if device_str == "cuda" and not torch.cuda.is_available():
