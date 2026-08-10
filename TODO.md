@@ -11,10 +11,17 @@ not obvious from the code:
    less redundant work, better algorithms. Numba `prange` was measured at 1.8x and
    declined on exactly this basis (`ARCHIVE.md`). BLAS threading inherited from the
    user's NumPy is a separate matter and is fine.
-2. **Bit-identical changes land; near-exact ones get documented instead.** That is why
-   the torch decomposition stack below is measured, prototyped, and still unlanded at
-   2.10-2.45x. If you want to change that bar, it is a decision to raise explicitly,
-   not to assume.
+2. **Near-exact changes can land, and every one carries a measured deviation.** This
+   rule used to read "bit-identical changes land; near-exact ones get documented
+   instead", and cited the torch decomposition stack as measured, prototyped and
+   deliberately *unlanded* at 2.10-2.45x. That stack landed on 2026-08-10 at a worst
+   deviation of 1.8e-13 relative to each component's peak, correlation 1.0 to fifteen
+   digits — so the bar was moved. The old rule said moving it was "a decision to raise
+   explicitly, not to assume"; this paragraph is that record. What holds now:
+   reassociation and solver substitutions that compute the *same quantity* are
+   landable, each with its worst-case deviation written down in `README.md` and
+   `ARCHIVE.md`; a genuine *approximation* still is not. Bit-identical is still
+   preferred, and the README table still marks which changes are.
 3. **Measure, don't estimate** — and be careful what you claim from one machine. Two
    entries in `ARCHIVE.md` exist because a platform-specific observation was written
    down as a universal invariant.
@@ -32,12 +39,14 @@ not obvious from the code:
 - perf/backprop: the torch metrics (auditory adaptation loop) still dominate
   backprop — ~1.2x backward/forward, ~39s for 2s audio (2026-07-30, after the
   cascade-collapse work in `ARCHIVE.md`) — because it is BPTT through the sequential
-  recurrence (the decomposition's pinv backward is cheap by comparison). The gradient
-  path cannot use the fast forward paths since it needs the straight-through max, so
-  it runs far slower than the no-grad path. A custom `autograd.Function` with a
-  hand-derived analytic backward for the 5-stage cascade would make training-scale
-  backprop practical; it's substantial and needs careful gradient validation. Note
-  the 2026-08-08 Numba kernel does **not** help here — it is forward-only by design.
+  recurrence (the decomposition's solve backward is cheap by comparison — measured
+  when that solve was a `pinv`; since 2026-08-10 it is a Cholesky, so cheaper still).
+  The gradient path cannot use the fast forward paths since it needs the
+  straight-through max, so it runs far slower than the no-grad path. A custom
+  `autograd.Function` with a hand-derived analytic backward for the 5-stage cascade
+  would make training-scale backprop practical; it's substantial and needs careful
+  gradient validation. Note the 2026-08-08 Numba kernel does **not** help here — it is
+  forward-only by design.
 - perf/deprecation: `torch.jit.script` is deprecated in favour of
   `torch.compile`/`torch.export`. Only one call site remains (the adaptation-loop
   fallback in `backend_torch/auditory_model.py`), it is worth ~2x where it is still
