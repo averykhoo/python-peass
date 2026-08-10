@@ -176,7 +176,8 @@ worth keeping:
   constant `(-i)^f`, making each of three sums a sliding window updatable in O(hop).
   Not worth it: it touches only Gram+RHS, 52 us of the 280 us frame, so the ceiling is
   ~4.5% end-to-end, bought with prefix-sum cancellation on an 8572-sample running total.
-- **Removing the redundant fancy-index copy** at `backend_numpy/decomposition.py:425-433`.
+- **Removing the redundant fancy-index copy** at `backend_numpy/decomposition.py:571`
+  (`block = subbands_output[band_indices, :]` in the analysis band loop).
   It copies a whole 1.9 MB row per band (82 ms total) where a zero-copy slice would do.
   Replacing it is bit-identical and **consistently 10% slower** (2.75/2.85/2.75 s vs
   2.49/2.50/2.54 across three independent passes): the "wasted" copy acts as a

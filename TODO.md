@@ -11,17 +11,24 @@ not obvious from the code:
    less redundant work, better algorithms. Numba `prange` was measured at 1.8x and
    declined on exactly this basis (`ARCHIVE.md`). BLAS threading inherited from the
    user's NumPy is a separate matter and is fine.
-2. **Near-exact changes can land, and every one carries a measured deviation.** This
-   rule used to read "bit-identical changes land; near-exact ones get documented
-   instead", and cited the torch decomposition stack as measured, prototyped and
-   deliberately *unlanded* at 2.10-2.45x. That stack landed on 2026-08-10 at a worst
-   deviation of 1.8e-13 relative to each component's peak, correlation 1.0 to fifteen
-   digits — so the bar was moved. The old rule said moving it was "a decision to raise
-   explicitly, not to assume"; this paragraph is that record. What holds now:
-   reassociation and solver substitutions that compute the *same quantity* are
-   landable, each with its worst-case deviation written down in `README.md` and
-   `ARCHIVE.md`; a genuine *approximation* still is not. Bit-identical is still
-   preferred, and the README table still marks which changes are.
+2. **Near-exact changes can land. Measure the deviation against the MATLAB reference
+   audio, not against the last build.** Reassociation and solver substitutions that
+   compute the *same quantity* are landable; a genuine *approximation* is not.
+   Bit-identical is still preferred, and the README table still marks which changes
+   are.
+
+   The bar is `tests/regression/test_matlab_regression.py`, which decomposes
+   `tests/resources/matlab_reference/` and asserts per-component correlation against
+   MATLAB PEASS v2.0.1's gold WAVs plus the locked resampler gain offset. Diffing a
+   change against the previous release is a fine *development* signal, but it is not
+   the bar: each release only ever gets compared to the one before it, so drift
+   ratchets in a step at a time and every step looks clean. A fixed reference cannot
+   drift with you.
+
+   This rule previously required bit-identical outright, and cited the torch
+   decomposition stack as measured, prototyped and deliberately *unlanded* at
+   2.10-2.45x. That stack landed on 2026-08-10; see `ARCHIVE.md`, "Decomposition:
+   torch ~2.2x, numpy ~1.47x", for what it cost in accuracy and how that was verified.
 3. **Measure, don't estimate** — and be careful what you claim from one machine. Two
    entries in `ARCHIVE.md` exist because a platform-specific observation was written
    down as a universal invariant.
@@ -64,22 +71,20 @@ not obvious from the code:
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
 
-## perf ideas not yet taken (decomposition-focused profile, 2026-08-09)
+## perf ideas not yet taken
 
-All prototyped and measured on `tests/resources/database/exp01_*` unless marked
-hypothesis. Ideas that were tried and *failed* are in `ARCHIVE.md` rather than here;
-check there before reviving anything, particularly FIR symmetry folding and Levinson.
+From the decomposition-focused profiles of 2026-08-09 and 2026-08-10. All prototyped
+and measured on `tests/resources/database/exp01_*` unless marked hypothesis, and all
+subject to rule 1 — efficiency and SIMD, no fanning out.
 
-**Updated 2026-08-10.** The bulk of this list has landed — torch P1 and P2 and both
-numpy kernel items, together worth 2.25x mono / 2.06x stereo on torch and 1.47x on
-numpy. See `ARCHIVE.md` "Decomposition: torch ~2.2x, numpy ~1.47x". P3 was implemented,
-measured, and reverted; it is in `ARCHIVE.md` too. What remains below is what is still
-genuinely open, with numbers that now need re-measuring against the faster baseline —
-in particular P4 and P5 were sized as fractions of a decomposition in which resampling
-was 60% of runtime and is now 33%, so their end-to-end value has shrunk.
+What landed, and what was tried and rejected, is in `ARCHIVE.md` rather than here —
+check it before reviving anything, particularly FIR symmetry folding, Levinson, and
+the batching experiment that the polyphase GEMM obsoleted. The P-numbers below start
+at P4 because P1-P3 of the 2026-08-09 list are archived there too.
 
-Everything here must respect the no-threads/no-subprocess constraint (see
-`ARCHIVE.md`) — efficiency and SIMD only.
+**Re-measure before trusting the numbers below.** They were sized against a
+decomposition in which resampling was 60% of runtime; it is 33% now, so the
+end-to-end value of P4 and P5 especially has shrunk.
 
 ### torch
 
@@ -96,20 +101,17 @@ Everything here must respect the no-threads/no-subprocess constraint (see
   analysis + 48.6 ms synthesis) disappear into the 21-tap filters, and the two cached
   modulation matrices (61 MB + 62 MB) can be dropped. Exact in real arithmetic,
   expected ~1 ULP. Effort: high — the index algebra needs careful per-band validation.
+- **Mixed-rate calls still take the FFT path** (`utils.py`), new from the 2026-08-10
+  pass. After the polyphase GEMM the largest single resample entries are the 2/3 and
+  3/2 conversions either side of the filterbank (~12-27 ms each, ~90 ms total, ~7% of
+  the decomposition). A general polyphase form covers them too, but the index algebra
+  is genuinely mixed-rate rather than the clean `up == 1` / `down == 1` cases, so it
+  was left alone. Effort: medium.
 
 ### numpy
 
 - **Synthesis scatter in place** (`decomposition.py:706-721`), ~93 ms of ~246 MB of
-  copies that `fast_resample_poly` could write directly into. Effort: small. This is
-  the only numpy item from the 2026-08-09 pass that has not landed.
-
-### torch, new from the 2026-08-10 pass
-
-- **Mixed-rate calls still take the FFT path** (`utils.py`). After the polyphase GEMM
-  the largest single resample entries are the 2/3 and 3/2 conversions either side of
-  the filterbank (~12-27 ms each, ~90 ms total, ~7% of the decomposition). A general
-  polyphase form covers them too, but the index algebra is genuinely mixed-rate rather
-  than the clean `up == 1` / `down == 1` cases, so it was left alone. Effort: medium.
+  copies that `fast_resample_poly` could write directly into. Effort: small.
 
 ### correctness, not perf
 
