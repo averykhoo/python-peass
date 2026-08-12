@@ -151,6 +151,72 @@ slice of the `N_fft`-wide buffer. Measured speed-neutral at 256 MB (mono 1.313 v
 otherwise allocate ~1 GB twice to produce a few hundred MB of subbands. Tighter budgets
 do start to cost (134 MB: 1.342 / 3.868 s).
 
+### Decomposition optimisations that measured worse, or not at all (2026-08-12)
+
+A second sweep of the same kind, from the profiles taken while landing the 2026-08-12
+pass. Same principle as the 2026-08-09 list below — these all look right on paper.
+
+- **Polyphase GEMM for the *numpy* interpolator**, mirroring what won 2.2x in torch.
+  Interpolation with `down == 1` is exactly one dgemm on a strided `(in_len, 21)` view.
+  Prototyped across the 20 real `(up, in_len)` pairs: **0.30x, i.e. 3.3x slower**, at
+  2e-16 agreement. The torch GEMM won against an *FFT convolution*; numpy's baseline is
+  already a vectorized AXPY kernel. This is the most tempting-looking idea in the file
+  and it is dead — do not port torch wins to numpy without re-measuring the baseline.
+- **`np.zeros` -> `np.empty` + zero-only-the-tail for the synthesis buffer.** 64 MB per
+  call, and after the scatter change only ~4% of each row still needs zeroing. Measured
+  **21.4 -> 23.2 ms, marginally worse**. `np.zeros` is calloc: it gets lazily-zeroed
+  pages from the OS and the cost is the first touch, which the scatter pays either way.
+  Note this is the *opposite* result to the same trick inside the resampler padding
+  buffers, which took decimate from 1.27x to 1.90x (see the 2026-08-10 entry) — the
+  difference is that those buffers are immediately overwritten in full.
+- **Removing the per-band temporary in `_numba_delay_process`.** It allocates a
+  `(delay + num_samples)` buffer per band, fills it, copies `num_samples` back out —
+  ~128 MB of avoidable traffic per mono decomposition. Rewritten to shift against the
+  output row directly: bitwise identical on both output and state, and **0.99x**. The
+  kernel is bound on streaming the complex input, not on the temporary.
+- **Skipping the zero blocks in `toeplitz_stack @ block_diagonal_weights`.** The weights
+  are block-diagonal, so the GEMM does `num_sources`x the necessary flops. Per-source
+  GEMMs measured **0.86x** (3.26 -> 3.79 ms per 256-frame batch) and were not
+  bit-identical (7.4e-15 — BLAS picks different kernels). The per-frame matrices are
+  tiny, so flops are not the cost.
+- **Hermitian `herk` Gram, and fusing the conjugate transpose via `zgemm trans_a=2`.**
+  Would halve flops and kill a 12 MB `.conj()` temporary (6.85 ms per batch, 2.3%), but
+  neither is batched in BLAS, so both force a Python loop over 256 frames — reinstating
+  exactly the overhead the 2026-08-09 batching removed. Reasoned, not prototyped, and
+  judged a near-certain loss.
+- **Batching the four identical `2/3` synthesis downsamples into one 4-row call.**
+  23.94 -> 21.90 ms, **1.09x**, about 2 ms of a 1.2 s decomposition. This is the narrow
+  remaining slice of the archived P3 batching experiment and it confirms that entry's
+  conclusion at finer granularity. Likewise batching the 4 components into 4-row blocks
+  in the band loop: 128 calls collapse to 32, but the Python dispatch is only ~48 us per
+  call, so ~5 ms total, and the padding volume is unchanged.
+
+- **The torch gammatone forward transform is not where the time is.** In
+  `gammatone.py:176` the forward `fft` is 0.009 s against the 32-band inverse at
+  0.131 s. An `rfft` forward would halve ~7% of the transform work and is not worth the
+  Hermitian reconstruction; everything else there routes back to transform sizing, which
+  the dropped sizing item already closed. The `_FFT_CHUNK_BUDGET_BYTES` chunking probed
+  as correctly sized.
+- **Collapsing the synthesis band-group unpack loop** (`decomposition.py:460` and the
+  32-iteration write loop at `:465-478`). Within a decimation group every band
+  necessarily has the same length — `torch.stack` would fail otherwise — so the loop
+  collapses to one advanced-index assignment per group. Bit-identical and trivial, but
+  it moves the same bytes and `torch.stack` did not reach the top 22 of the profile.
+  A readability item that might incidentally be free, not a perf item.
+
+Two observations from the same sweep that are not opportunities but bear on sizing:
+
+- **The numpy resampler kernels are at their achieved ceiling.** Interpolation 337.7 ms,
+  decimation 237.6 ms, mixed 36.8 ms — 612 ms, 42% of the numpy decomposition, still the
+  largest block. That is ~1.9-2.0 real GMAC/s against the ~2.3 GMAC/s this archive
+  already documents for these kernels. Further gains need *fewer MACs*, not better SIMD,
+  and the tap count is pinned at 21 by MATLAB parity (`half_length_factor = 10`). The
+  only route to fewer MACs is folding the modulation into the taps — TODO P5, which is
+  flagged as probably fatal for the same real-FIR reason in numpy as in torch.
+- **The "VECTORIZED 2D BLOCK" comments oversell what happens.** All 32 bands have
+  distinct decimation factors, so every "block" is literally one row — `shape=(1, 8572)`
+  on every synthesis resample. The comments describe an intent, not a realized benefit.
+
 ### Decomposition optimisations that measured worse, or not at all (2026-08-09)
 
 From a decomposition-focused profile of both backends. Each of these is the kind of

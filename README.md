@@ -488,7 +488,7 @@ deliberate, and **not fixed**.
 
 The cause is resampler filter normalization. `scipy.signal.firwin` defaults to
 `scale=True`, which normalizes the Kaiser-windowed sinc to exactly unit DC gain
-(`peass/backend_numpy/gammatone.py:797`, `peass/backend_torch/utils.py:85`). MATLAB's
+(`peass/backend_numpy/gammatone.py:811`, `peass/backend_torch/utils.py:85`). MATLAB's
 `resample` filter is *not* DC-normalized; its raw DC gain is 0.9993253. The decomposition
 performs four resamples per signal path (16k→24k, decimate by `Ndec`, interpolate by
 `Ndec`, 24k→16k), so MATLAB accumulates:
