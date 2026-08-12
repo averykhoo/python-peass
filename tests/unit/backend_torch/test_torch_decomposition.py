@@ -8,6 +8,7 @@ from peass.backend_torch.decomposition import apply_window_shading_torch
 from peass.backend_torch.decomposition import decompose_distortion_components
 from peass.backend_torch.decomposition import matlab_shade_length
 from peass.backend_torch.decomposition import matlab_shade_window_torch
+from peass.backend_torch.gammatone import GammatoneSynthesizerTorch
 
 # (fs, shade_ms) pairs exercised by the MATLAB-fidelity shade window tests. The
 # 44100/5.0, 44100/25.0 and 22050/10.0 entries land exactly on a .5 sample count,
@@ -102,6 +103,44 @@ def test_torch_shade_window_matches_numpy_backend():
         torch_window = matlab_shade_window_torch(fade_samples, torch.device("cpu"), torch.float64)
         numpy_window = torch.from_numpy(np_shade_window(fade_samples))
         torch.testing.assert_close(torch_window, numpy_window, rtol=0.0, atol=1e-15)
+
+
+@pytest.mark.unit
+def test_synthesis_alignment_matrix_is_keyed_on_the_delay():
+    """
+    `_get_synthesis_alignment_matrix_torch` caches `modulation * phase_factors`, and the
+    phase factors depend on the synthesizer delay while the modulation does not. Keying
+    the cache on the modulation's arguments alone would hand a matrix built for one delay
+    to a call that asked for another -- a silent, delay-dependent corruption of every
+    reconstruction that the single-delay regression test could not see.
+    """
+    from peass.backend_torch.decomposition import _get_synthesis_alignment_matrix_torch
+    from peass.backend_torch.gammatone import GammatoneAnalyzerTorch
+    from peass.backend_torch.gammatone import _get_synthesizer_params_torch
+
+    fs, max_len = 16000.0, 256
+    analyzer = GammatoneAnalyzerTorch(fs, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    cfs = tuple(analyzer.center_frequencies.tolist())
+    norms = tuple(analyzer.norms.tolist())
+    coefs = tuple(analyzer.coefs.tolist())
+
+    short_delay = _get_synthesis_alignment_matrix_torch(fs, max_len, cfs, "cpu", 0.004, norms, coefs)
+    long_delay = _get_synthesis_alignment_matrix_torch(fs, max_len, cfs, "cpu", 0.008, norms, coefs)
+    assert not torch.equal(short_delay, long_delay)
+
+    # And it really is modulation times that delay's phase factors, bitwise.
+    steps = torch.arange(max_len, dtype=torch.float64)
+    modulation = torch.exp(2j * math.pi / fs * analyzer.center_frequencies.unsqueeze(1) * steps)
+    for delay_seconds, cached in ((0.004, short_delay), (0.008, long_delay)):
+        _, phase_factors, _ = _get_synthesizer_params_torch(delay_seconds, fs, cfs, norms, coefs, "cpu")
+        assert torch.equal(cached, modulation * phase_factors.unsqueeze(-1))
+
+    # The shared parameter cache it reads from must come back untouched.
+    delays, phase_factors, gains = _get_synthesizer_params_torch(0.004, fs, cfs, norms, coefs, "cpu")
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    assert torch.equal(delays, synth.delays)
+    assert torch.equal(phase_factors, synth.phase_factors)
+    assert torch.equal(gains, synth.gains)
 
 
 @pytest.mark.unit

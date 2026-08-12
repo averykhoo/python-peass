@@ -238,6 +238,63 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### P4 — torch synthesis chain fused, ~1.15-1.18x, and one third of it declined (2026-08-12)
+
+`GammatoneSynthesizerTorch.process` was four full passes over the band block plus a
+gathered index tensor: modulate, phase-align and take `.real`, `gather` the delay shift,
+`where` the pre-onset mask, `einsum` the mixer gains. It is now one 32-iteration
+shift-accumulate,
+`out.narrow(-1, d, n).add_((subbands[..., b, :n] * alignment[b, :n]).real, alpha=gain)`,
+with the `where` mask falling out for free as the untouched `out[:d]`.
+`_get_synthesis_mod_matrix_torch` is replaced by `_get_synthesis_alignment_matrix_torch`,
+which caches `modulation * phase_factors` as one tensor keyed on the phase factors' full
+dependency set (`delay_sec`, `fs`, cfs, `norms`, `coefs`) as well as the modulation's —
+it builds its own `exp` rather than reading the old bare-matrix cache, so resident cache
+memory is unchanged at one 62 MB tensor.
+
+**The third sub-change from the original P4 sketch was dropped.** Writing
+`x.real*c.real - x.imag*c.imag` by hand instead of a complex multiply then `.real` is
+exactly bit-identical (measured 0.0e+00, as predicted — torch computes the real
+component as precisely that expression), but it is **0.85x mono / 0.84x stereo**: the
+`.real`/`.imag` views are stride-2 and give up torch's vectorized complex multiply.
+Worse, combined with the fused alignment matrix it cancelled that change's entire win —
+the full a+b+c combination the TODO proposed measures 1.76x where a+c measures 2.99x on
+the same data. There is a warning comment at the site so nobody re-adds it.
+
+Deviation, isolated per sub-change on the synthesizer's own output: the alignment cache
+2.84e-16 (reassociating `(x*m)*p` to `x*(m*p)`), the shift-accumulate 4.25e-16 (a
+different summation order over the 32 bands than `einsum`), combined 4.25e-16 mono /
+4.96e-16 stereo. End to end it is 7.99e-16 of each component's peak, correlations
+1.000000000000000, worst MATLAB correlation drop 2.22e-16, and gain error growth exactly
+zero on all 16 rows. It adds nothing measurable on top of the mixed-rate change.
+
+Timing, order-balanced paired A/B: the isolated chain is 2.649x mono (50.6 -> 19.1 ms)
+and 2.540x stereo (92.3 -> 36.3 ms), beating the 2.21x this was prototyped at; the whole
+torch decomposition is 1.175x mono (+191 ms, ~9.5 sigma over 12 interleaved repeats) and
+1.148x stereo (+323 ms, ~11 sigma). TODO.md had sized it at 1.08x.
+
+The 246 MB in the original note was the allocation tally rather than the block, and it
+checks out: the block is 61.6 MB mono, and the old chain allocated 251 MB mono / 437 MB
+stereo across `P*M`, `(X*ph).real`, the int64 index tensor, the bool mask, the clamp, the
+gather, the `where` and the `einsum` output. The new tally is 2.9 MB / 5.8 MB, and the
+measured working-set rise across the chain falls from +70 MB mono / +377 MB stereo to
++0.4 MB / +3.5 MB. So it was allocator-bound, as claimed.
+
+Two behavioural notes. Gradients are exactly identical (0.0e+00 on `dL/dsubbands`, both
+layouts) and `gradcheck` passes, but `alpha=gain` needs Python floats, so `gains` and
+`delays` are read out with `.tolist()` in `__init__` — that severs a gradient path to
+`gains` which the old `einsum` nominally had. Nothing is lost today, since `gains` is a
+constant built from `torch.ones_like` inside a cached function and never requires grad,
+but it would matter if the mixer gains were ever made learnable. And negative delays are
+now explicitly unhandled: `delays = target_delay - argmax(|ir|[:target_delay+1])` is
+non-negative by construction, and the old `gather` would have indexed out of bounds for a
+negative one, so there is no prior semantics to preserve. Zero delays *are* reachable
+(fs = 16 kHz, 0.004 s) and are covered by tests.
+
+Also measured and not taken: folding the mixer gains into the cached matrix as well. It
+came out slightly slower than `alpha=gain` and would have made the cache depend on the
+gains.
+
 ### torch mixed-rate polyphase — the FFT route retired to a fallback (2026-08-12)
 
 The 3/2 upsample in front of the filterbank and the 2/3 downsample behind it were the

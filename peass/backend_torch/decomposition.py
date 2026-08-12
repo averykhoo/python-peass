@@ -12,6 +12,7 @@ import torch.nn.functional as F
 
 from .gammatone import GammatoneAnalyzerTorch
 from .gammatone import GammatoneSynthesizerTorch
+from .gammatone import _get_synthesizer_params_torch
 from .utils import DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 from .utils import fast_resample_poly_torch
 from ..config import DecomposedFilePaths
@@ -28,11 +29,35 @@ def _get_analysis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, de
 
 
 @lru_cache(maxsize=16)
-def _get_synthesis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str):
+def _get_synthesis_alignment_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str,
+                                          delay_sec: float, norms_tuple: tuple, coefs_tuple: tuple):
+    """Synthesis modulation matrix pre-multiplied by the synthesizer's phase factors.
+
+    ``exp(+2j*pi*fc*t/fs) * phase_factor[band]`` -- the two per-band constants the
+    synthesis path applies back to back. Fusing them turns two full passes over the
+    (62 MB mono / 123 MB stereo) subband block into one, and re-associating
+    ``(x * mod) * phase`` into ``x * (mod * phase)`` costs ~1 ULP.
+
+    Keyed on the phase factors' full dependency set (``delay_sec``, ``fs``, the center
+    frequencies and the filter ``norms``/``coefs``) as well as the modulation's
+    (``fs``, ``max_len``, center frequencies, device). Keying it on the modulation's
+    arguments alone would silently serve a matrix built for a different delay.
+
+    This *replaces* a separate cache of the bare modulation matrix rather than adding to
+    one: the bare matrix had no other caller, so the resident cost is unchanged. The
+    analysis-side cache above is untouched, and `_get_synthesizer_params_torch` is only
+    read from here -- the product below is a fresh tensor, so neither cache entry is
+    disturbed.
+    """
     device = torch.device(device_str)
     cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
     time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
-    return torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
+    modulation = torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
+
+    _, phase_factors, _ = _get_synthesizer_params_torch(
+        delay_sec, fs, cfs_tuple, norms_tuple, coefs_tuple, device_str
+    )
+    return modulation * phase_factors.unsqueeze(-1)
 
 
 def _solve_hermitian_batch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -452,15 +477,18 @@ def run_auditory_synthesis_filterbank_torch(
                 else:
                     processed[band_idx, :curr_len] = upsampled
 
-    # Re-modulate back to center frequencies prior to synthesis
-    mod_matrix = _get_synthesis_mod_matrix_torch(
-        analyzer.fs, max_len, tuple(analyzer.center_frequencies.tolist()), str(analyzer.center_frequencies.device)
-    )
-    processed = processed * mod_matrix
-
+    # Re-modulate back to center frequencies and phase-align, in one cached matrix that
+    # the synthesizer applies band by band. Multiplying `processed` by the modulation
+    # here would cost a full extra pass over a 62-123 MB block for nothing.
     desired_delay_seconds = 1000.0 / analyzer.fs
+    alignment = _get_synthesis_alignment_matrix_torch(
+        analyzer.fs, max_len, tuple(analyzer.center_frequencies.tolist()),
+        str(analyzer.center_frequencies.device), desired_delay_seconds,
+        tuple(analyzer.norms.tolist()), tuple(analyzer.coefs.tolist())
+    )
+
     synth = GammatoneSynthesizerTorch(analyzer, desired_delay_seconds)
-    reconstructed = synth.process(processed)
+    reconstructed = synth.process(processed, alignment=alignment)
 
     # 1. Downsample back to the original frequency to prevent duration expansion
     original_fs = analyzer.original_sampling_frequency_hz

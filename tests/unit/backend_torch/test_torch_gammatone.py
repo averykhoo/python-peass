@@ -50,6 +50,174 @@ def test_torch_gammatone_filterbank(device_str):
     assert corr > 0.90, f"PyTorch reconstruction fidelity failed. Correlation is {corr:.4f}"
 
 
+def gather_synthesis_reference(synth: GammatoneSynthesizerTorch, subbands: torch.Tensor,
+                               alignment: torch.Tensor = None) -> torch.Tensor:
+    """
+    Independent oracle for `GammatoneSynthesizerTorch.process`, kept in the pre-fusion
+    form: build the whole phase-aligned block, shift it with `gather` against an index
+    tensor, mask the pre-onset samples with `where`, then contract with the mixer gains.
+
+    The production version fuses all four steps into one per-band accumulate, which is
+    ~2.7x faster but re-associates the arithmetic (`(x*mod)*phase` -> `x*(mod*phase)`,
+    and a different summation order over the bands). Everything below asserts the two
+    agree to a few ULP -- they compute the same quantity, so a real divergence here is a
+    bug, not rounding.
+    """
+    aligned = (subbands * (synth.phase_factors.view(-1, 1) if alignment is None else alignment)).real
+    time_steps = aligned.shape[-1]
+
+    idx = torch.arange(time_steps, device=aligned.device).unsqueeze(0) - synth.delays.unsqueeze(1)
+    valid = idx >= 0
+    idx_clamped = torch.clamp(idx, min=0)
+
+    shape_prefix = [1] * (aligned.dim() - 2)
+    idx_clamped = idx_clamped.view(*shape_prefix, synth.delays.shape[0], time_steps).expand_as(aligned)
+    valid = valid.view(*shape_prefix, synth.delays.shape[0], time_steps).expand_as(aligned)
+
+    shifted = torch.gather(aligned, -1, idx_clamped)
+    out = torch.where(valid, shifted, 0.0)
+    return torch.einsum('b, ...bt -> ...t', synth.gains.to(out.dtype), out)
+
+
+def _random_subbands(num_bands: int, shape_prefix: tuple, time_steps: int, seed: int) -> torch.Tensor:
+    generator = torch.Generator().manual_seed(seed)
+    size = shape_prefix + (num_bands, time_steps)
+    return (torch.randn(*size, generator=generator, dtype=torch.float64)
+            + 1j * torch.randn(*size, generator=generator, dtype=torch.float64))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape_prefix", [(), (1,), (2,), (3, 2)])
+def test_torch_synthesizer_matches_gather_formulation(shape_prefix):
+    """
+    The fused per-band delay-and-sum must reproduce the gather/where/einsum formulation
+    it replaced, batched and unbatched. Stereo reaches this through the batched path.
+    """
+    analyzer = GammatoneAnalyzerTorch(16000.0, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    num_bands = len(analyzer.center_frequencies)
+
+    subbands = _random_subbands(num_bands, shape_prefix, 2000, seed=4242)
+    expected = gather_synthesis_reference(synth, subbands)
+    actual = synth.process(subbands)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == expected.dtype
+    # Re-association only: a few ULP of the output's own scale.
+    assert float((actual - expected).abs().max()) < 1e-13 * float(expected.abs().max())
+
+
+@pytest.mark.unit
+def test_torch_synthesizer_alignment_argument_matches_premultiplying():
+    """
+    Passing a fused `(Bands, Time)` alignment matrix must equal pre-multiplying the
+    subbands by it and letting `process` apply the phase factors itself. This is exactly
+    what the decomposition does with the cached modulation-times-phase matrix, so a
+    broadcasting or indexing slip here would silently corrupt every reconstruction.
+    """
+    fs = 16000.0
+    time_steps = 1500
+    analyzer = GammatoneAnalyzerTorch(fs, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    num_bands = len(analyzer.center_frequencies)
+
+    steps = torch.arange(time_steps, dtype=torch.float64)
+    modulation = torch.exp(2j * math.pi / fs * analyzer.center_frequencies.unsqueeze(1) * steps)
+    alignment = modulation * synth.phase_factors.unsqueeze(-1)
+
+    for shape_prefix in [(), (2,)]:
+        subbands = _random_subbands(num_bands, shape_prefix, time_steps, seed=99)
+        expected = synth.process(subbands * modulation)
+        actual = synth.process(subbands, alignment=alignment)
+        assert float((actual - expected).abs().max()) < 1e-13 * float(expected.abs().max())
+
+
+@pytest.mark.unit
+def test_torch_synthesizer_zeroes_samples_before_each_band_onset():
+    """
+    `where(valid, shifted, 0)` used to zero every sample before a band's delay onset.
+    The fused loop expresses that as the region of the output buffer the accumulate never
+    touches, so it has to be checked directly: feeding a single band must leave exactly
+    its first `delay` samples at zero, and the rest equal to the gain-scaled band.
+    """
+    analyzer = GammatoneAnalyzerTorch(16000.0, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    num_bands = len(analyzer.center_frequencies)
+    time_steps = 400
+
+    band = int(torch.argmax(synth.delays))
+    delay = int(synth.delays[band])
+    assert delay > 0, "test needs a band with a non-zero delay"
+
+    subbands = torch.zeros(num_bands, time_steps, dtype=torch.complex128)
+    subbands[band] = _random_subbands(1, (), time_steps, seed=7)[0]
+    out = synth.process(subbands)
+
+    assert torch.all(out[:delay] == 0.0)
+    expected_tail = (synth.gains[band] * (subbands[band] * synth.phase_factors[band]).real)[:time_steps - delay]
+    assert float((out[delay:] - expected_tail).abs().max()) < 1e-14 * float(expected_tail.abs().max())
+
+
+@pytest.mark.unit
+def test_torch_synthesizer_drops_bands_delayed_past_the_signal():
+    """
+    A signal shorter than a band's delay contributes nothing from that band. The gather
+    formulation got this from an all-False `valid` mask; the fused loop gets it from
+    skipping the band. Both must agree, and a signal shorter than every delay must give
+    exact zeros.
+    """
+    analyzer = GammatoneAnalyzerTorch(16000.0, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    num_bands = len(analyzer.center_frequencies)
+    longest = int(synth.delays.max())
+
+    for time_steps in (1, longest // 2, longest, longest + 1):
+        subbands = _random_subbands(num_bands, (), time_steps, seed=time_steps)
+        expected = gather_synthesis_reference(synth, subbands)
+        actual = synth.process(subbands)
+        assert actual.shape == expected.shape
+        scale = float(expected.abs().max())
+        assert float((actual - expected).abs().max()) <= 1e-13 * max(scale, 1e-300)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape_prefix", [(), (2,)])
+def test_torch_synthesizer_gradients_match_gather_formulation(shape_prefix):
+    """
+    The synthesizer sits on the training path, and the fused version accumulates in place
+    into a fresh buffer. In-place writes are the classic way to silently break autograd,
+    so the gradient is compared against the out-of-place formulation directly.
+    """
+    analyzer = GammatoneAnalyzerTorch(16000.0, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    num_bands = len(analyzer.center_frequencies)
+
+    subbands = _random_subbands(num_bands, shape_prefix, 800, seed=1234)
+    weights = torch.randn(*(shape_prefix + (800,)), generator=torch.Generator().manual_seed(5), dtype=torch.float64)
+
+    reference_input = subbands.clone().requires_grad_(True)
+    (gather_synthesis_reference(synth, reference_input) * weights).sum().backward()
+
+    fused_input = subbands.clone().requires_grad_(True)
+    (synth.process(fused_input) * weights).sum().backward()
+
+    assert fused_input.grad is not None
+    assert torch.isfinite(fused_input.grad).all()
+    assert float((fused_input.grad - reference_input.grad).abs().max()) < 1e-13 * float(
+        reference_input.grad.abs().max())
+
+
+@pytest.mark.unit
+def test_torch_synthesizer_passes_gradcheck():
+    """Numerical gradient check of the fused accumulate on a small configuration."""
+    analyzer = GammatoneAnalyzerTorch(8000.0, 500.0, 1000.0, 2000.0, 1.0, torch.device("cpu"), torch.float64)
+    synth = GammatoneSynthesizerTorch(analyzer, 0.002)
+    num_bands = len(analyzer.center_frequencies)
+
+    subbands = _random_subbands(num_bands, (), 40, seed=31).requires_grad_(True)
+    assert torch.autograd.gradcheck(synth.process, (subbands,), eps=1e-6, atol=1e-9)
+
+
 def _recover_audiological_bandwidths(analyzer: GammatoneAnalyzerTorch) -> np.ndarray:
     """
     Inverts the Hohmann 2002 eq. (14) chain to recover the audiological ERBs that the

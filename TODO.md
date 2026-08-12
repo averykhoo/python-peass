@@ -79,28 +79,34 @@ subject to rule 1 — efficiency and SIMD, no fanning out.
 
 What landed, and what was tried and rejected, is in `ARCHIVE.md` rather than here —
 check it before reviving anything, particularly FIR symmetry folding, Levinson, and
-the batching experiment that the polyphase GEMM obsoleted. The P-numbers below start
-at P4 because P1-P3 of the 2026-08-09 list are archived there too.
+the batching experiment that the polyphase GEMM obsoleted. The P-numbers started at P4
+because P1-P3 of the 2026-08-09 list are archived there too; P4 and the two non-P items
+landed on 2026-08-12, leaving P5 as the only one still open.
 
-**Re-measure before trusting the numbers below.** They were sized against a
-decomposition in which resampling was 60% of runtime; it is 33% now, so the
-end-to-end value of P4 and P5 especially has shrunk.
+**Re-measure before trusting the number below.** It was sized against a decomposition
+in which resampling was 60% of runtime; it is well under a third now.
 
 ### torch
 
-- **P4, was 1.08x — fuse the synthesis modulation/phase/delay/gain chain**
-  (`decomposition.py:459` + `gammatone.py:238-256`). Currently four full passes over a
-  246 MB block plus a gathered index tensor. Cache `mod_matrix * phase_factors`, use
-  `x.real*c.real - x.imag*c.imag` instead of a complex multiply then `.real`, and
-  replace `gather`/`where`/`einsum` with a 32-iteration shift-accumulate. Measured
-  298.6 ms -> 135.3 ms (2.21x) in isolation, deviation 4.3e-16, but allocator-bound so
-  worth less end-to-end than that implies. Effort: medium.
-- **P5, hypothesis, removes 109 ms — fold the modulation into the polyphase filters**
-  (`decomposition.py:382` and `:459`). Complex-exponential modulation distributes
-  through convolution exactly, so the two full-length modulation multiplies (60.0 ms
-  analysis + 48.6 ms synthesis) disappear into the 21-tap filters, and the two cached
-  modulation matrices (61 MB + 62 MB) can be dropped. Exact in real arithmetic,
-  expected ~1 ULP. Effort: high — the index algebra needs careful per-band validation.
+- **P5, hypothesis, was sized at 109 ms — fold the modulation into the polyphase
+  filters** (`decomposition.py:382` and the synthesis alignment matrix). Complex-
+  exponential modulation distributes through convolution exactly, so the full-length
+  modulation multiplies fold into the 21-tap filters and the cached modulation matrices
+  (61 MB + 62 MB) can be dropped. Exact in real arithmetic, expected ~1 ULP.
+  Effort: high — the index algebra needs careful per-band validation.
+
+  **Two caveats found on 2026-08-12 that the original sizing missed, and the second is
+  probably fatal.** First, the modulation does not vanish, it shrinks:
+  `m[n]·(h*x)[n] = Σ (h[k]m[k])·(m[n-k]x[n-k])`, so folding it into the taps leaves a
+  residual modulation on the *decimated*-rate side — `m[mD]` on the analysis output,
+  the mirror of it on the synthesis input. That is still 32 multiplies of length
+  `T/D_b`; cheap, but 109 ms is an upper bound, not the saving. Second, a modulated
+  kernel is **complex**, which kills `_split_real_imag` (`utils.py`). The entire complex
+  win in the polyphase GEMM is that the FIR is real — one real multiply per tap instead
+  of four — so a complex kernel turns each polyphase GEMM into four real GEMMs, and
+  those GEMMs are now the dominant remaining cost. Measure that before writing any of
+  the index algebra: it plausibly costs more than it saves. Note also that the synthesis
+  half of this item now overlaps the fused alignment matrix P4 introduced.
 
 ### correctness, not perf
 

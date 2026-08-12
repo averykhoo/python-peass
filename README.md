@@ -231,9 +231,10 @@ NumPy backend by high correlation rather than to floating-point precision.
 #### Decomposition
 
 The decomposition is ~2.2x faster as of 2026-08-10 (mono 2.850 s -> 1.268 s, stereo
-7.286 s -> 3.531 s on the reference 5 s example). Two changes account for it, neither
-an approximation — both compute the same quantity, and output agrees with the previous
-release to 1.8e-13 of each component's peak, correlation 1.0 to all 15 digits:
+7.286 s -> 3.531 s on the reference 5 s example), with a further ~1.21-1.31x from the
+2026-08-12 pass below. None of these is an approximation — every one computes the same
+quantity, correlation against the previous release is 1.0 to all 15 digits, and
+correlation against the MATLAB gold WAVs is unchanged to 13 decimals:
 
 - **The resampler is a polyphase GEMM rather than an FFT convolution.** As of
   2026-08-10 this covered pure interpolation and pure decimation, 196 of its 198 calls;
@@ -269,6 +270,18 @@ release to 1.8e-13 of each component's peak, correlation 1.0 to all 15 digits:
   way to solve a linear system. `cholesky_ex` reports failure per matrix, which gives
   the same graceful handling of rank-deficient and silent frames that motivated pinv —
   those frames fall back to it, and agree with the old path to 1.7e-16.
+
+- **The synthesis chain is one shift-accumulate rather than five passes** (2026-08-12).
+  `GammatoneSynthesizerTorch.process` used to modulate, phase-align and take `.real`,
+  `gather` a delay shift, `where` a pre-onset mask, then `einsum` the mixer gains — five
+  full passes over the band block and 251 MB of allocation mono, 437 MB stereo. It is
+  now a 32-iteration accumulate into a narrowed output view, with the modulation and
+  phase factors cached premultiplied as one tensor and the mask falling out as the
+  region the accumulate never touches. Allocation drops to 2.9 MB / 5.8 MB and the
+  measured working-set rise across the chain from +70 MB mono / +377 MB stereo to
+  +0.4 MB / +3.5 MB. Worth 2.6x on the chain and ~1.15-1.18x end-to-end; deviation
+  8.0e-16 of each component's peak, from reassociating the phase multiply and summing
+  the 32 bands in a different order than `einsum` did. Gradients are bit-identical.
 
 Note that `GammatoneAnalyzerTorch.process` chunks its batch to bound the two
 frequency-domain intermediates. That is a memory bound, not a speedup; it measured
