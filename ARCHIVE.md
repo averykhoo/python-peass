@@ -238,6 +238,45 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### numpy synthesis scatter in place — bit-identical, ~1.07-1.08x (2026-08-12)
+
+`fast_resample_poly` gained an `out=` parameter and the four Numba polyphase kernels
+now take their destination buffer as an argument instead of allocating one, so
+`run_auditory_synthesis_filterbank` writes the upsampled bands straight into
+`processed_subbands` rather than into a temporary it then copies row by row.
+
+**Bit-identical, asserted as byte equality, not a tolerance.** No arithmetic moved:
+every dot product and AXPY still reads only the padded input and accumulates in
+registers or a local buffer, so only the store address changes. Verified against a
+frozen pre-change capture of all four components on both the MATLAB reference input and
+the exp01 nonlinear estimate — worst relative deviation 0.000e+00 on every waveform,
+reproduced on an independent second run.
+
+The `out=` contract is "the result goes into `out[..., :out_len]`, and nothing from
+`out_len` onward is touched", strictly validated (last axis, C-contiguous, matching
+leading shape, exact dtype) and raising rather than silently falling back — a silent
+fallback here would look like a working optimisation that never engaged. The
+decomposition-side guard additionally refuses the in-place path unless
+`resample_output_length(...) <= target_length` for every band in the block, so the
+truncating branch can never take it; that branch is the only one allowed to discard
+samples, and an in-place write there would leak filter tail past `target_length` into a
+region the old code deliberately left zero. In the real filterbank all 32 blocks pass
+the guard, because decimation factors fall monotonically with band index and bands
+sharing a factor have equal length, so `out_len == target_length` exactly.
+
+Timed by a paired in-process A/B — interleaved repeats with the scatter forced on and
+off in one process, because end-to-end wall clock drifted ~6% between runs that day
+(torch, untouched, moved 1.02-1.07x across the same pair of runs, which is how the
+drift was caught). 1.351 s -> 1.311 s mono, 3.231 s -> 3.028 s stereo, min of eight,
+with the stereo distributions not overlapping at all. The naive before/after of two
+separate `measure.py` runs flattered it to 1.19x; the A/B number is the honest one.
+
+Two things this did *not* buy: the SciPy fallback cannot write in place at all
+(`upfirdn` allocates internally), so it keeps the copy route and gets correctness but
+no win; and the truncate/short-write branches turn out to be unreachable in practice,
+since `np.array([...])` over ragged rows would raise, so all bands in a group have
+equal length. Both branches are kept and tested as defensive code.
+
 ### Decomposition: torch ~2.2x, numpy ~1.47x (2026-08-10)
 
 Measured on `tests/resources/database/exp01_*` with a *nonlinear* estimate

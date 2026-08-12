@@ -22,6 +22,7 @@ from .gammatone import GammatoneAnalyzer
 from .gammatone import GammatoneSynthesizer
 from .gammatone import calculate_equivalent_rectangular_bandwidth
 from .gammatone import fast_resample_poly
+from .gammatone import resample_output_length
 
 
 @lru_cache(maxsize=8)
@@ -680,6 +681,44 @@ def get_synthesis_modulation_matrix(
     return _store_modulation_matrix(cache_key, matrix)
 
 
+def _can_scatter_upsampling_in_place(
+        block: np.ndarray,
+        band_indices: np.ndarray,
+        subband_list: list,
+        factor: int,
+        processed_subbands: np.ndarray
+) -> bool:
+    """Whether a synthesis upsampling block may be written straight into its rows.
+
+    Four things have to hold, and all four are about not corrupting the parts of
+    `processed_subbands` this block does not own:
+
+    * the block is a plain rectangular 2D array (ragged input would have produced
+      an object array, which the resampler cannot handle in place);
+    * its destination rows are one contiguous slab, so `processed_subbands[lo:hi]`
+      is a genuine C-contiguous view -- fancy indexing would hand back a copy and
+      the write would be silently thrown away;
+    * `out=`'s dtype contract is met (complex input needs a complex128 buffer);
+    * and, the load-bearing one, the upsampled length is <= EVERY band's
+      target_length, so writing columns [0, out_len) can never reach past
+      target_length into the zeros the copy route deliberately leaves behind.
+
+    In the real filterbank all four always hold: decimation factors fall
+    monotonically with band index so each factor's bands are consecutive, and every
+    band sharing a factor has the same subband length, which makes out_len exactly
+    equal to target_length. The guard exists so that an unusual caller degrades to
+    the copy route instead of to wrong output.
+    """
+    if block.ndim != 2 or block.dtype == object:
+        return False
+    if np.iscomplexobj(block) != np.iscomplexobj(processed_subbands):
+        return False
+    if int(band_indices[-1]) - int(band_indices[0]) + 1 != band_indices.size:
+        return False
+    upsampled_length = resample_output_length(block.shape[-1], factor, 1)
+    return all(upsampled_length <= len(subband_list[b]) * factor for b in band_indices)
+
+
 def run_auditory_synthesis_filterbank(
         subband_list: list,
         analyzer: GammatoneAnalyzer,
@@ -698,9 +737,27 @@ def run_auditory_synthesis_filterbank(
     unique_factors = np.unique(analyzer.decimation_factors)
 
     for factor in unique_factors:
+        factor = int(factor)
         band_indices = np.where(analyzer.decimation_factors == factor)[0]
         # Faster stacking than vstack
         block = np.array([subband_list[b] for b in band_indices])
+
+        if _can_scatter_upsampling_in_place(block, band_indices, subband_list, factor, processed_subbands):
+            # Resample straight into the rows we own instead of allocating an
+            # upsampled block and copying it in. `out=` writes only the first
+            # `resample_output_length` columns of each row, and the guard above has
+            # already established that this is <= every band's target_length, so the
+            # zeros this loop is supposed to leave behind -- both the short-write gap
+            # below target_length and the whole tail past it -- are never written
+            # over. The truncating case (`curr_len > target_length`) is deliberately
+            # NOT served here: writing in place would have to lay down samples past
+            # target_length before discarding them, so it falls through to the copy
+            # route, which is the only branch that can throw samples away.
+            fast_resample_poly(
+                block, factor, 1, axis=-1, half_length_factor=half_length_factor,
+                out=processed_subbands[band_indices[0]:band_indices[-1] + 1]
+            )
+            continue
 
         # Vectorized 2D upsampling along axis=-1
         upsampled_block = fast_resample_poly(block, factor, 1, axis=-1, half_length_factor=half_length_factor)

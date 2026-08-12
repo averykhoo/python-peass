@@ -570,3 +570,134 @@ def test_modulation_matrix_cache_stays_bounded():
         get_synthesis_modulation_matrix(24000.0, num_samples, center_frequencies)
         assert (len(decomposition_module._MODULATION_MATRIX_CACHE)
                 <= decomposition_module._MODULATION_MATRIX_CACHE_SIZE)
+
+
+# -----------------------------------------------------------------------------
+# Synthesis upsampling scattered in place
+# -----------------------------------------------------------------------------
+#
+# `run_auditory_synthesis_filterbank` upsamples each decimation group straight
+# into the zero-filled (bands x samples) buffer instead of building an upsampled
+# block and copying it in row by row. Two properties have to hold and both are
+# checked here against the copy route it replaced: the reconstruction is bitwise
+# unchanged, and every sample the copy route deliberately left at zero -- the
+# short-write gap and the whole tail past each band's target length -- is still
+# zero, i.e. the in-place write never leaks filter tail samples past the region
+# the band owns.
+
+def synthesis_subbands_for_scatter_tests(num_samples: int = 4096, fs: float = 8000.0):
+    """A real analysis pass, so the decimation factors and lengths are the real ones."""
+    time_steps = np.arange(num_samples) / fs
+    signal_input = (np.sin(2.0 * np.pi * 220.0 * time_steps)
+                    + 0.4 * np.sin(2.0 * np.pi * 1750.0 * time_steps))
+    return run_auditory_analysis_filterbank(signal_input, fs)
+
+
+def synthesize_via_copy_route(monkeypatch, subbands, analyzer):
+    """Force the pre-optimization allocate-then-copy scatter."""
+    monkeypatch.setattr(decomposition_module, "_can_scatter_upsampling_in_place",
+                        lambda *args, **kwargs: False)
+    return run_auditory_synthesis_filterbank(subbands, analyzer)[0]
+
+
+@pytest.mark.unit
+def test_synthesis_scatter_in_place_is_bitwise_identical_to_copy_route(monkeypatch):
+    subbands, analyzer, _ = synthesis_subbands_for_scatter_tests()
+
+    taken = []
+    original_guard = decomposition_module._can_scatter_upsampling_in_place
+    monkeypatch.setattr(
+        decomposition_module, "_can_scatter_upsampling_in_place",
+        lambda *args, **kwargs: taken.append(original_guard(*args, **kwargs)) or taken[-1]
+    )
+    in_place = run_auditory_synthesis_filterbank(subbands, analyzer)[0]
+    monkeypatch.undo()
+
+    # The optimization is worthless if the guard quietly declines every block.
+    assert taken and all(taken), f"in-place scatter never engaged: {taken}"
+
+    copied = synthesize_via_copy_route(monkeypatch, subbands, analyzer)
+    assert in_place.shape == copied.shape
+    assert in_place.tobytes() == copied.tobytes()
+
+
+@pytest.mark.unit
+def test_synthesis_scatter_leaves_padding_zero(monkeypatch):
+    """The buffer handed to the synthesizer must be zero past each band's target
+    length -- that padding is what the copy route's short-write branch produced."""
+    subbands, analyzer, _ = synthesis_subbands_for_scatter_tests()
+
+    captured = {}
+    real_synthesizer = decomposition_module.GammatoneSynthesizer
+
+    class CapturingSynthesizer(real_synthesizer):
+        def process(self, input_data):
+            captured["subbands"] = np.array(input_data, copy=True)
+            return super().process(input_data)
+
+    monkeypatch.setattr(decomposition_module, "GammatoneSynthesizer", CapturingSynthesizer)
+    run_auditory_synthesis_filterbank(subbands, analyzer)
+
+    modulated = captured["subbands"]
+    assert modulated.shape[0] == len(subbands)
+    padded_bands = 0
+    for band_idx, subband in enumerate(subbands):
+        target_length = len(subband) * int(analyzer.decimation_factors[band_idx])
+        tail = modulated[band_idx, target_length:]
+        assert np.all(tail == 0.0), f"band {band_idx} leaked {np.count_nonzero(tail)} samples past its target"
+        padded_bands += tail.size > 0
+    # Only the longest band fills the buffer; the rest must actually have padding,
+    # otherwise this test proves nothing.
+    assert padded_bands >= len(subbands) - 1
+
+
+@pytest.mark.unit
+def test_synthesis_scatter_guard_rejects_unsafe_blocks():
+    """The guard is what keeps the in-place write inside the region it owns."""
+    block = np.zeros((3, 16), dtype=complex)
+    destination = np.zeros((6, 1024), dtype=complex)
+    subband_list = [np.zeros(16, dtype=complex)] * 6
+
+    contiguous = np.array([1, 2, 3])
+    assert decomposition_module._can_scatter_upsampling_in_place(
+        block, contiguous, subband_list, 4, destination)
+
+    # Fancy-indexed rows would be a copy, so the resample would vanish.
+    scattered = np.array([0, 2, 4])
+    assert not decomposition_module._can_scatter_upsampling_in_place(
+        block, scattered, subband_list, 4, destination)
+
+    # Real block into a complex destination: dtype contract of `out=` is not met.
+    assert not decomposition_module._can_scatter_upsampling_in_place(
+        block.real, contiguous, subband_list, 4, destination)
+
+    # Upsampled length longer than a band's target length would overwrite zeros
+    # the copy route's truncating branch is required to preserve.
+    short_targets = list(subband_list)
+    short_targets[2] = np.zeros(15, dtype=complex)
+    assert not decomposition_module._can_scatter_upsampling_in_place(
+        block, contiguous, short_targets, 4, destination)
+
+
+@pytest.mark.unit
+def test_synthesis_scatter_falls_back_for_interleaved_decimation_factors(monkeypatch):
+    """Non-consecutive bands per factor must degrade to the copy route, not to
+    silently dropped writes."""
+    subbands, analyzer, _ = synthesis_subbands_for_scatter_tests()
+    analyzer.decimation_factors = np.where(
+        np.arange(len(subbands)) % 2 == 0, 1, 2
+    ).astype(int)
+    subbands = [np.zeros(len(subbands[0]), dtype=complex) + subbands[0] for _ in subbands]
+
+    decisions = []
+    original_guard = decomposition_module._can_scatter_upsampling_in_place
+    monkeypatch.setattr(
+        decomposition_module, "_can_scatter_upsampling_in_place",
+        lambda *args, **kwargs: decisions.append(original_guard(*args, **kwargs)) or decisions[-1]
+    )
+    fallback = run_auditory_synthesis_filterbank(subbands, analyzer)[0]
+    monkeypatch.undo()
+
+    assert decisions and not any(decisions)
+    copied = synthesize_via_copy_route(monkeypatch, subbands, analyzer)
+    assert fallback.tobytes() == copied.tobytes()

@@ -104,6 +104,7 @@ try:
     def _numba_polyphase_decimate(
             reversed_filter: np.ndarray,
             padded_signal: np.ndarray,
+            output: np.ndarray,
             down: int,
             n_pre_remove: int,
             out_len: int,
@@ -119,12 +120,17 @@ try:
         on split real/imag buffers -- `ddot` needs real operands. The padding is
         load-bearing, not tidiness.
 
+        `output` is supplied by the caller (see `fast_resample_poly`'s `out=`); it
+        may be WIDER than `out_len`, and only columns [0, out_len) are written, so
+        a caller can scatter straight into a zero-filled destination without the
+        filter tail leaking past the region it owns. Every dot product reads only
+        `padded_signal`, so the destination's row stride cannot perturb a value.
+
         The taps and the products are identical to SciPy's; `fastmath`/`ddot`
         reassociate the accumulation. See USE_NUMBA_RESAMPLER for the accuracy
         trade-off and the opt-out.
         """
         num_rows = padded_signal.shape[0]
-        output = np.empty((num_rows, out_len), dtype=np.float64)
         for row_idx in range(num_rows):
             row = padded_signal[row_idx]
             for sample_idx in range(out_len):
@@ -138,6 +144,7 @@ try:
             reversed_filter: np.ndarray,
             padded_real: np.ndarray,
             padded_imag: np.ndarray,
+            output: np.ndarray,
             down: int,
             n_pre_remove: int,
             out_len: int,
@@ -145,9 +152,9 @@ try:
     ) -> np.ndarray:
         """Complex twin of `_numba_polyphase_decimate`: two `ddot`s per output
         sample on split real/imag buffers, writing complex128 directly so the
-        wrapper never recombines."""
+        wrapper never recombines. `output` is caller-supplied and only its first
+        `out_len` columns are written."""
         num_rows = padded_real.shape[0]
-        output = np.empty((num_rows, out_len), dtype=np.complex128)
         for row_idx in range(num_rows):
             row_real = padded_real[row_idx]
             row_imag = padded_imag[row_idx]
@@ -164,6 +171,7 @@ try:
     def _numba_polyphase_interpolate(
             branches_transposed: np.ndarray,
             padded_signal: np.ndarray,
+            output: np.ndarray,
             up: int,
             n_pre_remove: int,
             out_len: int,
@@ -184,9 +192,14 @@ try:
         First/last base indices may cover output samples outside
         [n_pre_remove, n_pre_remove + out_len); those phases are computed and
         discarded (at most one branch worth of work per row).
+
+        `output` is caller-supplied (see `fast_resample_poly`'s `out=`) and may be
+        wider than `out_len`; the p_lo/p_hi clamp already restricts the stores to
+        columns [0, out_len), so nothing outside that window is ever touched. The
+        accumulation happens entirely in the local `accumulator`, so the
+        destination's shape cannot change a single rounding.
         """
         num_rows = padded_signal.shape[0]
-        output = np.empty((num_rows, out_len), dtype=np.float64)
         accumulator = np.empty(up, dtype=np.float64)
         base_start = n_pre_remove // up
         base_end = (n_pre_remove + out_len - 1) // up
@@ -213,6 +226,7 @@ try:
             branches_transposed: np.ndarray,
             padded_real: np.ndarray,
             padded_imag: np.ndarray,
+            output: np.ndarray,
             up: int,
             n_pre_remove: int,
             out_len: int,
@@ -221,9 +235,9 @@ try:
     ) -> np.ndarray:
         """Complex twin of `_numba_polyphase_interpolate`: the same AXPY loop
         inversion run on split real/imag buffers (two real AXPYs per tap), writing
-        complex128 directly so the wrapper never recombines."""
+        complex128 directly so the wrapper never recombines. `output` is
+        caller-supplied and only its first `out_len` columns are written."""
         num_rows = padded_real.shape[0]
-        output = np.empty((num_rows, out_len), dtype=np.complex128)
         accumulator_real = np.empty(up, dtype=np.float64)
         accumulator_imag = np.empty(up, dtype=np.float64)
         base_start = n_pre_remove // up
@@ -835,21 +849,81 @@ def _scipy_resample_poly(x, up_reduced, down_reduced, n_pre_remove, h_padded, ax
     return y[tuple(keep)]
 
 
+def resample_output_length(in_len: int, up: int, down: int) -> int:
+    """Length `fast_resample_poly` produces along the resampled axis.
+
+    Exposed so a caller can size (or bounds-check) a destination buffer *before*
+    the call -- `run_auditory_synthesis_filterbank` uses it to decide whether the
+    result fits inside the region it owns and may therefore be written in place.
+    `fast_resample_poly` calls this too, so the two cannot drift apart.
+    """
+    if up == down:
+        return int(in_len)
+    divisor = math.gcd(int(up), int(down))
+    return int(np.ceil(int(in_len) * (int(up) // divisor) / (int(down) // divisor)))
+
+
+def _resolve_resample_out(x: np.ndarray, out: np.ndarray, axis: int, out_len: int) -> np.ndarray:
+    """Validate a caller-supplied `out=` destination and return `out[..., :out_len]`.
+
+    The contract is deliberately narrow, because the point of `out=` is to let a
+    caller keep ownership of the samples PAST `out_len`: only the last axis may be
+    resampled, `out` must be C-contiguous (so the numba kernels can write into it
+    with the same layout they would allocate), and its dtype must be exactly what
+    the call would naturally return. Anything else raises rather than silently
+    falling back, so a caller cannot lose the in-place write without noticing.
+    """
+    if axis not in (-1, x.ndim - 1):
+        raise ValueError("fast_resample_poly: out= is only supported for axis=-1")
+    if out.ndim != x.ndim or out.shape[:-1] != x.shape[:-1]:
+        raise ValueError(
+            f"fast_resample_poly: out shape {out.shape} incompatible with input shape {x.shape}"
+        )
+    if out.shape[-1] < out_len:
+        raise ValueError(
+            f"fast_resample_poly: out last axis is {out.shape[-1]}, needs at least {out_len}"
+        )
+    expected_dtype = np.dtype(np.complex128) if np.iscomplexobj(x) else np.dtype(np.float64)
+    if out.dtype != expected_dtype:
+        raise ValueError(
+            f"fast_resample_poly: out dtype must be {expected_dtype}, got {out.dtype}"
+        )
+    if not out.flags.c_contiguous:
+        raise ValueError("fast_resample_poly: out must be C-contiguous")
+    return out[..., :out_len]
+
+
 def fast_resample_poly(
         x: np.ndarray,
         up: int,
         down: int,
         axis: int = -1,
-        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR,
+        out: np.ndarray | None = None
 ) -> np.ndarray:
+    """Polyphase resample of `x` by `up/down` along `axis`.
+
+    With `out=None` a fresh array of length `resample_output_length(...)` is
+    returned. With `out` supplied the result is written into `out[..., :out_len]`
+    and THAT VIEW is returned; `out` may be longer than the result along the last
+    axis and everything from `out_len` onwards is left exactly as the caller left
+    it. That is the whole point: it lets a caller scatter into a zero-filled
+    buffer whose tail must stay zero. See `_resolve_resample_out` for the
+    (deliberately strict) requirements on `out`.
+    """
     if up == down:
-        return x.copy()
+        if out is None:
+            return x.copy()
+        destination = _resolve_resample_out(x, out, axis, x.shape[axis])
+        destination[...] = x
+        return destination
 
     (reversed_filter, branches_transposed, up_reduced, down_reduced,
      n_pre_remove, num_taps, branch_length) = get_polyphase_branches(up, down, half_length_factor)
 
     in_len = x.shape[axis]
-    out_len = int(np.ceil(in_len * up_reduced / down_reduced))
+    out_len = resample_output_length(in_len, up, down)
+    destination = None if out is None else _resolve_resample_out(x, out, axis, out_len)
 
     # Defer to SciPy when Numba is unavailable, when the caller has opted out via
     # USE_NUMBA_RESAMPLER, or for mixed small ratios (e.g. 3/2, 2/3) whose inner loop
@@ -857,7 +931,14 @@ def fast_resample_poly(
     # those. This branch is bitwise identical to the pre-optimization implementation.
     if not _HAS_NUMBA or not USE_NUMBA_RESAMPLER or (up_reduced > 1 and down_reduced > 1):
         h_padded = get_resample_filter(up, down, half_length_factor)[0]
-        return _scipy_resample_poly(x, up_reduced, down_reduced, n_pre_remove, h_padded, axis, out_len)
+        resampled = _scipy_resample_poly(x, up_reduced, down_reduced, n_pre_remove, h_padded, axis, out_len)
+        if destination is None:
+            return resampled
+        # SciPy's upfirdn allocates its own output, so this path cannot write in
+        # place; it keeps the copy route instead. `out=` stays honoured (and the
+        # tail past out_len untouched) so the two paths remain interchangeable.
+        destination[...] = resampled
+        return destination
 
     moved = np.moveaxis(x, axis, -1)
     moved_shape = moved.shape
@@ -881,6 +962,17 @@ def fast_resample_poly(
         buf[:, pad_left:pad_left + in_len] = plane
         return buf
 
+    # Destination the kernels write into. With `out=` this is the caller's buffer
+    # reshaped to (rows, full_width) -- C-contiguity was checked, so the reshape is
+    # a view, and the kernels are handed the SAME array layout they would have
+    # allocated, only wider. They bound every store by `out_len`, so the caller's
+    # columns from `out_len` onwards survive untouched.
+    if out is None:
+        kernel_output = np.empty((flat.shape[0], out_len),
+                                 dtype=np.complex128 if is_complex else np.float64)
+    else:
+        kernel_output = out.reshape(-1, out.shape[-1])
+
     # The kernels run on float64 buffers only (that is what lets them lower to
     # ddot / vectorized AXPY); complex input is split into real/imag planes and the
     # complex kernels write complex128 output directly -- no recombine pass here.
@@ -888,24 +980,28 @@ def fast_resample_poly(
         padded_real = _make_padded(flat.real)
         padded_imag = _make_padded(flat.imag)
         if up_reduced == 1:
-            out = _numba_polyphase_decimate_complex(
-                reversed_filter, padded_real, padded_imag,
+            _numba_polyphase_decimate_complex(
+                reversed_filter, padded_real, padded_imag, kernel_output,
                 down_reduced, n_pre_remove, out_len, num_taps
             )
         else:
-            out = _numba_polyphase_interpolate_complex(
-                branches_transposed, padded_real, padded_imag,
+            _numba_polyphase_interpolate_complex(
+                branches_transposed, padded_real, padded_imag, kernel_output,
                 up_reduced, n_pre_remove, out_len, pad_left, branch_length
             )
     else:
         padded = _make_padded(flat)
         if up_reduced == 1:
-            out = _numba_polyphase_decimate(
-                reversed_filter, padded, down_reduced, n_pre_remove, out_len, num_taps
+            _numba_polyphase_decimate(
+                reversed_filter, padded, kernel_output,
+                down_reduced, n_pre_remove, out_len, num_taps
             )
         else:
-            out = _numba_polyphase_interpolate(
-                branches_transposed, padded, up_reduced, n_pre_remove, out_len, pad_left, branch_length
+            _numba_polyphase_interpolate(
+                branches_transposed, padded, kernel_output,
+                up_reduced, n_pre_remove, out_len, pad_left, branch_length
             )
 
-    return np.moveaxis(out.reshape(moved_shape[:-1] + (out_len,)), -1, axis)
+    if destination is not None:
+        return destination
+    return np.moveaxis(kernel_output.reshape(moved_shape[:-1] + (out_len,)), -1, axis)

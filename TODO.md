@@ -108,11 +108,6 @@ end-to-end value of P4 and P5 especially has shrunk.
   is genuinely mixed-rate rather than the clean `up == 1` / `down == 1` cases, so it
   was left alone. Effort: medium.
 
-### numpy
-
-- **Synthesis scatter in place** (`decomposition.py:706-721`), ~93 ms of ~246 MB of
-  copies that `fast_resample_poly` could write directly into. Effort: small.
-
 ### correctness, not perf
 
 - The torch gammatone's accuracy floor is its **wrap guard, not its FFT length**:

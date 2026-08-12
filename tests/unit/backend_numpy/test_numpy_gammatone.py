@@ -8,6 +8,7 @@ import math
 import numpy as np
 import pytest
 
+from peass.backend_numpy import gammatone as gammatone_module
 from peass.backend_numpy.gammatone import GammatoneAnalyzer
 from peass.backend_numpy.gammatone import GammatoneFilter
 from peass.backend_numpy.gammatone import GammatoneSynthesizer
@@ -15,7 +16,9 @@ from peass.backend_numpy.gammatone import calculate_audiological_equivalent_rect
 from peass.backend_numpy.gammatone import calculate_equivalent_rectangular_bandwidth
 from peass.backend_numpy.gammatone import convert_equivalent_rectangular_bandwidth_scale_to_frequency
 from peass.backend_numpy.gammatone import convert_frequency_to_equivalent_rectangular_bandwidth_scale
+from peass.backend_numpy.gammatone import fast_resample_poly
 from peass.backend_numpy.gammatone import get_equivalent_rectangular_bandwidth_center_frequencies
+from peass.backend_numpy.gammatone import resample_output_length
 
 
 @pytest.mark.unit
@@ -418,3 +421,135 @@ def test_gammatone_analysis_reconstruction_fidelity(sampling_frequency_hz):
     # Assert high-fidelity signal reconstruction
     corr = np.corrcoef(original_slice, reconstructed_slice)[0, 1]
     assert corr > 0.90, f"Reconstruction fidelity too low: {corr:.4f}"
+
+
+# -----------------------------------------------------------------------------
+# fast_resample_poly(out=...) -- in-place scatter destination
+# -----------------------------------------------------------------------------
+#
+# `out=` exists so `run_auditory_synthesis_filterbank` can upsample straight into
+# the zero-filled (bands x samples) buffer it owns instead of allocating a block
+# and copying it in. The contract these tests pin is twofold: the samples written
+# are BITWISE the ones the allocating call returns (the optimization must change
+# no arithmetic), and the destination beyond the result length is left completely
+# untouched (the caller relies on those zeros surviving).
+
+RESAMPLE_RATIO_CASES = [
+    (4, 1),  # pure interpolation -- the synthesis upsampling case
+    (1, 4),  # pure decimation -- the analysis case
+    (3, 2),  # mixed ratio -- always routed to SciPy's upfirdn
+    (5, 5),  # up == down -- the early-out copy
+]
+
+
+# `False` forces the SciPy `upfirdn` fallback, which cannot write in place and so
+# takes a different route through `out=`; both routes are covered.
+RESAMPLER_BACKENDS = [pytest.param(True, id="numba"), pytest.param(False, id="scipy")]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("up, down", RESAMPLE_RATIO_CASES)
+@pytest.mark.parametrize("complex_input", [False, True], ids=["real", "complex"])
+@pytest.mark.parametrize("use_numba", RESAMPLER_BACKENDS)
+@pytest.mark.parametrize("slack", [0, 37], ids=["exact_width", "wider_than_result"])
+def test_fast_resample_poly_out_matches_allocated(monkeypatch, up, down, complex_input,
+                                                  use_numba, slack):
+    """`out=` reproduces the allocating result bit for bit and spares the tail."""
+    monkeypatch.setattr(gammatone_module, "USE_NUMBA_RESAMPLER", use_numba)
+
+    rng = np.random.default_rng(20260812)
+    block = rng.standard_normal((5, 97))
+    if complex_input:
+        block = block + 1j * rng.standard_normal((5, 97))
+
+    expected = fast_resample_poly(block, up, down, axis=-1)
+    result_length = expected.shape[-1]
+    assert result_length == resample_output_length(block.shape[-1], up, down)
+
+    sentinel = -12345.5 + (6789.25j if complex_input else 0.0)
+    destination = np.zeros((5, result_length + slack), dtype=expected.dtype)
+    destination[:, result_length:] = sentinel
+
+    returned = fast_resample_poly(block, up, down, axis=-1, out=destination)
+
+    # Bitwise, not approximately: `out=` must not perturb a single rounding.
+    assert returned.dtype == expected.dtype
+    assert returned.shape == expected.shape
+    assert returned.tobytes() == expected.tobytes()
+    assert np.shares_memory(returned, destination)
+    assert destination[:, :result_length].tobytes() == expected.tobytes()
+    assert np.all(destination[:, result_length:] == sentinel)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("use_numba", RESAMPLER_BACKENDS)
+def test_fast_resample_poly_out_accepts_one_dimensional_input(monkeypatch, use_numba):
+    """A 1D signal is as valid a destination shape as a 2D block."""
+    monkeypatch.setattr(gammatone_module, "USE_NUMBA_RESAMPLER", use_numba)
+
+    rng = np.random.default_rng(7)
+    signal_input = rng.standard_normal(160)
+
+    expected = fast_resample_poly(signal_input, 3, 1)
+    destination = np.zeros(expected.size + 11)
+    destination[expected.size:] = 99.0
+
+    returned = fast_resample_poly(signal_input, 3, 1, out=destination)
+    assert returned.tobytes() == expected.tobytes()
+    assert np.all(destination[expected.size:] == 99.0)
+
+
+@pytest.mark.unit
+def test_resample_output_length_matches_actual_output():
+    """The helper the synthesis bounds check relies on must not drift."""
+    rng = np.random.default_rng(3)
+    for in_len in (1, 2, 37, 97, 160):
+        signal_input = rng.standard_normal(in_len)
+        for up, down in RESAMPLE_RATIO_CASES + [(2, 3), (7, 1), (1, 7)]:
+            predicted = resample_output_length(in_len, up, down)
+            assert predicted == fast_resample_poly(signal_input, up, down).shape[-1], (in_len, up, down)
+
+
+@pytest.mark.unit
+def test_fast_resample_poly_out_rejects_short_destination():
+    block = np.zeros((3, 40))
+    too_short = np.zeros((3, resample_output_length(40, 4, 1) - 1))
+    with pytest.raises(ValueError, match="at least"):
+        fast_resample_poly(block, 4, 1, out=too_short)
+
+
+@pytest.mark.unit
+def test_fast_resample_poly_out_rejects_wrong_dtype():
+    block = np.zeros((3, 40))
+    with pytest.raises(ValueError, match="dtype"):
+        fast_resample_poly(block, 4, 1, out=np.zeros((3, 400), dtype=complex))
+
+    complex_block = np.zeros((3, 40), dtype=complex)
+    with pytest.raises(ValueError, match="dtype"):
+        fast_resample_poly(complex_block, 4, 1, out=np.zeros((3, 400), dtype=float))
+
+
+@pytest.mark.unit
+def test_fast_resample_poly_out_rejects_mismatched_leading_shape():
+    block = np.zeros((3, 40))
+    with pytest.raises(ValueError, match="shape"):
+        fast_resample_poly(block, 4, 1, out=np.zeros((4, 400)))
+
+
+@pytest.mark.unit
+def test_fast_resample_poly_out_rejects_non_contiguous_destination():
+    """A strided view would still be writable, but not with the layout the kernels
+    are handed -- reject it loudly instead of silently dropping the write."""
+    block = np.zeros((3, 40))
+    strided = np.zeros((3, 800))[:, ::2]
+    assert not strided.flags.c_contiguous
+    with pytest.raises(ValueError, match="contiguous"):
+        fast_resample_poly(block, 4, 1, out=strided)
+
+
+@pytest.mark.unit
+def test_fast_resample_poly_out_rejects_non_final_axis():
+    """`out=` only knows how to reserve a tail on the last axis."""
+    block = np.zeros((40, 3))
+    with pytest.raises(ValueError, match="axis"):
+        fast_resample_poly(block, 4, 1, axis=0, out=np.zeros((400, 3)))

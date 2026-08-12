@@ -323,6 +323,7 @@ single cumulative figure, because no end-to-end run was measured across both:
 | one block-diagonal matmul instead of one per source | — | ~1 ULP (1.9e-15) |
 | batched per-band Gram/RHS build instead of per frame | ~1.15x | **bit-identical** |
 | analysis modulation matrix cached and shared with synthesis | ~1.18x | **bit-identical** |
+| synthesis upsampling scattered straight into the band buffer (2026-08-12) | ~1.07-1.08x | **bit-identical** |
 
 The kernel rewrite landed 2026-08-10 and takes the decomposition from 2.436 s to
 1.644 s mono (1.48x) and 4.972 s to 3.430 s stereo (1.45x) on the reference example.
@@ -335,6 +336,17 @@ reduction managed. Accuracy against the SciPy path is unchanged to slightly bett
 the accuracy class this section already describes rather than widening it. One
 behaviour change: `float32`/`complex64` input now promotes to double exactly as the
 SciPy fallback does, where the old kernels kept single precision.
+
+The synthesis scatter landed 2026-08-12. `fast_resample_poly` grew an `out=` parameter
+and the Numba kernels take their destination as an argument instead of allocating one,
+so the synthesis filterbank's upsampled bands are written straight into the band buffer
+rather than into a temporary that is then copied row by row. No arithmetic moved — every
+dot product and AXPY still accumulates in registers and only the store address changes —
+so it is bit-identical, verified as byte equality rather than a tolerance. Measured by a
+paired in-process A/B (interleaved repeats with the scatter forced on and off, so machine
+drift cancels): 1.35 s -> 1.31 s mono and 3.23 s -> 3.03 s stereo, ~1.07-1.08x. The
+`out=` route is strictly validated and refuses anything it cannot serve exactly; the
+SciPy fallback still allocates internally, so it gets correctness but not the win.
 
 The batching and modulation-cache entries landed earlier (2026-08-09) and are worth a
 further ~1.28-1.32x on the decomposition between them. Both are bitwise exact, verified
