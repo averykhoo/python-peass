@@ -231,10 +231,13 @@ NumPy backend by high correlation rather than to floating-point precision.
 #### Decomposition
 
 The decomposition is ~2.2x faster as of 2026-08-10 (mono 2.850 s -> 1.268 s, stereo
-7.286 s -> 3.531 s on the reference 5 s example), with a further ~1.21-1.31x from the
-2026-08-12 pass below. None of these is an approximation — every one computes the same
-quantity, correlation against the previous release is 1.0 to all 15 digits, and
-correlation against the MATLAB gold WAVs is unchanged to 13 decimals:
+7.286 s -> 3.531 s on the reference 5 s example), with a further ~1.21x mono / ~1.19x
+stereo from the 2026-08-12 pass below — that figure composes the paired in-process A/B
+measurements, because end-to-end wall clock on this machine drifts 6-8% between runs and
+cannot resolve changes this size. None of these is an approximation: every one computes
+the same quantity, correlation against the previous release is 1.0 to all 15 digits, and
+correlation against the MATLAB gold WAVs is unchanged to 13 decimals (worst delta
+-1.08e-14, with gain errors moving at most 2.3e-12 against a 1e-3 bound):
 
 - **The resampler is a polyphase GEMM rather than an FFT convolution.** As of
   2026-08-10 this covered pure interpolation and pure decimation, 196 of its 198 calls;

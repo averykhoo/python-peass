@@ -238,6 +238,29 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### The 2026-08-12 pass, measured cumulatively against the fixed reference
+
+The three entries below landed together. Measured end to end against a capture frozen
+*before* any of them (commit 5ed534a), rather than each against the one before it —
+which is the point of rule 2 in `TODO.md`:
+
+- **numpy is exactly bit-identical.** 0.000e+00 on all twelve waveforms, all eight
+  scores equal to every printed digit, all gain errors unchanged.
+- **torch moves 1.18e-9** on `artifacts` relative to its own peak, essentially all of it
+  from the mixed-rate resampler and via least-squares conditioning rather than lost
+  precision (see that entry). Correlation against the MATLAB gold WAVs falls at worst
+  1.08e-14, gain errors grow at worst 2.33e-12 against the test's 1e-3 bound, and the
+  scores move at most 9.0e-11 against a +-1.0 bound. Distance from MATLAB is ~1e-5 and
+  was not measurably changed by any of this.
+- **Speed**: numpy ~1.07-1.08x, torch ~1.21x mono and ~1.19x stereo, composing the
+  paired in-process A/B numbers. Do not quote `measure.py`-style before/after wall clock
+  for these — it drifted 6-8% between runs on this machine, enough that untouched
+  backends appeared to move more than touched ones, and one final run reported a 41.9%
+  spread within six repeats of a single configuration.
+
+The gate went from 291 passed / 21 skipped to 546 / 21; every one of the 255 new tests
+came with the changes, and no existing test was weakened, skipped or edited.
+
 ### P4 — torch synthesis chain fused, ~1.15-1.18x, and one third of it declined (2026-08-12)
 
 `GammatoneSynthesizerTorch.process` was four full passes over the band block plus a
