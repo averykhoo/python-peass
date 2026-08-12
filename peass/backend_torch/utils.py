@@ -147,6 +147,91 @@ def _get_polyphase_kernel(
     return kernel.contiguous()
 
 
+@lru_cache(maxsize=256)
+def _mixed_polyphase_geometry(up: int, down: int, half_length_factor: int) -> tuple:
+    r"""Integer index algebra for the general ``up/down`` polyphase form.
+
+    SciPy's output is ``y[n] = sum_k h[k] * v[(n_pre_remove + n)*D - k]`` with ``v`` the
+    input zero-inserted by ``U``, so only ``k`` congruent to ``s = (n_pre_remove + n)*D``
+    modulo ``U`` survives. Writing ``k = p + U*j`` collapses the sum onto one branch::
+
+        y[n] = sum_j h[p(n) + U*j] * x[Q(n) - j],   p(n) = s mod U,  Q(n) = s div U
+
+    Splitting the output index as ``n = m*U + r`` makes both fixed per residue, because
+    ``s`` gains exactly ``m*U*D``::
+
+        p(n) = p(r),   Q(n) = Q(r) + m*D
+
+    so residue ``r`` is a decimation-by-``D`` of ``x`` against its own ``L``-tap branch,
+    ``L = ceil(len(h)/U)`` -- 21 taps at the default ``hf`` for ``3/2``, against the
+    ~120k-point transform the FFT route runs instead.
+
+    Reversing the branch (``j' = L-1-j``) turns it into a forward window starting at
+    ``base(r) = Q(r) - L + 1``; ``offset`` shifts every window non-negative so one common
+    block grid serves all residues, and ``taps`` is how many ``D``-wide blocks the widest
+    window spans. Returns ``(phase, column, taps_per_phase, taps, offset)`` with the two
+    index vectors as CPU int64 -- the caller moves them where they are needed.
+    """
+    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter_torch(
+        up, down, torch.float64, torch.device("cpu"), half_length_factor
+    )
+    filter_length = h_padded.shape[0]
+    taps_per_phase = -(-filter_length // up_reduced)
+
+    start = (n_pre_remove + torch.arange(up_reduced)) * down_reduced
+    phase = start % up_reduced
+    first = torch.div(start, up_reduced, rounding_mode="floor") - (taps_per_phase - 1)
+    offset = -min(0, int(first.min()))
+    column = first + offset
+    taps = -(-(int(column.max()) + taps_per_phase) // down_reduced)
+    return phase, column, taps_per_phase, taps, offset
+
+
+@lru_cache(maxsize=256)
+def _get_mixed_polyphase_kernel(
+        up: int,
+        down: int,
+        dtype: torch.dtype,
+        device: torch.device,
+        half_length_factor: int
+) -> tuple:
+    r"""The FIR laid out as the ``(down, up * taps)`` matrix the mixed-rate GEMM contracts.
+
+    With the block grid from :func:`_mixed_polyphase_geometry`, input sample
+    ``base(r) + m*D + j'`` is entry ``c`` of block ``m + t`` where ``t*D + c = column[r] +
+    j'``. Scattering branch ``r``'s reversed taps into a ``taps*D``-wide row at ``column[r]``
+    therefore places every tap at the ``(block, lane)`` the GEMM will read it from, and
+    the residue/tap pair becomes a plain output column::
+
+        kernel[c, r*taps + t] = h_branch_r[L-1 - (t*D + c - column[r])]
+
+    Entries whose window index falls outside ``[0, L)`` stay zero, so the sum picks up
+    only the real taps. Built once per ``(up, down, dtype, device)`` and cached.
+    """
+    h_padded = get_resample_filter_torch(up, down, dtype, device, half_length_factor)[0]
+    filter_length = h_padded.shape[0]
+    g = math.gcd(up, down)
+    up_reduced, down_reduced = up // g, down // g
+    phase, column, taps_per_phase, taps, offset = _mixed_polyphase_geometry(
+        up, down, half_length_factor
+    )
+    phase, column = phase.to(device), column.to(device)
+
+    # Branch r, reversed: branch[r, j'] = h[phase[r] + U*(L-1-j')], zero past the filter.
+    tap_index = torch.arange(taps_per_phase, device=device)
+    flat_index = phase[:, None] + up_reduced * (taps_per_phase - 1 - tap_index)[None, :]
+    branch = torch.where(
+        flat_index < filter_length,
+        h_padded[flat_index.clamp(max=filter_length - 1)],
+        torch.zeros((), dtype=dtype, device=device),
+    )
+
+    kernel = torch.zeros(up_reduced, taps * down_reduced, dtype=dtype, device=device)
+    kernel.scatter_(1, column[:, None] + tap_index[None, :], branch)
+    kernel = kernel.reshape(up_reduced, taps, down_reduced).permute(2, 0, 1)
+    return kernel.reshape(down_reduced, up_reduced * taps).contiguous(), taps, offset
+
+
 def _split_real_imag(x_flat: torch.Tensor) -> torch.Tensor:
     """Stack a complex ``(batch, n)`` as a real ``(2*batch, n)``: real rows, then imag.
 
@@ -260,6 +345,140 @@ def _polyphase_decimate(
     return accumulator
 
 
+def _polyphase_mixed(
+        x_flat: torch.Tensor,
+        up: int,
+        down: int,
+        in_len: int,
+        out_len: int,
+        half_length_factor: int
+) -> torch.Tensor:
+    r"""General ``up/down`` rate change as one GEMM plus a shifted-diagonal sum.
+
+    Reshaping the (offset) input to ``B[t, c] = x[t*D + c - offset]`` and contracting it
+    against the kernel of :func:`_get_mixed_polyphase_kernel` gives every residue's every
+    block-shift at once::
+
+        P[s, r*taps + t] = sum_c B[s, c] * kernel[c, r*taps + t]
+        y[m*U + r]       = sum_t P[m + t, r*taps + t]
+
+    -- the same collapse the pure-decimation path uses, which is exactly this form at
+    ``U = 1``. The GEMM is ``num_blocks x D x (U*taps)``, i.e. ``~in_len * U * taps``
+    multiply-adds where the FFT route transforms ``in_len * U`` points three times, and
+    the diagonal sum that follows is ``taps`` slice-adds over an ``out_len``-sized array.
+
+    The trailing ``[:, :out_len]`` drops the residues of the final group that run past the
+    requested length; SciPy's ``ceil(in_len*up/down)`` need not be a multiple of ``U``.
+    """
+    batch = x_flat.shape[0]
+    is_complex = x_flat.is_complex()
+    rows = _split_real_imag(x_flat) if is_complex else x_flat
+    kernel, taps, offset = _get_mixed_polyphase_kernel(
+        up, down, rows.dtype, rows.device, half_length_factor
+    )
+
+    num_groups = -(-out_len // up)
+    # Enough blocks for the last window (num_groups + taps - 1), and never fewer than the
+    # input itself occupies -- the diagonal sum only ever reads the first of the two.
+    num_blocks = max(num_groups + taps - 1, -(-(in_len + offset) // down))
+    padded = F.pad(rows, (offset, num_blocks * down - offset - in_len))
+    blocks = padded.reshape(rows.shape[0], num_blocks, down)
+
+    phase_sums = (blocks @ kernel).reshape(rows.shape[0], num_blocks, up, taps)
+    accumulator = phase_sums[:, :num_groups, :, 0]
+    for tap_idx in range(1, taps):
+        accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + num_groups, :, tap_idx]
+
+    interleaved = accumulator.reshape(rows.shape[0], num_groups * up)[:, :out_len]
+    if is_complex:
+        interleaved = _merge_real_imag(interleaved, batch)
+    return interleaved
+
+
+def _fft_resample(
+        x_flat: torch.Tensor,
+        up: int,
+        down: int,
+        n_pre_remove: int,
+        filter_length: int,
+        out_len: int,
+        original_dtype: torch.dtype,
+        half_length_factor: int
+) -> torch.Tensor:
+    """Zero-insert, FIR-filter by FFT linear convolution, decimate. The general fallback.
+
+    Kept reachable for rates whose polyphase intermediate would be disproportionate (see
+    ``MIXED_POLYPHASE_MAX_ELEMENTS``), and as the independent second implementation the
+    polyphase paths are cross-checked against. FFT is used rather than
+    conv1d/conv_transpose1d because torch has no optimized float64 convolution kernel --
+    those fall back to `slow_conv2d`/`slow_conv_transpose2d`, which dominated the double
+    precision decomposition. It is ~2x faster and bit-identical to the conv path
+    (verified to ~1e-15), and fully differentiable.
+    """
+    batch, in_len = x_flat.shape
+
+    # 1. Zero-insertion by up. Done via pad+reshape (differentiable, no in-place
+    #    scatter): each sample is followed by (up - 1) zeros.
+    if up > 1:
+        upsampled = F.pad(x_flat.unsqueeze(-1), (0, up - 1)).reshape(batch, in_len * up)
+    else:
+        upsampled = x_flat
+
+    # 2. FIR filtering via FFT linear convolution. The subband signals are complex
+    #    (analytic), so use the full complex FFT there; the real rfft/irfft path is
+    #    a faster specialization for real inputs (e.g. the auditory-model resamples).
+    #    The transform is padded up to a 5-smooth length: everything past
+    #    conv_length is exactly zero (no circular wrap), so the extra taps only
+    #    replace the zero-fill the crop below would have applied anyway.
+    conv_length = upsampled.shape[-1] + filter_length - 1
+    fft_length = next_fast_fft_length(conv_length)
+    filter_spectrum = _get_resample_filter_spectrum(
+        up, down, original_dtype, x_flat.device, half_length_factor, fft_length
+    )
+    if upsampled.is_complex():
+        spectrum = torch.fft.fft(upsampled, n=fft_length, dim=-1) * filter_spectrum
+        filtered = torch.fft.ifft(spectrum, n=fft_length, dim=-1)
+    else:
+        spectrum = torch.fft.rfft(upsampled, n=fft_length, dim=-1) * filter_spectrum
+        filtered = torch.fft.irfft(spectrum, n=fft_length, dim=-1)
+
+    # 3. Decimate by down and crop the centered out_len window (matches SciPy's
+    #    zero-phase offset via n_pre_remove).
+    decimated = filtered[:, ::down]
+    end = n_pre_remove + out_len
+    if decimated.shape[-1] < end:
+        decimated = F.pad(decimated, (0, end - decimated.shape[-1]))
+    return decimated[:, n_pre_remove:end]
+
+
+# Above this many elements in the mixed-rate GEMM's ``(rows, num_blocks, up, taps)``
+# product, fall back to the FFT convolution. The polyphase intermediate is ``taps`` copies
+# of the output, and ``taps`` is bounded by ``2*half_length_factor + 2``, so this only
+# trips on rate/length combinations whose *output* is already near a gigabyte -- the FFT
+# route's own working set (~4x the zero-inserted signal) is comparable there, and it
+# builds it in fewer, larger allocations. 2**26 elements is 512 MB in float64.
+MIXED_POLYPHASE_MAX_ELEMENTS = 1 << 26
+
+
+def _mixed_polyphase_fits(
+        up: int,
+        down: int,
+        out_len: int,
+        batch: int,
+        is_complex: bool,
+        half_length_factor: int
+) -> bool:
+    """Whether the mixed-rate GEMM's intermediate stays under the fallback threshold.
+
+    Sizes ``(rows, num_blocks, up, taps)`` from ``num_blocks * up ~ out_len``, which is
+    the block count :func:`_polyphase_mixed` derives exactly; the block-edge slack it adds
+    is ``up * taps`` and irrelevant at this threshold.
+    """
+    taps = _mixed_polyphase_geometry(up, down, half_length_factor)[3]
+    rows = 2 * batch if is_complex else batch
+    return rows * out_len * taps <= MIXED_POLYPHASE_MAX_ELEMENTS
+
+
 def fast_resample_poly_torch(
         x: torch.Tensor,
         up: int,
@@ -268,25 +487,30 @@ def fast_resample_poly_torch(
         half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
 ) -> torch.Tensor:
     """
-    Native PyTorch polyphase resampler replicating SciPy's upfirdn via FFT linear
-    convolution: zero-insert by ``up``, FIR-filter, decimate by ``down``.
+    Native PyTorch polyphase resampler replicating SciPy's ``resample_poly``:
+    zero-insert by ``up``, FIR-filter, decimate by ``down``.
 
-    Mixed rates (both ``up`` and ``down`` > 1 after reduction) go through an FFT linear
-    convolution. That is used instead of conv1d/conv_transpose1d because torch has no
-    optimized float64 convolution kernel — those fall back to slow reference
-    kernels (`slow_conv2d`/`slow_conv_transpose2d`) that dominated the double
-    precision decomposition. FFT is ~2x faster here and bit-identical to the conv
-    path (verified to ~1e-15), while remaining fully differentiable.
+    Every rate takes a polyphase GEMM: pure interpolation, pure decimation, and — since
+    the mixed-rate work landed — general ``up/down`` as well. The three are separate
+    routines rather than one general one because the specialisations are strictly better
+    at their own rate: at ``down == 1`` the general form degenerates to a rank-1 update
+    with a ``2*half_length_factor + 1``-fold intermediate, where
+    :func:`_polyphase_interpolate` does the identical FLOPs as a dense
+    ``(in_len, 21) @ (21, up)`` GEMM.
 
-    Pure interpolation and pure decimation instead take the polyphase GEMM path above.
-    That covers almost every call the decomposition makes: the filterbank has 32 bands
-    with 32 *distinct* decimation factors, so band grouping yields 32 groups of one or
-    two rows each, and the FFT parallelises over the batch dimension it no longer has.
-    Worse, the FFT works at the *undecimated* length either way — for a band decimated
-    by 1229 it transformed a 121500-point spectrum to produce 98 output samples, and
-    for the matching synthesis upsample it transformed 121500 points to filter 327.
-    The polyphase form does the same arithmetic in ``2*half_length_factor + 1`` taps
-    per output sample, so it is both asymptotically better and allocation-free.
+    Why this matters over the FFT convolution it replaced: the FFT works at the
+    *undecimated* length regardless of the rate. For a band decimated by 1229 it
+    transformed a 121500-point spectrum to produce 98 output samples, and for the
+    matching synthesis upsample it transformed 121500 points to filter 327. It also
+    parallelises over a batch dimension the filterbank does not have — 32 bands with 32
+    *distinct* decimation factors group into 32 runs of one or two rows. The polyphase
+    form instead does the same arithmetic in a handful of taps per output sample.
+
+    The FIR is real, so the mixed-rate arithmetic is a genuine reassociation of the FFT
+    route's, not an approximation: measured worst relative deviation 1.3e-15 over rates
+    from 3/2 to 1000/3, and *closer* to SciPy than the FFT route is (the direct 21-tap
+    sum beats a transform over ~120k points). :func:`_fft_resample` remains reachable for
+    the pathological sizes described at ``MIXED_POLYPHASE_MAX_ELEMENTS``.
     """
     if up == down:
         return x
@@ -307,42 +531,14 @@ def fast_resample_poly_torch(
 
     if down_reduced == 1:
         y_flat = _polyphase_interpolate(x_flat, up_reduced, in_len, out_len, half_length_factor)
-        return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)
-    if up_reduced == 1:
+    elif up_reduced == 1:
         y_flat = _polyphase_decimate(x_flat, down_reduced, in_len, out_len, half_length_factor)
-        return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)
-
-    # 1. Zero-insertion by up_reduced. Done via pad+reshape (differentiable, no
-    #    in-place scatter): each sample is followed by (up_reduced - 1) zeros.
-    if up_reduced > 1:
-        upsampled = F.pad(x_flat.unsqueeze(-1), (0, up_reduced - 1)).reshape(batch, in_len * up_reduced)
+    elif _mixed_polyphase_fits(up_reduced, down_reduced, out_len, batch, x.is_complex(),
+                               half_length_factor):
+        y_flat = _polyphase_mixed(x_flat, up_reduced, down_reduced, in_len, out_len,
+                                  half_length_factor)
     else:
-        upsampled = x_flat
-
-    # 2. FIR filtering via FFT linear convolution. The subband signals are complex
-    #    (analytic), so use the full complex FFT there; the real rfft/irfft path is
-    #    a faster specialization for real inputs (e.g. the auditory-model resamples).
-    #    The transform is padded up to a 5-smooth length: everything past
-    #    conv_length is exactly zero (no circular wrap), so the extra taps only
-    #    replace the zero-fill the crop below would have applied anyway.
-    conv_length = upsampled.shape[-1] + filter_length - 1
-    fft_length = next_fast_fft_length(conv_length)
-    filter_spectrum = _get_resample_filter_spectrum(
-        up, down, x.dtype, x.device, half_length_factor, fft_length
-    )
-    if upsampled.is_complex():
-        spectrum = torch.fft.fft(upsampled, n=fft_length, dim=-1) * filter_spectrum
-        filtered = torch.fft.ifft(spectrum, n=fft_length, dim=-1)
-    else:
-        spectrum = torch.fft.rfft(upsampled, n=fft_length, dim=-1) * filter_spectrum
-        filtered = torch.fft.irfft(spectrum, n=fft_length, dim=-1)
-
-    # 3. Decimate by down_reduced and crop the centered out_len window (matches
-    #    SciPy's zero-phase offset via n_pre_remove).
-    decimated = filtered[:, ::down_reduced]
-    end = n_pre_remove + out_len
-    if decimated.shape[-1] < end:
-        decimated = F.pad(decimated, (0, end - decimated.shape[-1]))
-    y_flat = decimated[:, n_pre_remove:end]
+        y_flat = _fft_resample(x_flat, up_reduced, down_reduced, n_pre_remove, filter_length,
+                               out_len, x.dtype, half_length_factor)
 
     return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)

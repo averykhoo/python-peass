@@ -235,8 +235,10 @@ The decomposition is ~2.2x faster as of 2026-08-10 (mono 2.850 s -> 1.268 s, ste
 an approximation — both compute the same quantity, and output agrees with the previous
 release to 1.8e-13 of each component's peak, correlation 1.0 to all 15 digits:
 
-- **The resampler is a polyphase GEMM rather than an FFT convolution** for pure
-  interpolation and pure decimation, which is 196 of its 198 calls. Two things made the
+- **The resampler is a polyphase GEMM rather than an FFT convolution.** As of
+  2026-08-10 this covered pure interpolation and pure decimation, 196 of its 198 calls;
+  since 2026-08-12 a general mixed-rate form covers the rest, so the FFT route is now
+  only a guarded fallback. Two things made the
   FFT a poor fit here, and neither was a tuning problem. The filterbank has 32 bands
   with 32 *distinct* decimation factors, so grouping bands by factor yields 32 groups of
   one or two rows and the FFT has no batch dimension left to parallelise over. And the
@@ -249,6 +251,17 @@ release to 1.8e-13 of each component's peak, correlation 1.0 to all 15 digits:
   real, but torch promotes it and runs full complex arithmetic, four real multiplies per
   tap where one will do. The split is exact — the discarded terms are the products of a
   complex multiply by a real number's zero imaginary part.
+
+  The mixed-rate extension (2026-08-12) covers the 3/2 and 2/3 conversions either side
+  of the filterbank, six calls per decomposition, worth 1.4-2.4x on those calls and
+  ~45 ms mono / ~85 ms stereo end-to-end. Against SciPy at those two rates it is
+  *closer* than the FFT route it replaces (4.8e-16 / 3.6e-16 versus 8.4e-16 / 1.07e-15)
+  — 21 taps beats a 120k-point transform on rounding as well as on work. It does move
+  the `artifacts` component by 1.18e-9 of its own peak, which is conditioning rather
+  than error: that component is the smallest-peak residual and the Gram's minimum
+  eigenvalue is ~3.4e-10, so a 1-ULP change upstream lands ~1e6 larger. Merely
+  re-padding the FFT route to a different valid length moves it further. See
+  `ARCHIVE.md` for the index algebra and the control experiment.
 
 - **The per-frame solve uses `cholesky_ex`/`cholesky_solve` rather than
   `torch.linalg.pinv`.** The Gram matrix is Hermitian positive-semidefinite by

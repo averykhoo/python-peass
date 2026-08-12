@@ -101,12 +101,6 @@ end-to-end value of P4 and P5 especially has shrunk.
   analysis + 48.6 ms synthesis) disappear into the 21-tap filters, and the two cached
   modulation matrices (61 MB + 62 MB) can be dropped. Exact in real arithmetic,
   expected ~1 ULP. Effort: high — the index algebra needs careful per-band validation.
-- **Mixed-rate calls still take the FFT path** (`utils.py`), new from the 2026-08-10
-  pass. After the polyphase GEMM the largest single resample entries are the 2/3 and
-  3/2 conversions either side of the filterbank (~12-27 ms each, ~90 ms total, ~7% of
-  the decomposition). A general polyphase form covers them too, but the index algebra
-  is genuinely mixed-rate rather than the clean `up == 1` / `down == 1` cases, so it
-  was left alone. Effort: medium.
 
 ### correctness, not perf
 

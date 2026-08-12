@@ -238,6 +238,64 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### torch mixed-rate polyphase — the FFT route retired to a fallback (2026-08-12)
+
+The 3/2 upsample in front of the filterbank and the 2/3 downsample behind it were the
+last resamples still taking the FFT linear convolution; six calls per decomposition
+(2x 3/2, 4x 2/3). `_polyphase_mixed` now serves general `up/down` by the same collapse
+`_polyphase_decimate` uses — that routine is in fact this one at `up == 1`.
+
+The algebra, since a reviewer will want to check it: SciPy's output is
+`y[n] = sum_k h[k] v[(n_pre_remove + n)*D - k]` with `v` the input zero-inserted by `U`,
+so only `k = s (mod U)` survives, `s = (n_pre_remove + n)*D`. Writing `k = p + U*j`
+collapses the sum onto one branch, `y[n] = sum_j h[p + U*j] x[Q - j]` with `p = s mod U`
+and `Q = s div U`. Writing `n = m*U + r` then fixes both per residue, because `s` gains
+exactly `m*U*D`: each residue is a decimation by `D` against its own
+`ceil(len(h)/U)`-tap branch. Reversing within the branch turns it into a forward window,
+a common offset makes all windows non-negative, and blocking the input gives one GEMM
+plus a shifted-diagonal sum. 21 taps per branch at 3/2, against a ~120k-point transform.
+
+**Accuracy improved where it was measured directly, and the end-to-end move is
+conditioning, not error.** Against SciPy at the two rates the decomposition actually
+uses, on the real audio: polyphase 4.8e-16 / 3.6e-16 versus the FFT route's 8.4e-16 /
+1.07e-15 — the direct 21-tap form is 2-3x closer. Worst deviation against the FFT route
+is 1.35e-15 over 264 combinations at `half_length_factor = 10`, inside the 2.3e-15 the
+pure-rate GEMMs were verified at.
+
+End to end it moves the torch `artifacts` component by 1.18e-9 relative to its own peak,
+which is four orders larger than the 1.8e-13 the 2026-08-10 decomposition work reported
+and is worth being precise about. It is amplification, not lost precision: `artifacts`
+is the smallest-peak residual component, and the least-squares Gram's minimum eigenvalue
+is ~3.4e-10 (see the note on the numpy backend's diagonal regularization above), so a
+1-ULP perturbation upstream arrives ~1e6 larger. The control confirms it — holding the
+FFT route but choosing a *different valid padding length*, which is exactly equivalent
+arithmetic, moves the same component by 1.798e-9, i.e. more than this change does.
+Correlation against the MATLAB gold WAVs is unchanged to 13 decimals (worst delta
+-1.07e-14), gain errors move at most 2.3e-12 against a 1e-3 bound, and the scores move
+at 1e-10 against a +-1.0 bound. numpy is untouched and exactly 0.000e+00.
+
+Timing needed a paired in-process A/B; `measure.py` could not resolve it (torch read
+1.03x/1.05x vs baseline while numpy, untouched in that run, moved 1.08x). On the
+isolated calls: 3/2 mono 9.01 -> 5.38 ms (1.67x), stereo 20.64 -> 14.57 ms (1.42x);
+2/3 mono 7.91 -> 3.26 ms (2.43x), stereo 20.02 -> 9.02 ms (2.22x). On the whole torch
+decomposition, 14 interleaved repeats: mono +45.5 ms (sd 53.7, 13/14 positive, ~3.2
+sigma), stereo +85.2 ms (sd 59.5, ~5.4 sigma, median 1.038x). That matches the ~90 ms
+TODO.md sized the item at. Note the mono *min*-of-14 reads 0.98x — min is the wrong
+statistic under this machine's outlier structure, and the paired difference is the
+number to trust.
+
+The pure-rate routines were deliberately **not** unified into the general form: at
+`down == 1` the general form degenerates to a rank-1 update with a 21-fold intermediate
+where `_polyphase_interpolate` does the same FLOPs as a dense GEMM. They are verified
+byte-identical against the previous commit across 14 rates x 3 lengths x real/complex.
+
+The FFT route survives as `_fft_resample` behind a `MIXED_POLYPHASE_MAX_ELEMENTS` guard,
+and honestly it is precautionary — `taps` is bounded by `2*half_length_factor + 2`, so
+the polyphase intermediate is at most ~22x the output and cannot blow up the way the
+FFT's `in_len * up` does, and no realistic case was found where polyphase is worse. Its
+real value now is as the independent second implementation the cross-check tests compare
+against.
+
 ### numpy synthesis scatter in place — bit-identical, ~1.07-1.08x (2026-08-12)
 
 `fast_resample_poly` gained an `out=` parameter and the four Numba polyphase kernels
