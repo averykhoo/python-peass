@@ -304,6 +304,65 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### History sweep: accuracy and speed across 14 commits (2026-08-13)
+
+`benchmarks/history_sweep.py`, tidy output in `benchmarks/history.csv`, full detail in
+the gitignored `benchmarks/results/history_raw.json`. Every commit is judged by **one
+fixed yardstick**: the library code comes from the checkout, but the gold WAVs, the
+gain-offset constant, the estimate/stereo conventions and the measuring code all come
+from HEAD and never vary. That matters — `_MATLAB_RESAMPLER_GAIN_OFFSET` was itself
+introduced partway through the swept range, so using each commit's own test constants
+would have moved the ruler along with the thing being measured.
+
+Two integrity checks, both clean: `5ed534a` is documentation-only against `c51f76a` and
+came out **byte-identical** on every accuracy metric, and accuracy matched exactly
+between the forward and reverse passes on all 1344 values (compared as floats, not with
+a tolerance).
+
+**The question that prompted it — was some earlier version closer to the MATLAB gold
+WAVs? — answers no.** Accuracy is monotone non-worsening toward HEAD. Nothing regressed,
+and there is no better starting point buried in the history.
+
+What the sweep did turn up:
+
+- **The accuracy cliff is at `3079de1`**, "default to full-order resampling". Its parent
+  `e281b56` sits at correlation 0.9898 on `artifacts` with a **-6.4% gain error on every
+  component** — precisely the "~-6% component energy, correlation ~0.99 at 3x" the config
+  docstring predicts for `resample_filter_half_length_factor = 3`. Restoring full-order
+  resampling bought back four to five orders of magnitude of accuracy and cost a great
+  deal of speed: 0.75x numpy, **0.41x torch mono, 0.48x torch stereo**. Everything since
+  has been paying that back.
+- **`4ab223a` traded gain error between components rather than reducing it.** The
+  MATLAB-parity ERB form improved `true_target` gain error ~10x (5.5e-6 -> 5.3e-7) while
+  making `artifacts` ~3x worse (-4.2e-6 -> -1.2e-5); RMS gain error across all components
+  is essentially unchanged (4.62e-6 -> 4.29e-6). So HEAD is closer to gold on
+  *correlation* but not uniformly on *gain*. Worth knowing before anyone treats the ERB
+  change as a pure accuracy win.
+- **numpy and torch have been within 5e-10 correlation of each other for the entire
+  swept history**, including at `e281b56` where both are equally wrong. The backends have
+  never been the accuracy story; the resampler always has been.
+- `c2c7e76` ("torch haircell lowpass applied time-reversed") shows zero effect here — it
+  lives in the auditory/scores path, not the decomposition path. Torch *scores* OOM at
+  the three oldest commits (62 GB allocation; the haircell FFT-convolution fix postdates
+  them), recorded as `status=partial`; their numpy numbers and torch decompositions are
+  fine.
+
+Speed, as realtime factor on a 5 s clip (audio seconds per compute second), swept forward
+and again in reverse. All 56 commit x backend x layout pairs agreed between passes within
+10% — zero flags, worst 9.4%, typical 1-3%. Outside the noise: `3079de1` the slowdown
+above; `d866075` 1.31x numpy mono; `76e53f3` 1.84x torch mono (note that is 1.8x on the
+*decomposition*, not the 5.7x pipeline figure in its subject line); `cd061f3` 1.36x numpy
+mono; `c51f76a` 1.49x numpy / **2.28x torch mono, 2.87x torch stereo**; `04de76a` 1.17x
+torch mono.
+
+**A caution about what this method can and cannot resolve.** The sweep reads `fda3030` at
+1.08x numpy and `ae0bdc2` at 1.04-1.06x torch, and calls both "inside noise". That is a
+statement about the *sweep's* resolution, not a contradiction of the paired A/B numbers
+in the entries below — cross-commit wall clock cannot certify a 4-8% effect, which is
+exactly why `benchmarks/ab.py` exists. The magnitudes agree: the A/B put the scatter at
+1.07-1.08x and the mixed-rate change at ~1.04x mono. Do not read "inside noise" here as
+"no effect"; read it as "this instrument cannot see it, use the other one".
+
 ### The 2026-08-12 pass, measured cumulatively against the fixed reference
 
 The three entries below landed together. Measured end to end against a capture frozen

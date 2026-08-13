@@ -143,14 +143,13 @@ investigate, not an automatic win for MATLAB. The `1e-15` diagonal regularizatio
    numpy) and the one that has absorbed the most change. Proves the concept in an
    afternoon before committing to the rest.
 
-### Lead worth checking first
+### The "was an earlier version closer to gold?" lead — checked, answer is no
 
-The owner recalls a version from a few pushes back that was **closer to the MATLAB gold
-WAVs than the current code**. If so, that commit — not a fresh transcription — may be the
-best starting point, and it would also mean some accuracy was given up somewhere without
-being noticed. This is now cheap to check, because `benchmarks/measure.py` runs against
-whatever is checked out: capture a tag at each candidate commit and compare the
-correlation columns. Do this before choosing a derivation option.
+Swept 14 commits back to 2026-07-08 on 2026-08-13 (`benchmarks/history_sweep.py`,
+results in `benchmarks/history.csv`). **No commit in the swept history is closer to the
+gold WAVs than HEAD**, so there is no better starting point hiding in the history and no
+unnoticed accuracy regression. Details in `ARCHIVE.md`, "History sweep". Choose a
+derivation option on its merits.
 
 ## perf ideas not yet taken
 
