@@ -88,6 +88,70 @@ not obvious from the code:
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
 
+## slow-mode ground-truth reference (design decision pending, nothing started)
+
+A frozen, deliberately unoptimized implementation kept alongside the fast backends, to
+serve as **both** the accuracy oracle for new code and a stable denominator for perf
+claims. Raised 2026-08-12; the options below were laid out and the choice deferred.
+
+**What it buys over what exists today.** The frozen `baseline` capture is ~25 MB of
+gitignored `.npy` that lives on one disk — frozen *code* regenerates the reference on
+any machine, for any input, indefinitely. And the MATLAB gold WAVs cover exactly one
+clip, so there is currently no ground truth at all for short files, unusual rates, or
+stereo; a reference implementation produces it for any input you hand it. As a perf
+denominator it never drifts, so "Nx faster than reference" stays comparable across
+machines and years in a way that "Nx faster than last release" does not.
+
+**The trap, which decides everything.** If the reference is written by stripping
+optimizations out of the current fast code, it cannot be an accuracy oracle: it inherits
+every existing bug and every bit of accumulated drift, so "fast matches slow" proves only
+that the code matches itself. Its authority as an oracle comes entirely from being
+derived *independently*, with the gold WAVs as the thing that earns it trust.
+
+### Derivation — pick one
+
+1. **Transcribe from MATLAB PEASS v2.0.1** (`papers/` and the reference sources are
+   in-repo). A literal, readable transcription of the `.m` files, validated by
+   reproducing the gold WAVs. The only option that is a real oracle — it can tell you
+   the *current* code is wrong. Roughly a day.
+2. **Freeze today's semantics.** A readable deoptimized snapshot of what the current
+   code computes. A couple of hours. Catches future drift and gives the perf denominator,
+   but is tautological about today.
+3. **Cheap now, upgrade later.** Land the snapshot, then replace stages with MATLAB
+   transcriptions where it matters — resampler and LS projection first, since that is
+   where the optimization pressure has been. Mark each stage `SNAPSHOT` or `TRANSCRIBED`
+   so the oracle's authority is never overstated.
+
+Owner leans toward MATLAB as the reference, **with a caveat worth taking seriously**:
+academic reference code sometimes contains numerical-stability mistakes, so a faithful
+transcription can enshrine one. Treat agreement with the gold WAVs as the trust signal,
+not MATLAB's algorithm choices as automatically correct — and if the transcription and
+the current code disagree somewhere numerically delicate, that is a question to
+investigate, not an automatic win for MATLAB. The `1e-15` diagonal regularization note in
+`ARCHIVE.md` is an example of this repo already declining to copy a questionable choice.
+
+### Scope — pick one
+
+1. **Decomposition only** — gammatone analysis/synthesis, polyphase resampling,
+   time-varying LS projection, component extraction. Where every optimization has landed
+   and where the accuracy risk lives. Smallest useful thing.
+2. **Decomposition + scores** — everything through OPS/TPS/IPS/APS including the
+   auditory model. Note the adaptation loop is a sequential recurrence: an unoptimized
+   version was ~1.97 s for 1 s of audio *before* the Numba kernel, and a deliberately
+   naive one is worse.
+3. **Resampler only, as a pilot** — the single hottest component (37% of torch, 42% of
+   numpy) and the one that has absorbed the most change. Proves the concept in an
+   afternoon before committing to the rest.
+
+### Lead worth checking first
+
+The owner recalls a version from a few pushes back that was **closer to the MATLAB gold
+WAVs than the current code**. If so, that commit — not a fresh transcription — may be the
+best starting point, and it would also mean some accuracy was given up somewhere without
+being noticed. This is now cheap to check, because `benchmarks/measure.py` runs against
+whatever is checked out: capture a tag at each candidate commit and compare the
+correlation columns. Do this before choosing a derivation option.
+
 ## perf ideas not yet taken
 
 From the decomposition-focused profiles of 2026-08-09 and 2026-08-10. All prototyped
