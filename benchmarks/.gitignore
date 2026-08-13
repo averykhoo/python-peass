@@ -1,0 +1,3 @@
+# Measurement output: ~20 MB of float64 waveforms per tag. Regenerate with
+# `python benchmarks/measure.py <tag>`; never commit it.
+results/

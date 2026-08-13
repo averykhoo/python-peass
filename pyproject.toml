@@ -50,10 +50,15 @@ name = "peass"
 exclude = [
     "references/*",
     "tests/*",
+    "benchmarks/*",
     ".github/*"
 ]
 
 [tool.pytest.ini_options]
+# Defaults, plus `benchmarks`: the measurement harness holds no tests, but it does
+# hold ~25 MB of result waveforms per captured tag, and nothing there should ever be
+# imported or walked by a test run.
+norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "benchmarks"]
 markers = [
     "unit: Isolated fast-running tests targeting single modules.",
     "integration: Multi-module system pipeline tests.",

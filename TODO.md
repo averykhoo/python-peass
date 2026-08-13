@@ -41,11 +41,14 @@ not obvious from the code:
    the hard way on 2026-08-12: this machine drifts 6-8% between runs, and on three
    separate occasions an *untouched* backend appeared to move more than the touched one
    — a numpy-only change read 1.19x by before/after and 1.08x when measured properly,
-   and one run showed 41.9% spread within six repeats of a single configuration. Use a
-   paired in-process A/B: emulate the old path in the same process, interleave the
-   repeats, and quote the paired difference with a sigma. Note also that `min` was the
-   wrong statistic here — the outlier structure is one-sided, so the paired mean beats
-   min-of-N.
+   and one run showed 41.9% spread within six repeats of a single configuration. Use
+   `benchmarks/ab.py`: it interleaves the two candidates along the Thue-Morse sequence,
+   repeats the whole run with them swapped, and refuses to give a number when the two
+   phases disagree. Note also that `min` was the wrong statistic here — the outlier
+   structure is one-sided, so medians with bootstrap intervals beat min-of-N.
+
+   `benchmarks/` also holds `measure.py` and `compare.py`, which is how you take the
+   frozen capture rule 2 asks for. See `benchmarks/README.md`.
 
 - train a different model on the peass data (which was removed in PR #3, commit `7ad923b3` on 2026-06-06 17:01)
   - get more data from https://www.audiolabs-erlangen.de/resources/2019-WASPAA-SEBASS
@@ -179,6 +182,35 @@ that first, it is longer than this list.
   the memory: one fewer full-block complex128 temporary, 61.6 MB mono / 123.2 MB stereo,
   which is the same ground `_FFT_CHUNK_BUDGET_BYTES` was landed on. Effort: trivial.
   Recorded mostly so nobody re-prototypes it expecting P4's 2.6x.
+- **torch: call the numpy backend's Numba resampler kernels on the no-grad CPU path.**
+  Precedented, not speculative: the torch adaptation recurrence already does exactly
+  this (`ARCHIVE.md`, 2026-08-08, ~2.2-2.3x, bit-identical on the reference platform),
+  so the pattern, the optional-dependency handling and the forward-only constraint are
+  all already solved in this repo.
+
+  **Do not size this from the 3.3x in the rejected list.** That number is the ratio
+  between two *numpy* implementations — numpy's Numba AXPY kernel against a numpy
+  polyphase GEMM. The separate torch result is that a polyphase GEMM beat an *FFT
+  convolution*. The two comparisons share no common leg, so they do not chain into an
+  ordering, and torch's GEMM is not even the same algorithm as the numpy GEMM that lost
+  (different layout, split real/imag rows, shifted-diagonal sum). Nobody has ever
+  benchmarked numpy's Numba kernel against torch's GEMM head to head.
+
+  The ceiling is the resampler's share of torch runtime — 37% by cProfile, itself an
+  upper bound — so even an infinitely fast kernel caps near 1.6x. Constraints inherited
+  from the adaptation-loop precedent: forward-only, so the differentiable torch path
+  must stay for training; CPU-only; and Numba is an optional dependency, so this is a
+  fast path and not a replacement.
+
+  **The deciding measurement is cheap and nobody has run it**: A/B
+  `_numba_polyphase_interpolate`/`_decimate` against torch's `_polyphase_interpolate`/
+  `_decimate` at the real filterbank rates, with `benchmarks/ab.py`. Do that before
+  writing any integration. Note one discouraging data point already in hand — the
+  `benchmarks/ab.py` demo A/Bs the Numba polyphase path against SciPy's `upfirdn` at
+  `up=2` on `(8, 16000)` and the Numba kernel is **0.57x, i.e. slower**. That is a small
+  pure-interpolation case at a rate the filterbank never uses, so it is not decisive,
+  but it does mean "the Numba kernel is simply faster" is not a safe assumption at every
+  shape. Effort: low to measure, medium to integrate.
 - **torch: the least-squares *assembly*, not the solve** (`decomposition.py:250-258`).
   `perform_time_varying_least_squares_projection_torch` is 21% of mono at 0.247 s
   cumulative, of which only 0.015 s is `cholesky_ex` — so it is almost entirely data
