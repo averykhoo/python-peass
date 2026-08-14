@@ -95,11 +95,14 @@ from tests.regression.test_matlab_regression import _EXPECTED_SCORES  # noqa: E4
 from tests.regression.test_matlab_regression import _GAIN_TOLERANCE  # noqa: E402
 from tests.regression.test_matlab_regression import _MATLAB_RESAMPLER_GAIN_OFFSET  # noqa: E402
 
-# These two are *function-local* in the test (`validation_map` and
-# `corr_threshold` inside test_regression_against_matlab_references), so there
-# is nothing importable to bind to; they are mirrored here instead. Keep them in
-# step with that function by hand.
-_CORR_THRESHOLD = {"numpy": 0.999, "torch": 0.99}
+# The correlation floors became module-level in the test on 2026-08-15 (they used
+# to be a function-local `corr_threshold`), so bind to them directly rather than
+# mirroring -- one source of truth, no hand-syncing.
+from tests.regression.test_matlab_regression import _MAX_CORRELATION_DEFICIT  # noqa: E402
+
+# `validation_map` is still function-local inside
+# test_regression_against_matlab_references, so this one is mirrored by hand.
+# Keep it in step with that function.
 
 _VALIDATION_MAP = [
     ("true_target", "targetEstimate_true.wav"),
@@ -281,7 +284,7 @@ def main(tag, results_dir):
                         "rms_ratio": rms_ratio,
                         "gain_error": rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET - 1.0,
                         "gain_error_db": 20.0 * np.log10(rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET),
-                        "corr_pass": corr > _CORR_THRESHOLD[backend],
+                        "corr_pass": (1.0 - corr) < _MAX_CORRELATION_DEFICIT[comp],
                         "gain_pass": abs(rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET - 1.0) < _GAIN_TOLERANCE,
                     })
                 entry["channels"].append(ch_entry)

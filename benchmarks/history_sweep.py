@@ -108,8 +108,16 @@ REPO = _THIS.parents[1]
 # from the commit under test would move the yardstick with the measurement.
 # Values are HEAD's, from tests/regression/test_matlab_regression.py.
 _MATLAB_RESAMPLER_GAIN_OFFSET = 1.0025651
-_GAIN_TOLERANCE = 1e-3
-_CORR_THRESHOLD = {"numpy": 0.999, "torch": 0.99}
+_GAIN_TOLERANCE = 1e-4
+# Largest tolerated `1 - corr`, per component. Applying HEAD's bar to historical
+# commits is the intended reading: it answers "would this commit pass today's
+# gate", so the pre-3079de1 commits correctly show as failing.
+_MAX_CORRELATION_DEFICIT = {
+    "true_target": 1e-5,
+    "interference": 1e-5,
+    "target_distortion": 1e-5,
+    "artifacts": 1e-4,
+}
 
 _VALIDATION_MAP = [
     ("true_target", "targetEstimate_true.wav"),
@@ -364,7 +372,7 @@ def _worker(peass_root: pathlib.Path, repo: pathlib.Path, repeats: int, out_path
                             "correlation": corr,
                             "rms_ratio": rms_ratio,
                             "gain_error": rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET - 1.0,
-                            "corr_pass": corr > _CORR_THRESHOLD[backend],
+                            "corr_pass": (1.0 - corr) < _MAX_CORRELATION_DEFICIT[comp],
                             "gain_pass": abs(rms_ratio / _MATLAB_RESAMPLER_GAIN_OFFSET - 1.0)
                             < _GAIN_TOLERANCE,
                         })
