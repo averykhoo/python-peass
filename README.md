@@ -213,6 +213,38 @@ We test our output waveforms directly against the original `.wav` reference wave
 PEASS toolbox (located in `references/peass_master_22c7fc4e/v2.0.1/example/`).
 Python's outputs must achieve a cross-correlation coefficient exceeding $0.95$ with the MATLAB reference to pass.
 
+### The `reference/` transcription
+
+`reference/` holds a frozen, deliberately unoptimized transcription of MATLAB PEASS
+v2.0.1's decomposition path — 25 modules, each carrying its `.m` file's complete source as
+interleaved comments. It is developer tooling, excluded from the sdist and never imported
+by the library. Its value is being an *independent* second opinion, so it imports nothing
+from `peass` and uses stock `scipy.signal.resample_poly` rather than this project's
+resampler: the two share no code.
+
+The interleaved format splits verification into three checks that can each be made
+separately, rather than one act of faith:
+
+```bash
+python -m reference.verify_transcription   # the embedded MATLAB is byte-exact vs the .m files
+```
+
+That is the *copy* check, and it is mechanical — 25 modules, diffed line for line
+including blank lines, licence headers and trailing newlines. The *port* is checked by
+reading each Python block against the MATLAB directly above it. The *output* is checked
+against the gold WAVs by `tests/regression/test_reference_transcription.py`.
+
+What it established: the transcription reproduces the gold WAVs at correlation
+0.999999956 / 0.999999752 / 0.999999930 / 0.999996689 — the same digits the optimized
+backends produce. Two implementations sharing no code landing in the same place means the
+residual gap to MATLAB belongs to the algorithm as specified rather than to this port, and
+it gives the `+0.257%` offset documented below a second, independent derivation instead of
+being asserted against our own output. See `ARCHIVE.md` for the full account, including
+two latent bugs the transcription surfaced in the original MATLAB.
+
+The MATLAB sources it transcribes are not redistributed here; the verifier skips cleanly
+when they are absent, so a fresh clone and CI are unaffected.
+
 ### NumPy vs PyTorch backends
 
 The package dispatches to a NumPy backend for array/file inputs and a PyTorch

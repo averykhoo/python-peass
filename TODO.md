@@ -88,68 +88,40 @@ not obvious from the code:
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
 
-## slow-mode ground-truth reference (design decision pending, nothing started)
+## ground-truth reference — decomposition DONE, score path open
 
-A frozen, deliberately unoptimized implementation kept alongside the fast backends, to
-serve as **both** the accuracy oracle for new code and a stable denominator for perf
-claims. Raised 2026-08-12; the options below were laid out and the choice deferred.
+`reference/` is a frozen, deliberately unoptimized interlinear transcription of MATLAB
+PEASS v2.0.1's **decomposition path** (25 modules), landed 2026-08-14. It imports nothing
+from `peass` and uses stock `scipy.signal.resample_poly`, so it shares no code with the
+thing it checks. `python -m reference.verify_transcription` proves the embedded MATLAB is
+byte-exact against the `.m` sources; a regression test proves it reproduces the gold WAVs
+and pins the declared deviation list. See `ARCHIVE.md`, "`reference/` — interlinear
+MATLAB transcription", for what it proved (short version: the ~1e-5 gap to MATLAB is
+inherent, not our error, and the 1.0025651 gain constant is no longer self-asserted).
 
-**What it buys over what exists today.** The frozen `baseline` capture is ~25 MB of
-gitignored `.npy` that lives on one disk — frozen *code* regenerates the reference on
-any machine, for any input, indefinitely. And the MATLAB gold WAVs cover exactly one
-clip, so there is currently no ground truth at all for short files, unusual rates, or
-stereo; a reference implementation produces it for any input you hand it. As a perf
-denominator it never drifts, so "Nx faster than reference" stays comparable across
-machines and years in a way that "Nx faster than last release" does not.
+Open, in rough priority order:
 
-**The trap, which decides everything.** If the reference is written by stripping
-optimizations out of the current fast code, it cannot be an accuracy oracle: it inherits
-every existing bug and every bit of accumulated drift, so "fast matches slow" proves only
-that the code matches itself. Its authority as an oracle comes entirely from being
-derived *independently*, with the gold WAVs as the thing that earns it trust.
+- **Generate reference files for inputs we have no gold for.** This was the original
+  motivation and it is now unblocked: the reference produces ground truth for short
+  clips, unusual rates and stereo, none of which the single MATLAB gold clip covers. The
+  reflection-padding item above is the obvious first customer. Caution worth keeping:
+  the reference is validated on *one* clip, so a transcription bug invisible there would
+  silently poison everything generated. Prefer generating for inputs close to the
+  validated regime first, and sanity-check invariants (algebraic reconstruction, gain
+  invariance) on whatever comes out.
+- **Transcribe the score path** — `audioQualityFeatures.m`, `pemo_internal.m`,
+  `PEASS_ObjectiveMeasure.m`, `map2SubjScale.m`, `myMapping.m`, `pemo_metric.m`,
+  `ISR_SIR_SAR_fromNewDecomposition.m`. That would let us finally replace the
+  `_EXPECTED_SCORES` characterization values above with numbers derived from MATLAB
+  rather than from our own output. Note `haircell`/`adapt` are MEX with pure-MATLAB
+  fallbacks, and the adaptation loop is a sequential recurrence, so a naive transcription
+  will be *very* slow — which is acceptable for a reference.
+- **Use it as a refactor gate for the queued perf work.** The least-squares assembly
+  items below have no independent oracle today; `reference/LSDecompose_tv.py` is one now.
 
-### Derivation — pick one
-
-1. **Transcribe from MATLAB PEASS v2.0.1** (`papers/` and the reference sources are
-   in-repo). A literal, readable transcription of the `.m` files, validated by
-   reproducing the gold WAVs. The only option that is a real oracle — it can tell you
-   the *current* code is wrong. Roughly a day.
-2. **Freeze today's semantics.** A readable deoptimized snapshot of what the current
-   code computes. A couple of hours. Catches future drift and gives the perf denominator,
-   but is tautological about today.
-3. **Cheap now, upgrade later.** Land the snapshot, then replace stages with MATLAB
-   transcriptions where it matters — resampler and LS projection first, since that is
-   where the optimization pressure has been. Mark each stage `SNAPSHOT` or `TRANSCRIBED`
-   so the oracle's authority is never overstated.
-
-Owner leans toward MATLAB as the reference, **with a caveat worth taking seriously**:
-academic reference code sometimes contains numerical-stability mistakes, so a faithful
-transcription can enshrine one. Treat agreement with the gold WAVs as the trust signal,
-not MATLAB's algorithm choices as automatically correct — and if the transcription and
-the current code disagree somewhere numerically delicate, that is a question to
-investigate, not an automatic win for MATLAB. The `1e-15` diagonal regularization note in
-`ARCHIVE.md` is an example of this repo already declining to copy a questionable choice.
-
-### Scope — pick one
-
-1. **Decomposition only** — gammatone analysis/synthesis, polyphase resampling,
-   time-varying LS projection, component extraction. Where every optimization has landed
-   and where the accuracy risk lives. Smallest useful thing.
-2. **Decomposition + scores** — everything through OPS/TPS/IPS/APS including the
-   auditory model. Note the adaptation loop is a sequential recurrence: an unoptimized
-   version was ~1.97 s for 1 s of audio *before* the Numba kernel, and a deliberately
-   naive one is worse.
-3. **Resampler only, as a pilot** — the single hottest component (37% of torch, 42% of
-   numpy) and the one that has absorbed the most change. Proves the concept in an
-   afternoon before committing to the rest.
-
-### The "was an earlier version closer to gold?" lead — checked, answer is no
-
-Swept 14 commits back to 2026-07-08 on 2026-08-13 (`benchmarks/history_sweep.py`,
-results in `benchmarks/history.csv`). **No commit in the swept history is closer to the
-gold WAVs than HEAD**, so there is no better starting point hiding in the history and no
-unnoticed accuracy regression. Details in `ARCHIVE.md`, "History sweep". Choose a
-derivation option on its merits.
+Deliberately NOT done: a reference for the resampler. There is no route to an independent
+one short of real MATLAB — see the Octave investigation in `ARCHIVE.md` — so all four
+`resample` call sites are declared deviations rather than transcriptions.
 
 ## perf ideas not yet taken
 

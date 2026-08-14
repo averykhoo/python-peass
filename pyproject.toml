@@ -51,6 +51,7 @@ exclude = [
     "references/*",
     "tests/*",
     "benchmarks/*",
+    "reference/*",
     ".github/*"
 ]
 

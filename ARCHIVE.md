@@ -84,6 +84,78 @@ implementation, plus dropping the `__post_init__` guard and its test.
 
 ## Closed investigations (do not reopen)
 
+### GNU Octave as a reference generator — does not work, and why (2026-08-14)
+
+**The idea.** We have the complete MATLAB PEASS v2.0.1 source in `.scratch/`. If Octave
+could execute it faithfully, it would be a *reference generator*: gold WAVs for any input
+we like, instead of the single clip in `tests/resources/matlab_reference/`. That would
+have made the whole clean-reference question mostly moot.
+
+**It does not work.** Octave, running the genuine MATLAB source with both
+decomposition-path MEX files compiled, reproduces the gold WAVs only to:
+
+| component | correlation | peak dev | RMS ratio |
+| --- | --- | --- | --- |
+| true_target | 0.99937 | 3.8% | +1.65% |
+| target_distortion | 0.99896 | 5.6% | +2.39% |
+| interference | 0.99937 | 4.1% | +1.42% |
+| artifacts | 0.99668 | 6.2% | +1.36% |
+
+Our Python reaches correlation 0.999996 and gain error ~1e-5 on the same clip — roughly
+three orders of magnitude closer. **The Python port is a far better MATLAB reproduction
+than actual Octave running the actual original code.** That is worth stating plainly,
+because it is the opposite of what you would assume.
+
+**Cause, isolated.** `resample`. Octave's signal-package version differs from ours by
+9.05e-2 relative on a single 3/2 call (rms ratio 1.0116) and 6.83e-2 on 2/3 (1.0129),
+while ours is *bit-identical* to `scipy.signal.resample_poly`. MATLAB designs the
+anti-aliasing filter with `firls`; Octave uses a kaiser-windowed ideal sinc. The
+magnitudes reconcile: 1.0116 compounded over the four resamples per signal path, with the
+up and down conversions partially cancelling, lands on the observed 1.014-1.024 — so the
+resampler accounts for essentially all of the deviation.
+
+**The obvious fix makes it worse.** Reimplementing `resample.m` from MathWorks' documented
+algorithm (order `2*n*max(p,q)` with `n=10`, cutoff `pi/max(p,q)`, `firls` windowed by
+`kaiser(beta=5)`, normalized `b = p*b/sum(b)`, then `upfirdn`) and shadowing the signal
+package with it measured **+3.1% RMS against gold, versus stock Octave's +1.2%**. At the
+filter-tap level against our scipy `firwin` design:
+
+| design | max tap difference |
+| --- | --- |
+| Octave `firls` (MATLAB's documented method) | 2.90e-2 |
+| Octave `fir1` (window method, same family as ours) | 2.93e-3 |
+
+Even Octave's `fir1` — nominally the same windowed-Kaiser algorithm scipy's `firwin`
+implements — differs from ours by ~0.9% on the taps. **So the problem is not that Octave
+picked the wrong filter design; it is that Octave's DSP primitives and scipy's do not
+agree at the precision this project cares about.** Closing that would mean reimplementing
+the filter design in `.m` to mirror scipy, at which point the resampler leg is circular,
+the result is still hostage to Octave's other primitives, and it is more work than the
+Python transcription it was meant to avoid.
+
+**The consequence for the reference design, which is the durable part.** There is no route
+to an *independent* resampler except real MATLAB. A Python transcription needs a
+`resample` too, and we would write the same reverse-engineered one. So transcription buys
+no resampler independence either — which means the honest scope of any clean reference is
+"independent everywhere except the resampler", and the cheapest way to get that is a
+Python port using stock `scipy.signal.resample_poly`. That is why `reference/` carries a
+declared `# !!! DEVIATION` at its resample call rather than attempting a transcription.
+
+**Practical notes, so a future attempt does not rediscover them.** Octave ships a plain
+`.zip` for Windows (`octave-9.4.0-w64.zip`, ~765 MB) alongside the installer, so it needs
+no admin rights and no GUI. `mkoctfile --mex` builds the PEASS MEX files without trouble
+once `mingw64/bin` is on `PATH`. Three findings about the MATLAB source itself are worth
+keeping:
+
+- `haircell` and `adapt` are **metrics-only** (`pemo_internal.m`); the decomposition never
+  touches them.
+- `toeplitzC` and `Gfb_Analyzer_fprocess` are in the decomposition path but both have pure
+  MATLAB fallbacks — a `try/catch` onto built-in `toeplitz`, and the `analyzer.fast` else
+  branch respectively. **No compilation is needed to run the decomposition.**
+- `myPemoAnalysisFilterBank.m:44` sets `analyzer.fast = true` *unconditionally*, without
+  the `exist(...)` guard its counterpart at `pemo_internal.m:65` uses. In MATLAB you would
+  have run `compile.m` first so it never shows; on a bare interpreter it is a hard error.
+
 ### Two CI failures from over-claimed test invariants (2026-08-09)
 
 Both were defects in the *tests*, not the code, and both came from writing down a
@@ -303,6 +375,75 @@ deviations from the MATLAB reference".
 ---
 
 ## Resolved
+
+### `reference/` — interlinear MATLAB transcription, and what it proved (2026-08-14)
+
+A frozen, deliberately unoptimized transcription of the MATLAB PEASS v2.0.1
+**decomposition path** — 25 modules, the 7 PEASS-layer files plus the 18 gammatone
+toolbox files. It exists to be an independent second opinion, so it **imports nothing
+from `peass`**: numpy, scipy and the stdlib only, and stock `scipy.signal.resample_poly`
+rather than this project's resampler, so the two share no code at all.
+
+**The format is the point.** Each module carries its `.m` file's complete source as
+`# `-prefixed comments, in order, interleaved with the Python implementing it, fenced by
+`# >>> MATLAB` / `# <<< MATLAB`. That makes three checks separable:
+
+- *faithfulness of the copy* — mechanical. `python -m reference.verify_transcription`
+  concatenates each module's embedded MATLAB and diffs it against the real `.m`, byte for
+  byte including blank lines, licence headers and the presence or absence of a trailing
+  newline. **25 passed, 0 failed.** It earned its keep immediately: all 18 gammatone
+  modules initially dropped each file's final newline, a one-character-per-file error that
+  no amount of reading would have caught.
+- *faithfulness of the port* — by eye, each Python block sitting under the MATLAB it
+  implements, with MATLAB's variable names kept.
+- *faithfulness of the output* — against the gold WAVs.
+
+**The headline: the ~1e-5 residual gap to MATLAB is inherent, not our error.** The
+transcription reproduces the gold WAVs at correlation 0.999999956 / 0.999999752 /
+0.999999930 / 0.999996689 — the same digits the optimised backends produce. Two
+implementations sharing no code land in the same place, so the gap belongs to the
+algorithm as specified, and the fast port is exonerated. This is the question
+`ARCHIVE.md` previously recorded as unanswerable without a second implementation.
+
+**It also de-circularizes the gain constant.** `_MATLAB_RESAMPLER_GAIN_OFFSET = 1.0025651`
+was asserted by `peass`'s own test against `peass`'s own output. The reference
+independently lands on 1.002565… — six significant figures — from the `.m` files alone.
+
+Two findings about the *original* code, which is the other thing a transcription buys:
+
+- **The segmentation path in shipped v2.0.1 cannot run.** `aux_mergeWav` sets
+  `siz0 = infos_est.TotalSamples`, a scalar, where the `wavread` it replaced returned
+  `[nSamples nChannels]` — so `zeros(siz0)` allocates `siz0`x`siz0` (~441000² for 10 s)
+  and `siz0(2)` indexes out of bounds. It fails in MATLAB too. The port raises
+  `NotImplementedError` rather than emit Python faithful to code that does not work, and
+  this independently corroborates commit `07ba346`'s decision to reject
+  `segmentation_factor != 1` instead of porting it.
+- **Latent bugs in the gammatone toolbox**: `Gfb_Mixer_new` tests `nargin < 4` inside a
+  three-argument function, so a caller-supplied `iterations` is always clobbered; and
+  `Gfb_Delay_new` can index off the front of `impulse_response`. Neither is reachable with
+  PEASS's parameters. Both transcribed as written, with the second raising rather than
+  silently wrapping, because a loud difference beats a silent one.
+
+An extra validation worth knowing about: the toolbox ships `README_examples.txt`
+containing **real MATLAB console output**, and the port reproduces every printed digit —
+`Gfb_Filter_new(10000,1000,100,3,4)` coefficient `0.7526+0.5468i`, normalization factor
+`4.7434e-05`, and the filter state after a 200-sample impulse. That is a second gold
+source for the gammatone layer specifically, independent of the WAVs.
+
+Nine declared deviations, each marked `# !!! DEVIATION` and pinned by a test so a *new*
+silent one fails the build: four `resample` call sites (the sole numerical deviation, and
+the entire source of the gain offset), the file-I/O inversion so the primary API returns
+arrays, `audiowrite` quantization, the segmentation `NotImplementedError`, and the
+gammatone MEX-branch and colon-operator notes.
+
+The single highest-risk spot in the port is `reshape(..., order='F')` in `extractTSIA` —
+MATLAB is column-major, and C order would silently transpose the source/channel grouping
+so every `(nSource-1)*NChan+(1:NChan)` slice addressed the wrong columns. Also load
+bearing: MATLAB's `round` is half-away-from-zero where Python's is half-to-even, which
+decides the shade-window length and the synthesis trim offset.
+
+Scope is the decomposition only. The auditory model and the OPS/TPS/IPS/APS score path
+are not transcribed — see `TODO.md`.
 
 ### History sweep: accuracy and speed across 14 commits (2026-08-13)
 
