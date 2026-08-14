@@ -48,10 +48,10 @@ name = "peass"
 
 [tool.flit.sdist]
 exclude = [
-    "references/*",
     "tests/*",
     "benchmarks/*",
     "reference/*",
+    ".scratch/*",
     ".github/*"
 ]
 

@@ -87,19 +87,13 @@ not obvious from the code:
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
+  There is now a second route to this that does not need MATLAB: transcribe the score
+  path into `reference/` — see the ground-truth reference section below.
 
-## ground-truth reference — decomposition DONE, score path open
+## ground-truth reference — decomposition done, score path open
 
-`reference/` is a frozen, deliberately unoptimized interlinear transcription of MATLAB
-PEASS v2.0.1's **decomposition path** (25 modules), landed 2026-08-14. It imports nothing
-from `peass` and uses stock `scipy.signal.resample_poly`, so it shares no code with the
-thing it checks. `python -m reference.verify_transcription` proves the embedded MATLAB is
-byte-exact against the `.m` sources; a regression test proves it reproduces the gold WAVs
-and pins the declared deviation list. See `ARCHIVE.md`, "`reference/` — interlinear
-MATLAB transcription", for what it proved (short version: the ~1e-5 gap to MATLAB is
-inherent, not our error, and the 1.0025651 gain constant is no longer self-asserted).
-
-Open, in rough priority order:
+`reference/` transcribes MATLAB PEASS v2.0.1's **decomposition path**; landed 2026-08-14,
+written up in `ARCHIVE.md`. Remaining work, in rough priority order:
 
 - **Generate reference files for inputs we have no gold for.** This was the original
   motivation and it is now unblocked: the reference produces ground truth for short
@@ -125,15 +119,15 @@ one short of real MATLAB — see the Octave investigation in `ARCHIVE.md` — so
 
 ## perf ideas not yet taken
 
-From the decomposition-focused profiles of 2026-08-09 and 2026-08-10. All prototyped
-and measured on `tests/resources/database/exp01_*` unless marked hypothesis, and all
-subject to rule 1 — efficiency and SIMD, no fanning out.
+From the decomposition-focused profiles of 2026-08-09, 2026-08-10 and 2026-08-12. All
+prototyped and measured on `tests/resources/database/exp01_*` unless marked hypothesis,
+and all subject to rule 1 — efficiency and SIMD, no fanning out.
 
-What landed, and what was tried and rejected, is in `ARCHIVE.md` rather than here —
-check it before reviving anything, particularly FIR symmetry folding, Levinson, and
-the batching experiment that the polyphase GEMM obsoleted. The P-numbers started at P4
-because P1-P3 of the 2026-08-09 list are archived there too; P4 and the two non-P items
-landed on 2026-08-12, leaving P5 as the only one still open.
+**Check `ARCHIVE.md` before reviving anything here.** What landed and what was measured
+and rejected both live there, and the rejected list is longer than this one — notably FIR
+symmetry folding, Levinson, the batching experiment the polyphase GEMM obsoleted, and a
+numpy polyphase GEMM that measured 3.3x *slower*. P5 below is the last survivor of the
+original P-numbered list; P1-P4 are archived.
 
 **Re-measure before trusting the number below.** It was sized against a decomposition
 in which resampling was 60% of runtime. It is not 60% any more, but it is still the
