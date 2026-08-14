@@ -269,8 +269,24 @@ def test_gammatone_reconstruction_parameterized(synthetic_signal):
     # is deliberately loose: broadband inputs (chirp, white noise) carry energy
     # outside the [80, 6000] Hz filterbank span that cannot be reconstructed, so
     # ~0.89 is the physical ceiling for those cases (narrowband tones reach ~0.99).
+    #
+    # FRAGILE -- do not tighten. Measured 2026-08-15 across the parametrization:
+    #
+    #     signal      correlation    1 - corr
+    #     sine        0.9929427      7.06e-03
+    #     square      0.9911042      8.90e-03
+    #     triangle    0.9956218      4.38e-03
+    #     chirp       0.8954640      1.05e-01
+    #     noise       0.8896672      1.10e-01   <- worst
+    #
+    # 0.85 allows a 1.5e-1 deficit, so `noise` runs at 1.36x of the bar -- the
+    # narrowest correlation margin in the suite. It is not flaky here (the fixture
+    # RNG is seeded and this path has no cross-platform-sensitive arithmetic), but
+    # any change that shifts broadband reconstruction even slightly will trip it,
+    # and the right fix in that case is to re-measure and lower the bar, not to
+    # assume a regression. Do not raise it toward the 0.99 the tonal cases reach.
     corr = np.corrcoef(original_sliced, reconstructed_sliced)[0, 1]
-    assert corr > 0.85
+    assert corr > 0.85, f"Reconstruction fidelity too low: {corr:.6f}"
 
 
 @pytest.mark.unit
@@ -348,11 +364,27 @@ def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
     assert reconstructed.shape[0] == num_samples
 
     # Compensate the synthesis group delay, then assert high reconstruction fidelity.
+    #
+    # This is a genuinely lossy round trip, so the bar is set by physics rather than
+    # by arithmetic noise and cannot be tightened the way a cross-backend parity bar
+    # can. Measured 2026-08-15, worst over the parametrization:
+    #
+    #     fs        correlation    1 - corr
+    #     8000      0.9950593      4.94e-03   <- worst
+    #     16000     0.9956465      4.35e-03
+    #     44100     0.9960657      3.93e-03
+    #
+    # 0.98 allows a deficit of 2e-2, i.e. ~4x over the worst case. That is a small
+    # margin by the standards of the parity tests, but appropriate here: there is no
+    # RNG and no resampling in this path, the two backends' filterbanks agree to
+    # 1e-13, and the value moves only 26% across a 5.5x span of sampling rate. The
+    # 10x-100x rule of thumb would actually *loosen* this bar to 0.95, so it is left
+    # where it is.
     delay_samples = int(round(desired_delay_seconds * sampling_frequency_hz))
     original_aligned = signal_input[:num_samples - delay_samples]
     reconstructed_aligned = reconstructed[delay_samples:delay_samples + len(original_aligned)]
     corr = np.corrcoef(original_aligned, reconstructed_aligned)[0, 1]
-    assert corr > 0.98, f"Reconstruction fidelity too low at {sampling_frequency_hz} Hz: {corr:.4f}"
+    assert corr > 0.98, f"Reconstruction fidelity too low at {sampling_frequency_hz} Hz: {corr:.6f}"
 
 
 @pytest.mark.unit
@@ -418,9 +450,22 @@ def test_gammatone_analysis_reconstruction_fidelity(sampling_frequency_hz):
     original_slice = original_slice[:min_len]
     reconstructed_slice = reconstructed_slice[:min_len]
 
-    # Assert high-fidelity signal reconstruction
+    # Assert high-fidelity signal reconstruction. Lossy round trip, same as
+    # test_gammatone_analysis_reconstruction above -- measured 2026-08-15:
+    #
+    #     fs        correlation    1 - corr
+    #     8000      0.9922756      7.72e-03   <- worst
+    #     16000     0.9929189      7.08e-03
+    #     44100     0.9930428      6.96e-03
+    #
+    # Tightened 0.90 -> 0.98 on 2026-08-15. The old bar allowed a 1e-1 deficit
+    # against a measured 7.7e-03, i.e. 13x, which let the filterbank degrade by an
+    # order of magnitude unnoticed. 0.98 leaves ~2.6x and matches the sibling test's
+    # bar for the same physical quantity; a 440 Hz tone against a [80, 3000] Hz bank
+    # is the near-ideal case for this filterbank, so the deficit is small and stable
+    # (11% spread across a 5.5x span of sampling rate).
     corr = np.corrcoef(original_slice, reconstructed_slice)[0, 1]
-    assert corr > 0.90, f"Reconstruction fidelity too low: {corr:.4f}"
+    assert corr > 0.98, f"Reconstruction fidelity too low at {sampling_frequency_hz} Hz: {corr:.6f}"
 
 
 # -----------------------------------------------------------------------------

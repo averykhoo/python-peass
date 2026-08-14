@@ -103,6 +103,42 @@ written up in `ARCHIVE.md`. Remaining work, in rough priority order:
   silently poison everything generated. Prefer generating for inputs close to the
   validated regime first, and sanity-check invariants (algebraic reconstruction, gain
   invariance) on whatever comes out.
+- **Property-based testing against the reference, with `hypothesis`.** The stronger
+  version of the item above: instead of freezing a fixed set of generated golden files,
+  use `reference/` as a *live oracle* and fuzz the input space, asserting the fast
+  backends agree with it. This closes the gap the existing tests structurally cannot:
+  every invariant we have — algebraic reconstruction, gain invariance, gammatone round
+  trip — constrains the *form* of the answer and is satisfied by a **wrong** one.
+  `true_target + target_distortion + interference + artifacts == estimate` holds for any
+  partition of the estimate. Only a reference constrains the *content*, and today it is
+  only checked on one clip.
+
+  **`hypothesis` is not currently a dependency** — this needs a decision first, presumably
+  as a dev/test extra rather than a runtime one.
+
+  Three things to design around, all learned the hard way and none obvious:
+
+  - **The reference is slow** (~13 s per decomposition, deliberately). Naive fuzzing is
+    far too slow for CI. Constrain the strategies hard — short signals, low sample rates,
+    two sources, mono — and cap `max_examples` with `deadline=None`. This probably wants
+    to be a nightly or opt-in marker rather than part of the default gate.
+  - **Hypothesis will find the degenerate cases immediately, and they are traps rather
+    than bugs.** A *linear* mix lies exactly in the span of the sources, so `artifacts`
+    comes out at ~1e-14 and any comparison of it becomes noise-against-noise. And a
+    second channel that is an exactly FIR-realizable image of the first (say a pure
+    delay, against a 640-tap filter) makes the per-frame Gram rank-deficient, so
+    `target_distortion` and `interference` become minimum-norm garbage — peaks ~1.7, and
+    the two backends disagreeing by 9e-2. Both were hit while building
+    `benchmarks/measure.py`; see the FROZEN CONVENTIONS block there for the nonlinear
+    estimate and decorrelated stereo that avoid them. Either exclude these from the
+    strategy or assert something weaker on them, but do it deliberately.
+  - **Comparison tolerance must be per component**, for the same reason
+    `test_matlab_regression.py` now is: `artifacts` amplifies ~1e6 through the
+    ill-conditioned least-squares stage, so a single bar is meaningless across the four.
+
+  Worth noting `reference/` runs without the MATLAB sources — only
+  `verify_transcription.py` needs them — so this works on a fresh clone and in CI.
+
 - **Transcribe the score path** — `audioQualityFeatures.m`, `pemo_internal.m`,
   `PEASS_ObjectiveMeasure.m`, `map2SubjScale.m`, `myMapping.m`, `pemo_metric.m`,
   `ISR_SIR_SAR_fromNewDecomposition.m`. That would let us finally replace the
@@ -120,7 +156,7 @@ one short of real MATLAB — see the Octave investigation in `ARCHIVE.md` — so
 ## perf ideas not yet taken
 
 From the decomposition-focused profiles of 2026-08-09, 2026-08-10 and 2026-08-12. All
-prototyped and measured on `tests/resources/database/exp01_*` unless marked hypothesis,
+prototyped and measured on `tests/resources/database/exp01_*` unless marked unprototyped,
 and all subject to rule 1 — efficiency and SIMD, no fanning out.
 
 **Check `ARCHIVE.md` before reviving anything here.** What landed and what was measured
@@ -138,7 +174,7 @@ not assume resampling has stopped mattering.
 
 ### torch
 
-- **P5, hypothesis, was sized at 109 ms — fold the modulation into the polyphase
+- **P5, unprototyped, was sized at 109 ms — fold the modulation into the polyphase
   filters** (`decomposition.py:407` and the synthesis alignment matrix). Complex-
   exponential modulation distributes through convolution exactly, so the full-length
   modulation multiplies fold into the 21-tap filters and the cached modulation matrices
@@ -277,6 +313,42 @@ that first, it is longer than this list.
   and the same trick may apply, but nobody has looked at the surrounding algebra.
 
 ### correctness, not perf
+
+- **Backend-dependent onset transient on short synthetic inputs** — found 2026-08-15
+  while tightening thresholds, documented in place at
+  `tests/regression/test_differential_numpy_vs_torch.py:213`. On the synthetic 2-source
+  pair in `test_differential_decomposition_pipeline`, torch's `target_distortion` and
+  `interference` carry a transient in the **first ~60 samples peaking at ~1e3, against a
+  numpy RMS of ~1e-1**. Their individual correlations against numpy are **0.127 and
+  0.110**.
+
+  Why it has stayed invisible: the transient *cancels* between those two components, so
+  both backends still reconstruct the estimate to the same 1.1 max error and every
+  algebraic-reconstruction invariant passes. And that test only ever asserted
+  `true_target`, which is unaffected. The same two components measure 1e-11 parity on the
+  MATLAB reference WAVs, so it is specific to short synthetic input rather than a general
+  divergence — most likely a filter/solver warm-up at the very start of the signal that
+  the 5 s reference clip dilutes to nothing.
+
+  This matters beyond tidiness: short clips are exactly the regime the reflection-padding
+  item is about, and exactly where `reference/` is meant to start generating ground
+  truth. Root-cause before either. Do not widen that test to the other components until
+  it is understood — it will fail, and correctly.
+
+- **Three fragile absolute tolerances, 1.2-1.6x of margin** (the narrowest in the suite),
+  all in `test_differential_numpy_vs_torch.py` and marked `FRAGILE -- do not tighten`:
+  mixer gains `:353` (measured 8.31e-7 vs `atol=1e-6`), FFT-vs-IIR analyzer `:327`
+  (7.38e-7 vs 1e-6), synthesizer delay/phase `:382` (3.15e-6 vs `atol=5e-6`). Also
+  `test_numpy_gammatone.py:381` DC rejection at 5.05e-3 against 1e-2.
+
+  These are the most likely source of an ubuntu-latest-only CI failure in the whole
+  suite, and the root cause is a **units mismatch, not a too-tight number**: each is a
+  genuine ~1e-6 *relative* algorithmic difference being checked against an *absolute*
+  tolerance, so the margin depends on the signal's peak. The principled fix is to express
+  them as `rtol` rather than raise `atol` — that is a correctness fix in how the
+  comparison is written, not a weakening. Raising `atol` to ~1e-5 is the quick
+  alternative. Deliberately left alone for now because both directions widen a currently
+  passing bar, which is a judgement call rather than a measurement.
 
 - The torch gammatone's accuracy floor is its **wrap guard, not its FFT length**:
   against a 4x-padded oracle the current transform is 5.4e-6 relative, driven by a

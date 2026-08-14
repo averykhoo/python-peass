@@ -37,7 +37,6 @@ def test_torch_gammatone_filterbank(device_str):
     assert reconstructed.device == device
     assert reconstructed.shape[0] == 16000
 
-    # Convert to numpy and check that reconstruction is highly correlated (>0.90)
     x_np = to_numpy_format(x)
     recon_np = to_numpy_format(reconstructed)
 
@@ -46,8 +45,27 @@ def test_torch_gammatone_filterbank(device_str):
     orig_slice = x_np[delay: -delay]
     recon_slice = recon_np[2 * delay: len(orig_slice) + 2 * delay]
 
+    # Lossy analysis -> synthesis round trip, so this bar is set by physics rather
+    # than arithmetic noise. Measured on CPU 2026-08-15: correlation 0.9929697,
+    # i.e. a deficit of 7.03e-03. The NumPy backend on the identical setup measures
+    # 0.9929697 too -- the two reconstructions agree to 1.6e-13 -- so this is the
+    # filterbank's own reconstruction floor, not a torch approximation.
+    #
+    # Tightened 0.90 -> 0.98 on CPU 2026-08-15; the old bar allowed a 1e-1 deficit
+    # against a measured 7.0e-03 (14x) and let the filterbank degrade an order of
+    # magnitude unnoticed. 0.98 leaves ~2.8x and matches the NumPy siblings in
+    # tests/unit/backend_numpy/test_numpy_gammatone.py.
+    #
+    # CUDA has never been measured for this quantity and is not exercised in CI, so
+    # it keeps the old documented-loose bound rather than silently inheriting the
+    # CPU floor. Tighten it once there is a measurement to justify a number.
+    minimum_correlation = 0.90 if device_str == "cuda" else 0.98
+
     corr = np.corrcoef(orig_slice, recon_slice)[0, 1]
-    assert corr > 0.90, f"PyTorch reconstruction fidelity failed. Correlation is {corr:.4f}"
+    assert corr > minimum_correlation, (
+        f"PyTorch reconstruction fidelity failed on {device_str}. Correlation is "
+        f"{corr:.6f}, below the {minimum_correlation} floor"
+    )
 
 
 def gather_synthesis_reference(synth: GammatoneSynthesizerTorch, subbands: torch.Tensor,
