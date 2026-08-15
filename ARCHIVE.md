@@ -84,6 +84,85 @@ implementation, plus dropping the `__post_init__` guard and its test.
 
 ## Closed investigations (do not reopen)
 
+### Auditory-path optimisations that measured worse, and four method traps (2026-08-15)
+
+From the same pass as the wins in "The 2026-08-15 auditory-path pass". The two rejections
+were built and reverted; the four method findings each invalidated somebody's first
+answer, which is why they are here rather than in a commit message.
+
+- **Interleaving N independent bands through the numpy fused auditory kernel's sample
+  loop.** The reasoning is sound and is the archive's own: the 5-stage cascade is five
+  *dependent* divisions at ~14 cycles of latency each, and the 2026-08-08 note below
+  already says this kernel is "latency-bound on its 5 serial divisions". Processing a
+  block of independent bands in lockstep should overlap those chains. An isolated harness
+  read **1.53x**. In situ it is worth nothing, at every block width:
+
+  | block width | vs width 1 (`ab.py`, 20 samples/phase, AGREE) |
+  | --- | --- |
+  | 2 | 0.9921x CI [0.9754, 1.0047] |
+  | 4 | 0.9753x CI [0.9527, 0.9871] |
+  | 8 | 1.0042x CI [0.9794, 1.0177] |
+  | 16 | 0.9818x CI [0.9498, 1.0008] |
+
+  Every width is bit-identical to every other (reordering independent recurrences
+  reassociates nothing), so this was purely a timing decision and the timing says no.
+  Built, measured, reverted; there is a comment at the site in
+  `backend_numpy/auditory_model.py` so it is not re-prototyped. **The torch twin was
+  measured independently the same day and also came out flat-to-slower.**
+
+- **Sharing the linear front end across the 5 auditory runs per channel.** The metric path
+  runs the auditory model five times per channel, and the four references are
+  leave-one-out sums of the same four components. The front end — scale, resample,
+  gammatone — is linear, so four filterbank passes could in principle serve all five.
+  Measured, and it is a loss: it saves one gammatone pass (~44 ms) and costs forming the
+  combinations on `(27, N)` subbands instead of on `(N,)` waveforms, at ~11 ms per
+  full-array op. **Summing in the time domain, before the filterbank, is the correct
+  place.** It is also only a reassociation, not bit-identical, so it would have to clear
+  the near-exact bar to buy a negative. Recorded in place at the call site in
+  `backend_numpy/metrics.py`, which is also where a `ThreadPoolExecutor` suggestion that
+  directly violated ground rule 1 used to live.
+
+Four method findings, each of which broke a first attempt:
+
+- **`np.longdouble` is float64 under MSVC on this platform.** `np.finfo(np.longdouble)`
+  reports `eps == 2.220446049250313e-16` and `machep == -52`. An "80-bit oracle" built on
+  it therefore silently compares float64 against itself and will report exactly **0.0**
+  deviation for any candidate whatsoever — including a badly wrong one. One agent's first
+  accuracy claim in this pass was built on exactly that and was wrong. Use a double-double
+  instead (Dekker split, `two_prod`, `two_sum`; ~106 bits); two independent agents
+  reproduced the same construction from scratch, and it is what the haircell accuracy
+  numbers above rest on.
+
+- **torch's batched FFT is not bit-row-invariant, and never was.** Measured on a
+  `(9, 20000)` float64 input at fs=24000, one call against nine single-row calls:
+  `process` 7.11e-16, `process_real` 5.55e-16. Through the public auditory entry with one
+  row per chunk forced, the internal representation moves 4.55e-12 on the real path and
+  3.64e-12 on the complex one. `_FFT_CHUNK_BUDGET_BYTES` claimed "rows are filtered
+  independently, so any value gives identical output"; that was false **before** this
+  session's patches as well as after, so it is a property of torch's batched FFT and not
+  of anything landed here. The comment, the `process`/`process_real` docstrings and README
+  are now correct. The consequence for anyone touching that constant: it is a memory knob,
+  not a tuning knob, and changing it changes the last digits of a score.
+
+- **The "old path's own noise" control — treat this as the standard method for any
+  near-exact claim.** Before attributing a deviation to a candidate, reproduce it on the
+  **unchanged** path via a mathematically exact identity: permute the rows, change a chunk
+  boundary, run full-batch against row-by-row. In this pass a seed-1006 row permutation on
+  the *unpatched* path reproduced the rfft candidate's OPS deviation of **2.117e-09 to the
+  digit**. Without that control, the number you report as "what my change moved" may be
+  characterizing the existing filterbank instead. The 2026-08-12 mixed-rate entry used the
+  same trick with a different valid padding length and reached the same kind of
+  conclusion; this generalizes it.
+
+- **Isolated harnesses overstate on this codebase — now three data points, and the rule is
+  general.** Band-interleaving read 1.53x isolated against 1.0042x in situ; its torch twin
+  behaved the same way; and the gammatone loop order read 1.16-1.53x in a kernel harness
+  against 1.024x in situ on the decomposition. A kernel harness feeds warm cache, omits
+  the allocator, and — most of all — omits Amdahl. **No timing claim in this repo is valid
+  unless it came from `benchmarks/ab.py` driving a real public entry point.** Note the
+  converse is also on record: the same rule caught the gammatone loop order being
+  *under*-sized by 2.2x once measured on the entry point that actually calls it 18 times.
+
 ### GNU Octave as a reference generator — does not work, and why (2026-08-14)
 
 **The idea.** We have the complete MATLAB PEASS v2.0.1 source in `.scratch/`. If Octave
@@ -269,6 +348,18 @@ pass. Same principle as the 2026-08-09 list below — these all look right on pa
   Hermitian reconstruction; everything else there routes back to transform sizing, which
   the dropped sizing item already closed. The `_FFT_CHUNK_BUDGET_BYTES` chunking probed
   as correctly sized.
+
+  **Amended 2026-08-15 — do not read this as a blanket "no rfft in the gammatone"; a
+  sweep that does will re-reject a win that has landed.** This bullet is about the
+  *forward* transform on the **decomposition** path, where the output must stay analytic
+  so the inverse is complex-to-complex and the Hermitian reconstruction has to be paid
+  for. The **auditory** path discards the output to `.real`, which makes the inverse
+  complex-to-**real** — so it attacks the 0.131 s side this bullet itself identifies as
+  the cost, not the 0.009 s side, and the Hermitian symmetry is folded once into an
+  `lru_cache`d half filter rather than reconstructed per call. Measured **1.1306x** on
+  the metric path; see `GammatoneAnalyzerTorch.process_real` and "The 2026-08-15
+  auditory-path pass" under Resolved. The bullet as written remains correct for
+  `process`, which is untouched.
 - **Collapsing the synthesis band-group unpack loop** (`decomposition.py:460` and the
   32-iteration write loop at `:465-478`). Within a decimation group every band
   necessarily has the same length — `torch.stack` would fail otherwise — so the loop
@@ -355,6 +446,14 @@ estimated, so they do not need measuring again:
   `np.real()` stride-16 view: **1.03x**, and the copy itself costs 0.011 s. The kernel
   is latency-bound on its 5 serial divisions, not memory-bound.
 
+  **Amended 2026-08-15: this result is still correct, and it is a *component* of a win
+  that landed.** What was rejected here is buying contiguity at the consumer, where the
+  copy costs more than the 1.03x it buys. The producer can supply it for free — the
+  gammatone kernel was writing that memory anyway, so storing float64 rather than
+  complex128 hands the same contiguous array over at negative cost. See "The 2026-08-15
+  auditory-path pass" under Resolved. Generalizable: a micro-optimisation rejected at the
+  call site that has to pay for it may still be free one stage upstream.
+
 ### +0.257% level offset against the MATLAB gold WAVs
 
 Root-caused and deliberately **not** fixed. Our decomposition output is a flat factor
@@ -375,6 +474,190 @@ deviations from the MATLAB reference".
 ---
 
 ## Resolved
+
+### The 2026-08-15 auditory-path pass — metric 1.75x, pipeline 1.24x (2026-08-15)
+
+Four changes, all on the *metric*/auditory path rather than the decomposition, all timed
+with `benchmarks/ab.py` driving a real public entry point and all compared for accuracy
+against a capture frozen before the series (`perf_20260815_final`) rather than against
+each other. Two are bit-identical; two are near-exact, and one of those two is a strict
+accuracy *improvement*.
+
+| change | class | metric path | full pipeline |
+| --- | --- | --- | --- |
+| numpy `_numba_gfb_analyze` band-outer loop + real store | bit-identical | 1.0796x [1.0583, 1.0912] | 1.0405x [1.0306, 1.0499] |
+| numpy dB affine fused into the kernel's store | bit-identical | 1.04-1.11x, see below | — |
+| torch haircell + 5-stage adaptation fused into one kernel | near-exact | 1.4918x [1.4501, 1.5215] | 1.1761x [1.1604, 1.1850] |
+| torch rfft/irfft real-output gammatone | near-exact, ~1 ULP | 1.1306x [1.1061, 1.1498] | 1.0680x [1.0539, 1.0872] |
+
+Each row is that change measured on its own. The two torch rows were then measured
+*together*, which had never been done — see "The pair" below, because neither the speed
+nor the accuracy composes the way you would guess.
+
+**numpy: band-outer loop order and a real-valued store** (`a13fed2`, bit-identical).
+`_numba_gfb_analyze` ran `for sample: for band:`, so every input sample wrote 32 output
+cells `num_samples * 16` bytes apart — 32 distinct cache lines per sample into a C-order
+`(bands, samples)` array. The bands are independent 4th-order recurrences, so the order
+is free; `for band: for sample:` writes each row contiguously and keeps the four states
+in registers across the row. State load/store traffic per complex call at n=120336 falls
+631.5 MB -> 5.2 KB. Separately, the auditory model discards the imaginary part
+immediately, so `_numba_gfb_analyze_real`/`GammatoneAnalyzer.process_real` store float64
+where the *state* stays complex — halving the output write (518.4 -> 259.2 MB per mono
+`predict`) and handing the next kernel a contiguous array rather than a stride-16 view.
+`process` is untouched, so the decomposition still gets its analytic subbands. Measured
+1.0239x [1.0161, 1.0376] on the decomposition, 1.0796x [1.0583, 1.0912] on the metric
+path, 1.0405x [1.0306, 1.0499] end to end, all three AGREE — plus an unclaimed secondary
+win, independently measured: **peak working set on `predict` falls 31.9%, 606.3 ->
+412.9 MB**. Bit-identity was attacked rather than assumed: 173 kernel comparisons
+including a SIMD-width sweep over 1..128 bands (the hypothesis being that the old
+band-inner loop could vectorize where the new one cannot — it does not), denormals, +-0.0,
+Inf/NaN payloads, strided and F-order inputs, and 50 chained calls carrying state. Output
+and mutated state byte-equal every time; `compare.py` reports 0.000e+00 on every waveform,
+score and gain error.
+
+**That item's sizing in `TODO.md` was wrong by ~2.2x, and both causes are reusable
+mistakes.** It was carried as "~29 ms, ~1.8% end-to-end" against a delivered ~4% on the
+pipeline. First, it counted **3** kernel calls per run, from a decomposition profile;
+instrumenting the real entry point shows **18 per `predict`**, because the metric path
+runs the filterbank five times per channel. Second, it sized the *decomposition*, which
+turned out to be the weaker of the two halves (1.024x there against 1.080x on the metric
+path). Profile the entry point you actually intend to speed up, and count the calls
+rather than inheriting a count from a different profile.
+
+Note also what this says about the 2026-08-08 rejection below, "feeding the fused NumPy
+auditory kernel a contiguous array instead of the `np.real()` stride-16 view: **1.03x**,
+and the copy itself costs 0.011 s". That rejected result is a *component* of this win,
+obtained without paying for the copy that sank it: the consumer cannot afford to make its
+input contiguous, but the producer can store it contiguously for free, because it was
+writing that memory anyway. A rejected micro-optimisation is sometimes only rejected at
+the call site that would have to pay for it.
+
+**numpy: the dB affine fused into the auditory kernel's store** (`5e52075`,
+bit-identical). The global dB scaling ran as two NumPy ufunc passes over a 26 MB array
+`_numba_fused_auditory_kernel` had just finished writing. It is now applied at the store
+as `scale * (value - offset)` — the same two IEEE operations, in the same order, on the
+same value, so bit-identical, but folded into a write that was happening anyway. Verified
+three ways: `np.array_equal` against a verbatim copy of the old kernel on real pipeline
+subbands, `compare.py` against a frozen pre-change capture (24 waveforms at 0.000e+00, 16
+scores identical to 12 decimals), and the full suite.
+
+Measured **1.037x CI [1.014, 1.049]** and **1.105x CI [1.085, 1.124]** on the metric path,
+on two separate runs, both AGREE. **Those intervals do not overlap, and that is recorded
+rather than averaged away**: `ab.py`'s interval covers within-run variance only, and this
+machine drifts more between runs than the interval is wide (ground rule 3 in `TODO.md`).
+The honest statement is "1.04-1.11x on the metric path", not either endpoint. Anyone
+quoting a single `ab.py` CI as the accuracy of a speedup should read this entry first.
+
+**torch: haircell + 5-stage adaptation fused into one row-major Numba kernel**
+(`c482740`). The auditory path ran `F.relu`, an FFT convolution against the haircell
+impulse response, a `clamp`, a transpose into the adaptation kernel, a transpose back,
+then two more full-size passes for the closing dB affine — each writing a buffer the size
+of the subband block. `_numba_fused_haircell_adaptation` writes one. The win is memory
+traffic; the FLOPs are unchanged. 1.4918x [1.4501, 1.5215] on
+`calculate_auditory_quality_features`, 1.1761x [1.1604, 1.1850] end to end.
+
+**Its class is near-exact but it is specifically *not* a reassociation, and calling it one
+understates it.** Nothing is reassociated: the five adaptation stages are transcribed
+operation-for-operation from `_numba_adaptation_loop` under `fastmath=False`, same order,
+same result. What changes is the *evaluation method* for the haircell filter — the torch
+function convolves the one-pole impulse response truncated at 10 ms by FFT, the kernel
+runs the recurrence that impulse response comes from. Ground rule 2 permits exactly this:
+it computes the same quantity. And it is a strict accuracy improvement, not a trade. The
+truncation it removes sits at `g**(0.01*fs) == exp(-20*pi) == 5.2e-28` relative, and the
+exponent does not depend on `fs`, so that is twelve orders below float64 eps at every
+rate. Against a ~106-bit double-double oracle the recurrence is the *more* accurate of the
+two: 1.96e-16 worst absolute against the FFT path's 4.31e-16, and an independent
+double-double referee scored it **982x closer to the correctly-rounded result**, with
+100% of the worst manufactured divergence being the *old* path being wrong.
+
+**Two numbers, and they must not be conflated** — the README table reports one of them and
+a reader can easily take it for the other:
+
+- *Build-to-build delta*: up to **~7.3e-11 of peak**, on two scores. Against the frozen
+  capture, `target_perceptual_score` moves +4.328e-11 (7.1e-13 relative) and
+  `artifact_perceptual_score` -8.214e-12 (1.1e-13). Every correlation and gain error
+  against the MATLAB gold WAVs is identical to the digit, all 24 component waveforms are
+  0.000e+00 (the decomposition never enters this path), and 14 of the 16 scores/ratios are
+  unchanged.
+- *Distance from exact*: **<= 5.1 ULP**, and the new path is the closer of the two.
+
+The first is "the output moved"; the second is "the output is more correct than it was".
+A change can have a large first number and a favourable second, and this one does.
+
+Three contract defects surfaced in adversarial verification and were fixed with the change
+rather than carried: the transcription test asserted `torch.equal` across a
+numpy-vs-numba boundary at `s = g*s + w*x`, exactly the `a*b + c` shape a toolchain may
+contract into one FMA (the same failure mode that broke CI on CPython 3.14 for the
+adaptation kernel next door — see the 2026-08-09 entry above); README claimed all eight
+scores compare equal with `==` between Numba-present and Numba-absent runs, which was true
+before this change and false after; and the `float64` condition in
+`_can_fuse_haircell_adaptation` was documented as a float32 opt-out and is not one, since
+`GammatoneAnalyzerTorch` promotes unconditionally, so a float32 caller does run the fused
+kernel. The last was documented as-is and pinned by a test rather than "fixed" with a
+float32 branch, because the promotion is intentional and a branch would be a behaviour
+change.
+
+**torch: rfft/irfft real-output gammatone on the auditory path** (`a7f2d62`, near-exact,
+~1 ULP). The auditory model takes `.real` of the analyzer's output and never touches the
+imaginary part, but `process` built the full analytic subbands anyway: a complex `fft`, a
+complex `ifft` per band per row, and a full-length complex filter. With
+`conj(X[-k]) == X[k]`,
+
+    Re(ifft(fft(x) * H)) == irfft(rfft(x) * Hmod),   Hmod[k] = (H[k] + conj(H[-k]))/2
+
+so `process_real` halves the **inverse** transform — the dominant cost — halves the cached
+filter, and hands the next stage a contiguous real block instead of a stride-2 view of a
+complex buffer that stays alive behind it. `Hmod` is built straight on the half grid, so
+the full-length `H` is never materialised. Measured 1.1306x [1.1061, 1.1498] on the metric
+path, 1.0680x [1.0539, 1.0872] end to end. `process` is deliberately left alone — the
+decomposition genuinely needs the analytic subbands — so this is a second entry point, not
+a flag on the first, which would have put a branch in the hot path of the one caller that
+cannot use it.
+
+Two details in `Hmod` are invisible under `allclose` and would each cost ~2e-11 in the
+Nyquist bin, so the test asserts bit-for-bit equality against the fold of the full filter
+rather than a tolerance: the frequency grid inherits torch's default float32 (see
+`TODO.md` — that is a real pre-existing accuracy item), so `exp(-+i*pi)` carries an
+~8.7e-8 imaginary residue and `fftfreq`'s Nyquist convention (-0.5) differs from
+`rfftfreq`'s (+0.5) by ~1e-7 relative; and the Nyquist bin reflects onto itself, so the
+conjugate-grid formula does not hold there and it is set to `Re(H)` directly.
+
+**The pair, measured together — and neither speed nor accuracy composes.** The two torch
+changes had only ever been measured individually. Driving the real public entry points on
+the reference clip with both candidates in one process, 32 samples per phase:
+
+    calculate_auditory_quality_features   1.7466x  95% CI [1.6608, 1.8574]  AGREE
+                                          phases 1.8245 / 1.7990
+    predict_perceptual_evaluation_scores  1.2412x  95% CI [1.2243, 1.2597]  AGREE
+                                          phases 1.2430 / 1.2336
+
+*Speed.* Disjoint stages in series save additively rather than multiplying. On the
+pipeline the additive prediction is 1.27x and the multiplicative one 1.256x; the measured
+**1.2412x sits below the additive prediction and covers the multiplicative one at its top
+edge**. On the metric path the interval covers both models with the phase estimates
+sitting at the additive one. Use the additive model as an upper bound when stacking
+independent stage wins, and do not assume the ratios multiply.
+
+*Accuracy, which is the non-obvious half.* **The deviations are not additive — they are
+not even independent.** Alone, the rfft change moved four fields, including
+`overall_perceptual_score` by -2.117e-09. With the fusion also present those contributions
+vanish at score resolution: **all eight torch scores in the pair are bit-identical to the
+fusion-only state**, which reports the same two moved fields and the same two magnitudes.
+And `target_perceptual_score` lands on exactly **60.99057681753397** under either change
+alone *and* under both — 6091 ULP from the baseline. That is not a
+representable-resolution floor; it is a discrete landing point that any ULP-scale upstream
+perturbation reaches, because the score path's mapping stage quantizes small input moves
+onto the same output. Do not read "same value under A, under B and under A+B" as evidence
+that a change is inert, and do not read a per-change deviation as a term you can sum.
+
+Pre/post agreed to 2.2e-16 on the metric features and 4.3e-11 on the scores before either
+was timed. For the pair: all 16 correlations and gain errors against the MATLAB gold WAVs
+identical to the digit, all 24 component waveforms 0.000e+00. Full suite green, 603 passed
+/ 24 skipped.
+
+One cost, recorded in README and carried forward in `TODO.md`: Numba-neutrality is gone.
+3 of the 8 reported scores now differ between Numba-present and Numba-absent runs, where
+before this pass all 8 compared equal with `==` (the fusion alone made it 2 of 8).
 
 ### `reference/` — interlinear MATLAB transcription, and what it proved (2026-08-14)
 

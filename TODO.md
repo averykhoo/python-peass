@@ -72,14 +72,31 @@ not obvious from the code:
    this file's open list, and they include ideas that look obviously right — a numpy
    polyphase GEMM mirroring the torch win measured **3.3x slower**.
 3. **Quote no timing number that did not come from `benchmarks/ab.py`.** Wall-clock
-   before/after cannot resolve anything under ~10% on this machine; see rule 3.
-4. **Cheapest decisive next step**: A/B the numpy Numba resampler kernels against
-   torch's polyphase GEMM at the real filterbank rates. It is a measurement, not an
-   implementation, and it settles whether the "point torch's no-grad CPU path at the
-   Numba kernels" item is worth anything at all. Details in that item below.
-5. **Easiest clean win**: the `_numba_gfb_analyze` loop order — bit-identical, verified,
-   ~15 lines, ~1.8% end-to-end.
-6. **Consider root-causing the onset transient first** (under "correctness, not perf") if
+   before/after cannot resolve anything under ~10% on this machine; see rule 3. **And do
+   not size a change from an isolated kernel harness either** — three measured cases now
+   overstate by 1.5x or more against the same change measured in situ (`ARCHIVE.md`,
+   2026-08-15). Sizing from the wrong profile cuts both ways: the same entry records an
+   item that was *under*-sized 2.2x because it counted kernel calls from a decomposition
+   profile when the metric path makes six times as many.
+4. **Know what the last pass took.** 2026-08-15 worked the *auditory/metric* path —
+   `ARCHIVE.md`, "The 2026-08-15 auditory-path pass": metric 1.75x, whole pipeline 1.24x,
+   from four changes. The cheap structural wins there (one fused kernel instead of six
+   full-array passes; a real-output transform where the imaginary half was discarded) are
+   spent. Compose those two ratios and the metric path went from ~45% of torch `predict`
+   to ~32%, so the **decomposition is now decisively the larger share** — and it has
+   already been worked over by the 2026-08-09/10/12 passes, which is why what is left in
+   the list below is harder than what just landed.
+5. **Cheapest decisive next step**, unchanged and still nobody has run it: A/B the numpy
+   Numba resampler kernels against torch's polyphase GEMM at the real filterbank rates.
+   It is a measurement, not an implementation, and it settles whether the "point torch's
+   no-grad CPU path at the Numba kernels" item is worth anything at all. Details in that
+   item below.
+6. **Easiest clean win, now that the gammatone loop order has landed**: the complex Kaiser
+   double-design (`utils.py:519`) — bit-identical, ~15 min, though it buys memory and
+   cache lookups rather than time. The cheapest *accuracy* item is the float32 frequency
+   grid in the torch gammatone, under "correctness, not perf" — it is orders of magnitude
+   larger than anything the 2026-08-15 pass moved and looks free.
+7. **Consider root-causing the onset transient first** (under "correctness, not perf") if
    you intend to touch anything on the short-clip path. It is a real backend divergence
    that current invariants cannot see.
 
@@ -103,7 +120,12 @@ not obvious from the code:
   `autograd.Function` with a hand-derived analytic backward for the 5-stage cascade
   would make training-scale backprop practical; it's substantial and needs careful
   gradient validation. Note the 2026-08-08 Numba kernel does **not** help here — it is
-  forward-only by design.
+  forward-only by design, and neither does the 2026-08-15 fusion that absorbed the
+  haircell stage into it, for the same reason. **Re-checked 2026-08-15 and this item is
+  now relatively more urgent, not less**: the no-grad path around it got ~1.75x faster on
+  the metric path while the gradient path did not move at all, so the gap between
+  training and scoring is wider than the ~1.2x backward/forward figure above implies.
+  Re-measure the ratio before quoting it.
 - perf/deprecation: `torch.jit.script` is deprecated in favour of
   `torch.compile`/`torch.export`. Only one call site remains (the adaptation-loop
   fallback in `backend_torch/auditory_model.py`), it is worth ~2x where it is still
@@ -115,13 +137,23 @@ not obvious from the code:
   machine with a working inductor backend or a CUDA runtime. Note this is now much
   less urgent: the Numba kernel already delivers the fusion this item was chasing,
   on the CPU path, at ~1e-14 (exactly zero on the reference platform — see
-  `ARCHIVE.md` for why that is not a portable guarantee).
+  `ARCHIVE.md` for why that is not a portable guarantee). **Less urgent again as of
+  2026-08-15**: the kernel now also absorbs the relu, haircell, clamp and dB affine, so
+  the scripted fallback covers proportionally less work than it did — and it is reached
+  by fewer callers than the gate reads, since `float32` callers do *not* fall back
+  (`GammatoneAnalyzerTorch` promotes unconditionally; see README). It is still the one
+  remaining `jit.script` site and still worth ~2x where it runs.
 - the `_EXPECTED_SCORES` characterization values in `test_matlab_regression.py`
   are Python-reference numbers (the decomposition now matches MATLAB to ~0.9999,
   but we still don't have MATLAB's published OPS/TPS/IPS/APS to assert against);
   replace with MATLAB's actual scores for the example clips if/when available.
   There is now a second route to this that does not need MATLAB: transcribe the score
   path into `reference/` — see the ground-truth reference section below.
+  Re-checked 2026-08-15: still open and unchanged, and the tolerances absorbed that
+  pass without edits. But note these values are now weakly **Numba-dependent** — 3 of 8
+  scores differ by ~1e-9 or less between Numba-present and Numba-absent runs (see
+  "correctness, not perf"), so whichever numbers eventually replace them must be
+  asserted with a tolerance, never with `==`.
 
 ## ground-truth reference — decomposition done, score path open
 
@@ -234,17 +266,13 @@ pass; the things that were prototyped and *lost* are in `ARCHIVE.md` under
 "Decomposition optimisations that measured worse, or not at all (2026-08-12)" — read
 that first, it is longer than this list.
 
-- **numpy: `_numba_gfb_analyze` loop order** (`backend_numpy/gammatone.py:20-61`). The
-  kernel runs `for sample: for band:`, so every input sample writes 32 output cells
-  `num_samples * 16` bytes apart — 32 distinct cache lines per sample into a C-order
-  `(bands, samples)` array. The bands are independent 4th-order recurrences, so the
-  order is arbitrary; `for band: for sample:` writes each row contiguously and keeps the
-  four states in registers across the row. Prototyped on real coefficients: 71.85 ->
-  62.12 ms at n=120336 (1.16x), 5.86 -> 3.83 ms at n=8572 (1.53x). The kernel is 10.6%
-  of a mono decomposition over 3 calls, so **~29 ms, ~1.8% end-to-end** — small, and
-  worth stating as small. **Bit-identical** (verified: `tobytes()` equal on output and
-  mutated states; reordering independent recurrences reassociates nothing).
-  Effort: low, ~15 lines, no call-site change.
+The one numpy item this list carried — the `_numba_gfb_analyze` loop order — landed on
+2026-08-15 and is in `ARCHIVE.md`. Everything left here is torch, and all of it is on
+the **decomposition** path, so none of it was touched, obsoleted or re-sized by the
+2026-08-15 auditory-path pass. Sizings below are still against a torch mono
+decomposition and remain valid; note only that the decomposition is now a *larger* share
+of `predict` than it was, because the metric path around it got ~1.75x faster.
+
 - **torch: the complex real/imag round trip**, `utils.py:235` and `:251`. Found
   independently by two profiling passes, which agree on the shape and disagree on the
   size: 0.071 s and 0.155 s per torch mono decomposition, so call it **4-8%**, and
@@ -390,3 +418,47 @@ that first, it is longer than this list.
   against a 4x-padded oracle the current transform is 5.4e-6 relative, driven by a
   0.2 s guard against a designed `pad_len` of 4800. Raising `pad_len` matters far more
   than any FFT sizing change (see the dropped sizing item in `ARCHIVE.md`).
+
+- **The torch gammatone frequency grid is float32** (`backend_torch/gammatone.py`).
+  `torch.fft.fftfreq(N_fft, device=device)` inherits torch's *default* dtype, which is
+  float32 unless the caller has changed it, so the cached `H` is built on a float32 grid
+  and carries **~6e-8 relative phase error** before it is promoted to complex128. Adding
+  `dtype=torch.float64` looks like a free accuracy improvement on both entry points.
+
+  **This is pre-existing, not something the 2026-08-15 pass introduced**, and it is the
+  larger number by a long way: it affects `process` and therefore the *decomposition*
+  path, and it is orders of magnitude bigger than anything that pass moved (which topped
+  out at ~4.3e-11 absolute on one score). It surfaced there only because building the
+  Hermitian-folded half filter forced someone to look at the grid closely — `fftfreq`'s
+  Nyquist convention (-0.5) differs from `rfftfreq`'s (+0.5), and `exp(-+i*pi)` on a
+  float32 grid carries an ~8.7e-8 imaginary residue, both of which are written up beside
+  `process_real`.
+
+  Deliberately **not** bundled into that pass, because it moves the decomposition and so
+  needs its own frozen capture and its own before/after against the MATLAB gold WAVs,
+  where the other four changes provably could not move a waveform at all. Do that
+  comparison rather than assuming the improvement is free: it is an accuracy *change*
+  even if it is an accuracy *improvement*, and the numpy backend does not have the same
+  bug, so it will also move numpy-vs-torch parity bars.
+
+- **Numba is no longer numerically neutral on the torch path.** As of 2026-08-15, **3 of
+  the 8 reported scores differ** between Numba-present and Numba-absent runs; before that
+  pass it was 0 of 8. Roundoff on a 0-100 scale, but it is a difference where there was
+  none, so installing or removing the optional `numba` extra now changes the last digits
+  of a score. README carries the current table and the deltas.
+
+  Recorded here for one reason: **do not write a test that asserts a specific set of
+  moved fields.** Which fields move is itself unstable under unrelated ULP-level changes
+  upstream — the same pass took it from 0 of 8 to 2 of 8 to 3 of 8, with the field set
+  changing, and `target_perceptual_score` landed on the *identical* value under two
+  different changes and under both together (see `ARCHIVE.md`). The durable invariant is
+  that some scores differ and that the differences are ~1e-9 or smaller; a field-set
+  assertion would be fragile and would fail on the next unrelated ULP change.
+
+- **Undocumented behaviour change: complex input to the torch auditory path now raises.**
+  `GammatoneAnalyzerTorch.process_real` raises `ValueError` for a complex input, where the
+  auditory path previously routed through `process` and computed `.real` of a
+  complex-filtered *complex* signal. Failing loud is the better behaviour and this is
+  unreachable from the public entry — the resampler in front of it raises first — but it
+  went unlisted when it landed, so it is listed now. Decide deliberately whether it wants
+  a test pinning the unreachability, or a note in the docstring, or nothing.
