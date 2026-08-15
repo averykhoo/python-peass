@@ -50,6 +50,28 @@ not obvious from the code:
    `benchmarks/` also holds `measure.py` and `compare.py`, which is how you take the
    frozen capture rule 2 asks for. See `benchmarks/README.md`.
 
+**Picking this up for performance work? Start here.**
+
+1. **Freeze a baseline before you change anything.** `python benchmarks/measure.py baseline`
+   at the commit you start from, then compare everything to that tag for the whole
+   series. Rule 2 below is why, and the capture cannot be reconstructed afterwards.
+   `benchmarks/results/` is gitignored, so whatever a previous session froze is not
+   yours — take your own.
+2. **Read `ARCHIVE.md`'s rejected lists before picking an item.** They are longer than
+   this file's open list, and they include ideas that look obviously right — a numpy
+   polyphase GEMM mirroring the torch win measured **3.3x slower**.
+3. **Quote no timing number that did not come from `benchmarks/ab.py`.** Wall-clock
+   before/after cannot resolve anything under ~10% on this machine; see rule 3.
+4. **Cheapest decisive next step**: A/B the numpy Numba resampler kernels against
+   torch's polyphase GEMM at the real filterbank rates. It is a measurement, not an
+   implementation, and it settles whether the "point torch's no-grad CPU path at the
+   Numba kernels" item is worth anything at all. Details in that item below.
+5. **Easiest clean win**: the `_numba_gfb_analyze` loop order — bit-identical, verified,
+   ~15 lines, ~1.8% end-to-end.
+6. **Consider root-causing the onset transient first** (under "correctness, not perf") if
+   you intend to touch anything on the short-clip path. It is a real backend divergence
+   that current invariants cannot see.
+
 - train a different model on the peass data (which was removed in PR #3, commit `7ad923b3` on 2026-06-06 17:01)
   - get more data from https://www.audiolabs-erlangen.de/resources/2019-WASPAA-SEBASS
 - use peass decomposition as an ablation for haspi metrics
@@ -341,8 +363,11 @@ that first, it is longer than this list.
   (7.38e-7 vs 1e-6), synthesizer delay/phase `:382` (3.15e-6 vs `atol=5e-6`). Also
   `test_numpy_gammatone.py:381` DC rejection at 5.05e-3 against 1e-2.
 
-  These are the most likely source of an ubuntu-latest-only CI failure in the whole
-  suite, and the root cause is a **units mismatch, not a too-tight number**: each is a
+  **Update: CI is green on all of these** — ubuntu-latest 3.10/3.12/3.14 and
+  windows-latest 3.14, at `cf80b31`. So the cross-platform difference is smaller than the
+  remaining margin on those runners, and these are not broken today. They are still the
+  thinnest bars in the suite and the first place to look if CI goes intermittently red.
+  The root cause is a **units mismatch, not a too-tight number**: each is a
   genuine ~1e-6 *relative* algorithmic difference being checked against an *absolute*
   tolerance, so the margin depends on the signal's peak. The principled fix is to express
   them as `rtol` rather than raise `atol` — that is a correctness fix in how the
