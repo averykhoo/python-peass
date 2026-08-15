@@ -343,7 +343,7 @@ Note that `GammatoneAnalyzerTorch.process` chunks its batch to bound the two
 frequency-domain intermediates. That is a memory bound, not a speedup; it measured
 neutral. See `_FFT_CHUNK_BUDGET_BYTES`.
 
-#### Adaptation loop
+#### Adaptation loop, and the haircell stage fused into it
 
 The auditory-nerve adaptation recurrence is sequential in time and tiny per step
 (one element per band), so in torch it is bound by kernel-launch latency rather
@@ -356,12 +356,21 @@ therefore runs as a Numba kernel instead, which removes the dispatch entirely:
 | 1 s mono | 1.97 s | 0.85 s | 2.32x |
 | 5 s mono | 9.25 s | 4.24 s | 2.18x |
 
-The kernel is an operation-for-operation transcription of the torch loop (running
-product, divide, then `c*(1-g) + s*g` as two multiplies and an add, with
+As of 2026-08-15 that kernel also absorbs the stage in front of it. Half-wave
+rectification, the 1 kHz inner-haircell lowpass, the absolute-threshold clamp, the five
+adaptation stages and the closing dB affine now run in a single row-major pass
+(`_numba_fused_haircell_adaptation`), behind the same four conditions
+(`_can_fuse_haircell_adaptation`). The win is memory traffic, not arithmetic: the
+unfused route materialises a relu, an rfft spectrum, an irfft output, a clamp, two full
+transposes and two more full-size buffers for the affine, where this writes one buffer.
+Measured 1.4918x CI [1.4501, 1.5215] on `calculate_auditory_quality_features` and
+1.1761x CI [1.1604, 1.1850] end-to-end, by paired in-process A/B.
+
+The adaptation stages are an operation-for-operation transcription of the torch loop
+(running product, divide, then `c*(1-g) + s*g` as two multiplies and an add, with
 `fastmath=False` keeping LLVM from reassociating it). On the reference platform —
-Windows, CPython 3.10, torch 2.12.1+cpu, numba 0.65.1 — it is exactly **bit-identical**:
-`torch.equal` holds at every measured shape and all eight reported scores compare equal
-with `==`.
+Windows, CPython 3.10, torch 2.12.1+cpu, numba 0.65.1 — that half is exactly
+**bit-identical**: `torch.equal` holds at every measured shape.
 
 That equality is not portable, and should not be relied on as an invariant. Whether a
 toolchain contracts `a*b + c` into a single FMA differs by LLVM and torch build; CPython
@@ -369,11 +378,41 @@ toolchain contracts `a*b + c` into a single FMA differs by LLVM and torch build;
 everywhere is agreement to ~1e-14 relative, which is still fourteen orders below any
 real transcription error — a wrong stage ordering costs O(1). `tests/unit/backend_torch/test_torch_auditory_model.py`
 pins the two implementations together at that tolerance, with the measurements that set
-it recorded alongside.
+it recorded alongside, and asserts bounds rather than equality for exactly this reason.
 
-Any other case — CUDA/MPS, `float32`, a gradient-requiring input, or Numba not
-installed — falls back to the TorchScript loop, which is unchanged. Training is
-unaffected: the differentiable path was never touched.
+The haircell half is a different evaluation of the same filter, and it changed a
+contract this section used to state. The torch function convolves the one-pole
+filter's impulse response, truncated at 10 ms, by FFT; the kernel runs the recurrence
+that impulse response comes from. They are the same filter to
+`g**(0.01*fs) == exp(-20*pi) == 5.2e-28` relative — the exponent does not depend on
+`fs`, so the truncation sits twelve orders below float64 eps at every rate — and
+against a ~106-bit double-double oracle the recurrence is the *more* accurate of the
+two (1.96e-16 worst absolute against the FFT path's 4.31e-16). What it costs is
+Numba-neutrality. Scoring the reference clip with Numba present and absent, **2 of the
+8 reported scores now differ**, where before the fusion all 8 compared equal with `==`:
+
+| score | Numba present | Numba absent | delta |
+| --- | --- | --- | --- |
+| `target_perceptual_score` | 60.99057681753397 | 60.99057681749069 | +4.328e-11 |
+| `artifact_perceptual_score` | 76.30118899632163 | 76.30118899632984 | -8.214e-12 |
+
+The other six are bit-identical between the two runs. Those deltas are 7.1e-13 and
+1.1e-13 relative — roundoff on a 0-100 scale — but they are a difference where there
+was none, so installing or removing the optional `numba` extra no longer guarantees
+the last digits of a score are untouched.
+
+Callers on CUDA/MPS, callers that need a gradient, and installs without Numba fall back
+to the torch functions, which are unchanged; training is unaffected, because the
+differentiable path was never touched. **`float32` callers do not fall back**, despite
+the `float64` condition in `_can_fuse_haircell_adaptation` reading as though they
+would: `GammatoneAnalyzerTorch.process` promotes its rows to `complex128`
+unconditionally, so the subbands that reach the gate are float64 whatever
+dtype the caller passed. A `float32` call to `calculate_auditory_quality_features`
+therefore runs the fused kernel and moves with it — measured 2.4e-12 (2.3e-15 of peak)
+on the internal representation, and at most 4.4e-16 absolute on the four features. This
+was documented the other way round when the fusion first landed; it is corrected here
+rather than "fixed" in code, because adding a float32 branch would be a behaviour
+change and the promotion is intentional.
 
 ### NumPy backend performance and numerical reproducibility
 
