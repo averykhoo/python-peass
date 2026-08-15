@@ -343,3 +343,103 @@ def test_torch_and_numpy_gammatone_bandwidths_agree():
     numpy_values = np.array([calculate_audiological_equivalent_rectangular_bandwidth(f) for f in center_frequencies])
 
     np.testing.assert_allclose(torch_values, numpy_values, rtol=1e-15)
+
+
+@pytest.mark.unit
+def test_torch_gammatone_half_spectrum_filter_is_the_exact_reflection():
+    """
+    `_get_gammatone_H_real_torch` must be bit-for-bit `(H[k] + conj(H[-k])) / 2` taken
+    from the full-grid filter -- that identity is the whole basis of `process_real`.
+
+    Bit-identity is asserted, not approximated, because the two ways of missing it are
+    both traps. The frequency grid inherits torch's default float32, so `exp(-+i*pi)`
+    carries an ~8.7e-8 imaginary residue and the `fftfreq` (-0.5) / `rfftfreq` (+0.5)
+    Nyquist conventions disagree by ~1e-7 relative; and the Nyquist bin reflects onto
+    itself, so the conjugate-grid formula does not apply there at all. Getting either
+    wrong is invisible under `allclose` and shows up as a ~2e-11 error in that bin.
+    """
+    from peass.backend_torch.gammatone import _get_gammatone_H_real_torch
+    from peass.backend_torch.gammatone import _get_gammatone_H_torch
+
+    fs = 24000.0
+    analyzer = GammatoneAnalyzerTorch(fs, 235.0, 1000.0, 11000.0, 1.0, torch.device("cpu"), torch.float64)
+    args = (
+        fs,
+        tuple(analyzer.center_frequencies.tolist()),
+        tuple(analyzer.norms.tolist()),
+        tuple(analyzer.coefs.tolist()),
+        "cpu",
+    )
+
+    for n_fft in (4096, 8192, 32768):
+        full = _get_gammatone_H_torch(n_fft, *args)
+        half = _get_gammatone_H_real_torch(n_fft, *args)
+
+        k = torch.arange(n_fft // 2 + 1)
+        expected = (full[:, k] + torch.conj(full[:, (-k) % n_fft])) * 0.5
+
+        assert half.shape == (full.shape[0], n_fft // 2 + 1)
+        assert torch.equal(half, expected), f"n_fft={n_fft}"
+        # A Hermitian spectrum needs both self-reflecting bins purely real.
+        assert torch.equal(half[:, 0].imag, torch.zeros_like(half[:, 0].imag))
+        assert torch.equal(half[:, -1].imag, torch.zeros_like(half[:, -1].imag))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("shape", [(4000,), (2, 4000), (2, 3, 1500)])
+def test_torch_gammatone_process_real_matches_the_complex_path(shape):
+    """
+    `process_real` computes the same quantity as `process(x).real`, via a half-length
+    inverse transform. Not bit-identical -- rfft/irfft sum the same terms in a
+    different order -- so the bar is a couple of ULP of the signal's own peak.
+    """
+    fs = 16000.0
+    analyzer = GammatoneAnalyzerTorch(fs, 235.0, 1000.0, 7000.0, 1.0, torch.device("cpu"), torch.float64)
+    x = torch.randn(*shape, generator=torch.Generator().manual_seed(3), dtype=torch.float64)
+
+    expected = analyzer.process(x).real
+    actual = analyzer.process_real(x)
+
+    assert actual.shape == expected.shape
+    assert actual.dtype == torch.float64
+    # A contiguous real block, which is the point of the path. Only the new value's own
+    # layout is asserted: whether `.real` on a complex tensor is a strided view is
+    # torch's business, not this function's contract.
+    assert actual.is_contiguous()
+
+    peak = expected.abs().max().item()
+    assert (actual - expected).abs().max().item() < 8.0 * np.finfo(np.float64).eps * peak
+
+
+@pytest.mark.unit
+def test_torch_gammatone_process_real_rejects_complex_input():
+    """The identity only holds for real input; complex signals must keep `process`."""
+    analyzer = GammatoneAnalyzerTorch(16000.0, 235.0, 1000.0, 7000.0, 1.0, torch.device("cpu"), torch.float64)
+
+    with pytest.raises(ValueError, match="real input"):
+        analyzer.process_real(torch.randn(2, 512, dtype=torch.complex128))
+
+
+@pytest.mark.unit
+def test_torch_gammatone_process_real_is_differentiable():
+    """
+    The metrics are trained through this path, so the half-spectrum route has to carry
+    the same gradient the complex one did.
+    """
+    analyzer = GammatoneAnalyzerTorch(16000.0, 235.0, 1000.0, 7000.0, 1.0, torch.device("cpu"), torch.float64)
+    generator = torch.Generator().manual_seed(5)
+    num_bands = len(analyzer.center_frequencies)
+    weights = torch.randn(1, num_bands, 800, generator=generator, dtype=torch.float64)
+
+    x = torch.randn(1, 800, generator=generator, dtype=torch.float64, requires_grad=True)
+
+    (analyzer.process_real(x) * weights).sum().backward()
+    actual = x.grad.clone()
+
+    x.grad = None
+    (analyzer.process(x).real * weights).sum().backward()
+    expected = x.grad.clone()
+
+    assert actual.shape == expected.shape
+    np.testing.assert_allclose(to_numpy_format(actual), to_numpy_format(expected), rtol=0.0,
+                               atol=8.0 * np.finfo(np.float64).eps * expected.abs().max().item())

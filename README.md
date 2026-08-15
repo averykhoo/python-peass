@@ -339,9 +339,11 @@ correlation against the MATLAB gold WAVs is unchanged to 13 decimals (worst delt
   8.0e-16 of each component's peak, from reassociating the phase multiply and summing
   the 32 bands in a different order than `einsum` did. Gradients are bit-identical.
 
-Note that `GammatoneAnalyzerTorch.process` chunks its batch to bound the two
-frequency-domain intermediates. That is a memory bound, not a speedup; it measured
-neutral. See `_FFT_CHUNK_BUDGET_BYTES`.
+Note that `GammatoneAnalyzerTorch.process` and `.process_real` chunk their batch to
+bound the frequency-domain intermediates. That is a memory bound, not a speedup; it
+measured neutral. It is *not* bit-invariant in the chunk width — torch's batched FFT
+does not sum a row the same way alone as alongside others (7.1e-16 measured) — so the
+budget is a memory knob and not something to tune. See `_FFT_CHUNK_BUDGET_BYTES`.
 
 #### Adaptation loop, and the haircell stage fused into it
 
@@ -388,31 +390,71 @@ that impulse response comes from. They are the same filter to
 `fs`, so the truncation sits twelve orders below float64 eps at every rate — and
 against a ~106-bit double-double oracle the recurrence is the *more* accurate of the
 two (1.96e-16 worst absolute against the FFT path's 4.31e-16). What it costs is
-Numba-neutrality. Scoring the reference clip with Numba present and absent, **2 of the
+Numba-neutrality. Scoring the reference clip with Numba present and absent, **3 of the
 8 reported scores now differ**, where before the fusion all 8 compared equal with `==`:
 
-| score | Numba present | Numba absent | delta |
-| --- | --- | --- | --- |
-| `target_perceptual_score` | 60.99057681753397 | 60.99057681749069 | +4.328e-11 |
-| `artifact_perceptual_score` | 76.30118899632163 | 76.30118899632984 | -8.214e-12 |
+| score | Numba present | Numba absent | delta | relative |
+| --- | --- | --- | --- | --- |
+| `overall_perceptual_score` | 17.665736258846312 | 17.665736256729744 | +2.117e-09 | 1.2e-10 |
+| `interference_perceptual_score` | 20.484476217617885 | 20.484476217625293 | -7.407e-12 | 3.6e-13 |
+| `artifact_perceptual_score` | 76.30118899632163 | 76.30118899634628 | -2.466e-11 | 3.2e-13 |
 
-The other six are bit-identical between the two runs. Those deltas are 7.1e-13 and
-1.1e-13 relative — roundoff on a 0-100 scale — but they are a difference where there
-was none, so installing or removing the optional `numba` extra no longer guarantees
-the last digits of a score are untouched.
+The other five are bit-identical between the two runs. (With only the fusion and not
+the real-output analysis path below, it was 2 of 8: `target_perceptual_score`
++4.328e-11 and `artifact_perceptual_score` -8.214e-12. Which fields move, and by how
+much, is not stable under unrelated ULP-level changes upstream — the *fact* that some
+do is the durable part.) These are roundoff on a 0-100 scale, but they are a difference
+where there was none, so installing or removing the optional `numba` extra no longer
+guarantees the last digits of a score are untouched.
 
 Callers on CUDA/MPS, callers that need a gradient, and installs without Numba fall back
 to the torch functions, which are unchanged; training is unaffected, because the
 differentiable path was never touched. **`float32` callers do not fall back**, despite
 the `float64` condition in `_can_fuse_haircell_adaptation` reading as though they
-would: `GammatoneAnalyzerTorch.process` promotes its rows to `complex128`
-unconditionally, so the subbands that reach the gate are float64 whatever
+would: `GammatoneAnalyzerTorch` promotes unconditionally (`process` to `complex128`,
+`process_real` to `float64`), so the subbands that reach the gate are float64 whatever
 dtype the caller passed. A `float32` call to `calculate_auditory_quality_features`
 therefore runs the fused kernel and moves with it — measured 2.4e-12 (2.3e-15 of peak)
 on the internal representation, and at most 4.4e-16 absolute on the four features. This
 was documented the other way round when the fusion first landed; it is corrected here
 rather than "fixed" in code, because adding a float32 branch would be a behaviour
 change and the promotion is intentional.
+
+#### Real-output gammatone on the auditory path
+
+The auditory model takes `.real` of the analyzer's output and never looks at the
+imaginary part, so as of 2026-08-15 it calls `GammatoneAnalyzerTorch.process_real`,
+which computes that real part directly: `irfft(rfft(x) * Hmod)` with a Hermitian-folded
+half filter `Hmod[k] = (H[k] + conj(H[-k])) / 2`, instead of `ifft(fft(x) * H).real`.
+That halves the inverse transform — one per band per row, and by far the dominant cost
+here — halves the cached filter, and hands the next stage a contiguous real block
+rather than the stride-2 view of a complex buffer that stays alive behind it. Measured
+on the candidate: 1.1306x CI [1.1061, 1.1498] on the metric path, 1.0680x CI [1.0539,
+1.0872] end-to-end.
+
+`process` is untouched and stays the decomposition's entry point: that path genuinely
+needs the analytic subbands. This is a second method rather than a flag on the first.
+
+The identity is exact, but the evaluation is not bit-identical — `rfft`/`irfft` sum the
+same terms in a different order, at the ULP level. Two details are easy to get wrong and
+invisible under `allclose`, so `tests/unit/backend_torch/test_torch_gammatone.py`
+asserts the half filter is *bit-for-bit* the fold of the full one: the frequency grid
+inherits torch's default float32, so `exp(∓iπ)` carries an ~8.7e-8 imaginary residue
+and `fftfreq`'s Nyquist convention (−0.5) disagrees with `rfftfreq`'s (+0.5) by ~1e-7
+relative; and the Nyquist bin reflects onto itself, so the conjugate-grid formula does
+not apply there and it is set directly.
+
+Taken together with the kernel fusion above, and measured as a pair against both
+changes turned off — `calculate_auditory_quality_features` **1.7466x, 95% CI [1.6608,
+1.8574]**, phase estimates 1.8245 and 1.7990, verdict AGREE; the full
+`predict_perceptual_evaluation_scores` pipeline **1.2412x, 95% CI [1.2243, 1.2597]**,
+phases 1.2430 and 1.2336, AGREE. The two are disjoint stages in series, so their
+*savings* should add rather than their ratios multiply; the metric-path interval covers
+both models and the phase estimates sit at the additive one, while the pipeline lands
+just under both. Deviation against the frozen capture is not additive either, and this
+is worth knowing before assuming it is: each change alone moved
+`target_perceptual_score` to exactly the same value, and the pair reproduces the
+fusion-only result bit-for-bit in all eight scores.
 
 ### NumPy backend performance and numerical reproducibility
 

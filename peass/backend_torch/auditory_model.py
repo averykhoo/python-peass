@@ -382,9 +382,9 @@ def _can_fuse_haircell_adaptation(subbands: torch.Tensor) -> bool:
     of one. Everything it rejects falls through to the torch functions unchanged.
 
     The ``float64`` condition is **not** a float32 opt-out, and must not be read as
-    one. ``GammatoneAnalyzerTorch.process`` promotes unconditionally -- its rows are
-    cast to ``complex128`` -- so the subbands the only production call site passes
-    here are float64 whatever dtype the caller
+    one. ``GammatoneAnalyzerTorch`` promotes unconditionally -- ``process`` casts its
+    rows to ``complex128`` and ``process_real`` to ``float64`` -- so the subbands the
+    only production call site passes here are float64 whatever dtype the caller
     handed the metric. A float32 caller of ``calculate_auditory_quality_features``
     therefore *does* run this kernel and does move by the haircell roundoff below
     (measured 2.4e-12, 2.3e-15 of peak, on the internal representation; <=4.4e-16
@@ -408,12 +408,16 @@ def _fused_haircell_adaptation(subbands: torch.Tensor, fs: float) -> torch.Tenso
     kernel sees exactly the thresholds and gains the torch loop would have seen;
     only the haircell filter's *evaluation* differs (see the kernel's docstring).
 
-    ``subbands`` arrives as the stride-2 ``.real`` view of the analyzer's complex
-    output, and ``reshape`` keeps that a view rather than a copy. It is handed to
-    the kernel strided rather than made contiguous: the copy would be another
-    full-size buffer, and `ARCHIVE.md` records the same experiment on the NumPy
-    backend's fused kernel at 1.03x, i.e. not worth it -- that loop is latency-bound
-    on its five serial divisions, not on load bandwidth. Not re-measured here.
+    ``subbands`` arrives from ``GammatoneAnalyzerTorch.process_real`` as a contiguous
+    real block, so ``reshape`` and ``.numpy()`` are both views and the kernel reads
+    unit-stride rows. It used to arrive as the stride-2 ``.real`` view of the
+    analyzer's complex output, and was handed over strided on purpose: the
+    contiguising copy would have been another full-size buffer, and `ARCHIVE.md`
+    records the same experiment on the NumPy backend's fused kernel at 1.03x -- that
+    loop is latency-bound on its five serial divisions, not on load bandwidth. The
+    real-output analysis path made the block contiguous for free, as a side effect of
+    not building the complex one; nothing here had to change for it, and the kernel
+    still accepts either layout.
     """
     abs_thresh, gains, thresholds = _get_adaptation_constants(fs, str(subbands.device), subbands.dtype)
     haircell_gain = math.exp(-math.pi * 2000.0 / fs)
@@ -453,7 +457,10 @@ def generate_auditory_internal_representation_torch(
         fs = float(new_fs)
 
     analyzer = GammatoneAnalyzerTorch(fs, low_freq, 1000.0, high_freq, 1.0, signal_data.device, signal_data.dtype)
-    subbands = analyzer.process(scaled).real
+    # Real-output analysis path: this stage discards the imaginary part, so the
+    # subbands come back as a contiguous real block from a half-length inverse
+    # transform instead of `.real` on a complex one. See `process_real`.
+    subbands = analyzer.process_real(scaled)
 
     if _can_fuse_haircell_adaptation(subbands):
         adapted = _fused_haircell_adaptation(subbands, fs)
