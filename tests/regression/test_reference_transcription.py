@@ -23,7 +23,6 @@ import pytest
 
 from reference import verify_transcription
 from reference.extractDistortionComponents import audioread
-from reference.extractDistortionComponents import extractDistortionComponents
 
 
 # ---------------------------------------------------------------------------
@@ -185,18 +184,9 @@ _GOLD_FILES = [
 ]
 
 
-@pytest.fixture(scope="module")
-def reference_decomposition(matlab_ref_resources):
-    """Run the (deliberately slow) reference decomposition once for this module."""
-    target, fs = audioread(matlab_ref_resources / "targetSrc.wav")
-    interference_1, _ = audioread(matlab_ref_resources / "interfSrc1.wav")
-    interference_2, _ = audioread(matlab_ref_resources / "interfSrc2.wav")
-    estimate, _ = audioread(matlab_ref_resources / "targetEstimate.wav")
-
-    components = extractDistortionComponents(
-        [target, interference_1, interference_2], estimate, fs
-    )
-    return components[:4]
+# The `reference_decomposition` fixture lives in this directory's conftest.py:
+# `test_reference_vs_peass_parity.py` needs the same (slow) run, so it is
+# session-scoped there rather than module-scoped here.
 
 
 @pytest.mark.regression
