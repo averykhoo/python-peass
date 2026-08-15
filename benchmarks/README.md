@@ -13,7 +13,7 @@ not imported by the library.
 ## Running
 
 ```bash
-python benchmarks/measure.py baseline           # freeze a reference, ~75-85 s
+python benchmarks/measure.py baseline           # capture a "before" snapshot, ~75-85 s
 python benchmarks/measure.py current            # after your change
 python benchmarks/compare.py baseline current   # judge the change
 python benchmarks/ab.py --samples 96            # demo A/B on this repo's resampler
@@ -27,6 +27,27 @@ about **75-85 s**. Keep the frozen baseline, delete the rest when the series is 
 `measure.py` imports the gain-offset constant, the gain tolerance and the locked
 score/ratio dicts from `tests/regression/test_matlab_regression.py` rather than
 copying them, so the harness always reproduces the bar the test actually asserts.
+
+## A capture is not `reference/` — they answer different questions
+
+Easy to conflate, since both get called "frozen". They are complementary, not
+alternatives:
+
+| | `reference/` | a capture (`measure.py <tag>`) |
+| --- | --- | --- |
+| what is frozen | **code** — a transcription that never gets optimized | **data** — waveforms and timings at one commit |
+| answers | is this output *correct*? | what did my change *move*? |
+| compares against | MATLAB's algorithm | your own code, before the edit |
+| resolution | ~1e-5 (the gap any implementation has to MATLAB) | ~1e-16 |
+| says anything about speed | no | yes |
+
+The resolution row is the reason you need both. Two different implementations differ
+from each other by far more than a reassociation does, so a 1e-9 shift is invisible
+against `reference/` — but a capture compares your code to *itself before the edit*,
+where the only difference is your edit. That is how the 2026-08-12 pass measured a
+1.18e-9 move on `artifacts` and then attributed it to conditioning rather than error.
+
+Use `reference/` to answer "is it right". Use a capture to answer "what did I just do".
 
 ## The workflow (this is the part that matters)
 

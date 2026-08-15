@@ -52,11 +52,22 @@ not obvious from the code:
 
 **Picking this up for performance work? Start here.**
 
-1. **Freeze a baseline before you change anything.** `python benchmarks/measure.py baseline`
-   at the commit you start from, then compare everything to that tag for the whole
-   series. Rule 2 below is why, and the capture cannot be reconstructed afterwards.
-   `benchmarks/results/` is gitignored, so whatever a previous session froze is not
-   yours — take your own.
+1. **Capture a "before" snapshot of the output before you change anything.**
+   `python benchmarks/measure.py baseline` at the commit you start from, then compare
+   everything to that tag for the whole series. It cannot be reconstructed afterwards,
+   and `benchmarks/results/` is gitignored, so a previous session's capture is not yours
+   — take your own.
+
+   **This is not the same thing as `reference/`, and one does not replace the other.**
+   `reference/` is frozen *code*: an oracle that answers "is this output **correct**?".
+   A capture is frozen *data*: the actual waveforms and timings at one commit, answering
+   "what did my change **move**?". You need the capture because the reference cannot
+   resolve small changes — two different implementations differ from each other by far
+   more than a reassociation does, so a 1e-9 shift is invisible against it. A capture
+   compares your code to *itself before the edit*, where the only difference is your
+   edit, which is how the 2026-08-12 pass measured a 1.18e-9 move on `artifacts` and
+   then attributed it. The capture also records timings; the reference says nothing
+   about speed.
 2. **Read `ARCHIVE.md`'s rejected lists before picking an item.** They are longer than
    this file's open list, and they include ideas that look obviously right — a numpy
    polyphase GEMM mirroring the torch win measured **3.3x slower**.
