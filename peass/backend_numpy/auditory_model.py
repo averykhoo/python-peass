@@ -15,6 +15,24 @@ from peass.config import ModulationProcessingType
 from .gammatone import GammatoneAnalyzer
 from .gammatone import fast_resample_poly
 
+# MEASURED AND REJECTED (2026-08-15): interleaving N independent bands through
+# the sample loop to overlap their division chains. The reasoning is sound --
+# the 5-stage cascade is 5 dependent divisions at ~14 cycles of latency each,
+# and the archive's 2026-08-08 note that this kernel is "latency-bound on its 5
+# serial divisions" says the same thing from the other side -- and an isolated
+# harness measured it at 1.53x. In situ it is worth nothing:
+#
+#     block width   vs width 1 (benchmarks/ab.py, 20 samples/phase, AGREE)
+#         2         0.9921x  CI [0.9754, 1.0047]
+#         4         0.9753x  CI [0.9527, 0.9871]
+#         8         1.0042x  CI [0.9794, 1.0177]
+#        16         0.9818x  CI [0.9498, 1.0008]
+#
+# Every width is bit-identical to every other (reordering independent
+# recurrences reassociates nothing), so this was purely a timing choice and the
+# timing says no. The torch twin was independently measured the same way on the
+# same day and also came out flat-to-slower. Do not re-prototype this.
+
 # -----------------------------------------------------------------------------
 # NUMBA JIT COMPILATION (WITH SAFE IMPORT FALLBACK)
 # -----------------------------------------------------------------------------
@@ -30,11 +48,28 @@ try:
             sampling_frequency_hz: float,
             haircell_filter_gain: float,
             adaptation_bandwidths: np.ndarray,
-            absolute_hearing_threshold: float
+            absolute_hearing_threshold: float,
+            output_scale: float,
+            output_offset: float
     ) -> np.ndarray:
         """
         Fused JIT kernel: Half-wave rectification, haircell lowpass,
-        and 5-stage non-linear adaptation executing natively in a single pass.
+        5-stage non-linear adaptation and the global dB affine, executing
+        natively in a single pass.
+
+        `output_scale`/`output_offset` apply `scale * (value - offset)` at the
+        store. That is the same two IEEE operations, in the same order, on the
+        same value as doing it with two NumPy ufuncs afterwards -- so it is
+        bit-identical -- but it fuses them into a write the kernel is making
+        anyway instead of two more full passes over a 26 MB array.
+
+        Measured on the whole metric path with `benchmarks/ab.py` against a
+        verbatim copy of the pre-change path: **1.037x** CI [1.014, 1.049] and
+        **1.105x** CI [1.085, 1.124] on two separate runs, both AGREE. Those
+        intervals do not overlap, which is worth reading as a warning rather
+        than averaging away: `ab.py`'s CI covers within-run variation only, and
+        this machine drifts more than that between runs (TODO.md ground rule 3).
+        Call it 1.04-1.11x on the metric path, i.e. ~1-4% end-to-end.
         """
         num_bands, num_samples = subband_signals.shape
         output_signals = np.empty_like(subband_signals)
@@ -83,7 +118,8 @@ try:
                     )
                     current_value = compressed_value
 
-                output_signals[band_idx, sample_idx] = current_value
+                # 4. Global dB offset scaling, fused into the store
+                output_signals[band_idx, sample_idx] = output_scale * (current_value - output_offset)
 
         return output_signals
 
@@ -203,10 +239,15 @@ def _fallback_fused_auditory_kernel(
         sampling_frequency_hz: float,
         haircell_filter_gain: float,
         adaptation_bandwidths: np.ndarray,
-        absolute_hearing_threshold: float
+        absolute_hearing_threshold: float,
+        output_scale: float,
+        output_offset: float
 ) -> np.ndarray:
     """
     Pure SciPy/NumPy fallback executing identical math utilizing C-backends.
+
+    Applies the same `output_scale`/`output_offset` affine as the JIT kernel, so
+    the two paths stay interchangeable at the call site.
     """
     # 1. Half-wave rectification
     rectified_signals = np.maximum(subband_signals, 0.0)
@@ -216,9 +257,10 @@ def _fallback_fused_auditory_kernel(
     denominator_coefficients = np.array([1.0, -haircell_filter_gain])
     transduced_signals = signal.lfilter(numerator_coefficients, denominator_coefficients, rectified_signals, axis=-1)
 
-    return _fallback_adaptation_loops(
+    adapted_signals = _fallback_adaptation_loops(
         transduced_signals, sampling_frequency_hz, adaptation_bandwidths, absolute_hearing_threshold
     )
+    return output_scale * (adapted_signals - output_offset)
 
 
 # -----------------------------------------------------------------------------
@@ -299,23 +341,27 @@ def generate_auditory_internal_representation(
     absolute_hearing_threshold = 10.0 ** (-decibel_range / 20.0)
     adaptation_loop_bandwidths = 1.0 / (np.pi * np.array([0.005, 0.05, 0.129, 0.253, 0.5]))
 
+    # Global dB offset scaling. Computed here but applied inside the kernel, at
+    # the store -- see `_numba_fused_auditory_kernel`. `final_threshold` is the
+    # same five chained square roots the kernel's stage-threshold loop performs,
+    # so it is exactly `stage_thresholds[4]`.
+    final_threshold = absolute_hearing_threshold
+    for _ in range(5):
+        final_threshold = math.sqrt(final_threshold)
+    output_scale = decibel_range / (1.0 - final_threshold)
+
     if _HAS_NUMBA:
         adapted_signals = _numba_fused_auditory_kernel(
             subbands, sampling_frequency_hz, haircell_filter_gain,
-            adaptation_loop_bandwidths, absolute_hearing_threshold
+            adaptation_loop_bandwidths, absolute_hearing_threshold,
+            output_scale, final_threshold
         )
     else:
         adapted_signals = _fallback_fused_auditory_kernel(
             subbands, sampling_frequency_hz, haircell_filter_gain,
-            adaptation_loop_bandwidths, absolute_hearing_threshold
+            adaptation_loop_bandwidths, absolute_hearing_threshold,
+            output_scale, final_threshold
         )
-
-    # Global dB offset scaling
-    final_threshold = absolute_hearing_threshold
-    for _ in range(5):
-        final_threshold = math.sqrt(final_threshold)
-
-    adapted_signals = (decibel_range / (1.0 - final_threshold)) * (adapted_signals - final_threshold)
 
     # 4. Modulation Filtering & Polyphase Decimation
     if modulation_processing_type == ModulationProcessingType.FILTERBANK:
