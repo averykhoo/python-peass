@@ -60,8 +60,14 @@ def _get_gammatone_H_real_torch(N_fft: int, fs: float, cfs_tuple: tuple, norms_t
     rather than ~1.2e-16, and the two signs differ by ~1e-7 relative.)
 
     Returns shape ``(num_bands, N_fft // 2 + 1)`` -- half the elements of
-    `_get_gammatone_H_torch`'s full grid, and bit-identical to
-    ``(H[k] + conj(H[-k])) / 2`` taken from it.
+    `_get_gammatone_H_torch`'s full grid, agreeing with ``(H[k] + conj(H[-k])) / 2``
+    taken from it to a few hundred ULP.
+
+    Not bit-identical to it, despite being exact on Windows: the two build ``z_inv``
+    by calling a complex ``torch.exp`` on grids of different length, and that is free
+    to vectorize differently per length and per platform libm. CI caught the
+    difference on ubuntu-latest at ``N_fft=4096``. Nothing downstream needs the
+    stronger property -- ``process_real`` uses this filter and never the reflection.
     """
     device = torch.device(device_str)
     freqs_norm = torch.fft.fftfreq(N_fft, device=device)[:N_fft // 2 + 1]

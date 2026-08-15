@@ -351,12 +351,23 @@ def test_torch_gammatone_half_spectrum_filter_is_the_exact_reflection():
     `_get_gammatone_H_real_torch` must be bit-for-bit `(H[k] + conj(H[-k])) / 2` taken
     from the full-grid filter -- that identity is the whole basis of `process_real`.
 
-    Bit-identity is asserted, not approximated, because the two ways of missing it are
-    both traps. The frequency grid inherits torch's default float32, so `exp(-+i*pi)`
-    carries an ~8.7e-8 imaginary residue and the `fftfreq` (-0.5) / `rfftfreq` (+0.5)
-    Nyquist conventions disagree by ~1e-7 relative; and the Nyquist bin reflects onto
-    itself, so the conjugate-grid formula does not apply there at all. Getting either
-    wrong is invisible under `allclose` and shows up as a ~2e-11 error in that bin.
+    The bar is a few hundred ULP of the filter's own peak rather than bit-identity, and
+    the distinction is deliberate. This assertion was `torch.equal` when it landed --
+    exact on Windows across 32 config x size combinations -- and it failed on
+    ubuntu-latest at `n_fft=4096` the first time CI saw it. The two constructions call
+    `torch.exp` on grids of different length (the full `N_fft` vs this half grid), and a
+    complex `exp` is free to vectorize differently per length and per platform libm; the
+    last-ULP difference then runs through a 4th power with a resonant denominator. Same
+    family as the batched-FFT non-invariance recorded in ARCHIVE.md, and the second time
+    this project has written a Windows-only exactness down as a universal invariant.
+
+    The bound still catches what this test exists to catch, with orders to spare. Both
+    ways of getting the identity wrong are traps that fail far louder than 1e-13: the
+    frequency grid inherits torch's default float32, so `exp(-+i*pi)` carries an ~8.7e-8
+    imaginary residue and the `fftfreq` (-0.5) / `rfftfreq` (+0.5) Nyquist conventions
+    disagree by ~1e-7 relative; and the Nyquist bin reflects onto itself, so the
+    conjugate-grid formula does not apply there at all, which shows up as ~2e-11 in that
+    bin. The bound below is ~200x tighter than the quieter of those.
     """
     from peass.backend_torch.gammatone import _get_gammatone_H_real_torch
     from peass.backend_torch.gammatone import _get_gammatone_H_torch
@@ -379,8 +390,22 @@ def test_torch_gammatone_half_spectrum_filter_is_the_exact_reflection():
         expected = (full[:, k] + torch.conj(full[:, (-k) % n_fft])) * 0.5
 
         assert half.shape == (full.shape[0], n_fft // 2 + 1)
-        assert torch.equal(half, expected), f"n_fft={n_fft}"
-        # A Hermitian spectrum needs both self-reflecting bins purely real.
+
+        peak = half.abs().max().item()
+        deviation = (half - expected).abs().max().item()
+        assert deviation < 1e-13 * peak, (
+            f"n_fft={n_fft}: half-grid filter deviates {deviation:.3e} from the "
+            f"reflection of the full-grid one, {deviation / peak:.3e} of peak "
+            f"({deviation / (peak * torch.finfo(torch.float64).eps):.1f} ULP). "
+            "A few hundred ULP is platform libm; 1e-11 or more means the Nyquist "
+            "bin or the fftfreq/rfftfreq convention is actually wrong."
+        )
+
+        # These two stay exact on every platform, and are structural rather than
+        # numerical: a Hermitian spectrum needs both self-reflecting bins purely
+        # real. DC cancels algebraically (z_inv[0] is exactly 1+0j, so the
+        # reflected term is the conjugate of the forward one) and Nyquist is
+        # assigned `forward[:, -1].real` outright.
         assert torch.equal(half[:, 0].imag, torch.zeros_like(half[:, 0].imag))
         assert torch.equal(half[:, -1].imag, torch.zeros_like(half[:, -1].imag))
 

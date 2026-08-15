@@ -144,6 +144,24 @@ Four method findings, each of which broke a first attempt:
   are now correct. The consequence for anyone touching that constant: it is a memory knob,
   not a tuning knob, and changing it changes the last digits of a score.
 
+- **A complex `torch.exp` is not length-invariant either, and CI caught it where a
+  32-case sweep did not.** `_get_gammatone_H_real_torch` builds `z_inv` on the half grid
+  while `_get_gammatone_H_torch` builds it on the full one. The half filter is therefore
+  *not* bit-identical to `(H[k] + conj(H[-k]))/2` sliced from the full one, even though it
+  is exactly that on Windows across 32 config x size combinations — which is how it was
+  asserted with `torch.equal` when it landed. ubuntu-latest failed it at `N_fft=4096` on
+  the first CI run: different grid length, different libm vectorization, last-ULP
+  difference, then a 4th power with a resonant denominator. The test now bounds at 1e-13
+  of peak, which is still ~200x tighter than the quietest thing it exists to catch (a
+  ~2e-11 Nyquist-bin error). Same family as the batched-FFT entry above.
+
+  Worth stating as a rule, since this is the third entry in this file with the same shape:
+  **a sweep proves a property on the machine you swept.** Exactness across many shapes on
+  one platform is evidence about that platform's libm, not about the identity. If a test
+  asserts bit-equality between two *differently-shaped* computations of the same quantity,
+  it will eventually fail on another platform — bound it, and size the bound from the
+  error the test is meant to detect.
+
 - **The "old path's own noise" control — treat this as the standard method for any
   near-exact claim.** Before attributing a deviation to a candidate, reproduce it on the
   **unchanged** path via a mathematically exact identity: permute the rows, change a chunk
