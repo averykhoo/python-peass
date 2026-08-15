@@ -25,21 +25,34 @@ try:
             states: np.ndarray,
             order: int
     ) -> np.ndarray:
+        """All-pole gammatone analysis filterbank, band-outer.
+
+        The bands are independent 4th-order recurrences, so the loop order is
+        free. Band-outer writes each output row contiguously (sample-outer wrote
+        `num_bands` cells `num_samples * 16` bytes apart per input sample, i.e. a
+        distinct cache line each) and keeps the four states in registers for the
+        whole row instead of reloading and storing them every sample.
+
+        Bit-identical to the sample-outer form: every band still evaluates the
+        same operations on the same operands in the same order; only independent
+        recurrences are interleaved differently, which reassociates nothing.
+        """
         num_bands = len(coefficients)
         num_samples = len(input_signal)
         output = np.empty((num_bands, num_samples), dtype=numba.complex128)
 
-        for sample_idx in range(num_samples):
-            val = input_signal[sample_idx]
-            for band_idx in range(num_bands):
-                coef = coefficients[band_idx]
-                norm = normalization_factors[band_idx]
+        for band_idx in range(num_bands):
+            coef = coefficients[band_idx]
+            norm = normalization_factors[band_idx]
 
-                # Retrieve states for this band
-                s0 = states[band_idx, 0]
-                s1 = states[band_idx, 1]
-                s2 = states[band_idx, 2]
-                s3 = states[band_idx, 3]
+            # Retrieve states for this band; they stay in registers across the row
+            s0 = states[band_idx, 0]
+            s1 = states[band_idx, 1]
+            s2 = states[band_idx, 2]
+            s3 = states[band_idx, 3]
+
+            for sample_idx in range(num_samples):
+                val = input_signal[sample_idx]
 
                 # 4th-order cascaded state update (fully unrolled matching SciPy lfilter)
                 y0 = val * norm + s0
@@ -51,12 +64,66 @@ try:
                 y3 = y2 + s3
                 s3 = y3 * coef
 
-                states[band_idx, 0] = s0
-                states[band_idx, 1] = s1
-                states[band_idx, 2] = s2
-                states[band_idx, 3] = s3
-
                 output[band_idx, sample_idx] = y3
+
+            states[band_idx, 0] = s0
+            states[band_idx, 1] = s1
+            states[band_idx, 2] = s2
+            states[band_idx, 3] = s3
+
+        return output
+
+
+    @numba.njit(cache=True)
+    def _numba_gfb_analyze_real(
+            input_signal: np.ndarray,
+            coefficients: np.ndarray,
+            normalization_factors: np.ndarray,
+            states: np.ndarray,
+            order: int
+    ) -> np.ndarray:
+        """Real-output twin of `_numba_gfb_analyze`, for callers that discard the
+        imaginary part immediately (the auditory model).
+
+        The recurrence and the state are unchanged and still complex -- only the
+        *store* is real, so the output array is float64 `(bands, samples)`
+        instead of complex128: half the write traffic, and the consumer gets a
+        contiguous array rather than the stride-16 `.real` view of a complex one.
+
+        Bit-identical to `np.real(_numba_gfb_analyze(...))`: `y3.real` is an
+        exact component extraction, not a computation.
+        """
+        num_bands = len(coefficients)
+        num_samples = len(input_signal)
+        output = np.empty((num_bands, num_samples), dtype=numba.float64)
+
+        for band_idx in range(num_bands):
+            coef = coefficients[band_idx]
+            norm = normalization_factors[band_idx]
+
+            s0 = states[band_idx, 0]
+            s1 = states[band_idx, 1]
+            s2 = states[band_idx, 2]
+            s3 = states[band_idx, 3]
+
+            for sample_idx in range(num_samples):
+                val = input_signal[sample_idx]
+
+                y0 = val * norm + s0
+                s0 = y0 * coef
+                y1 = y0 + s1
+                s1 = y1 * coef
+                y2 = y1 + s2
+                s2 = y2 * coef
+                y3 = y2 + s3
+                s3 = y3 * coef
+
+                output[band_idx, sample_idx] = y3.real
+
+            states[band_idx, 0] = s0
+            states[band_idx, 1] = s1
+            states[band_idx, 2] = s2
+            states[band_idx, 3] = s3
 
         return output
 
@@ -481,25 +548,33 @@ class GammatoneAnalyzer:
     def center_frequencies_hz(self) -> np.ndarray:
         return self.center_frequencies
 
+    def _has_jit_path(self) -> bool:
+        return bool(_HAS_NUMBA and self.filters and self.filters[0].filter_order == 4)
+
+    def _pack_filter_parameters(self) -> tuple:
+        """Coefficients, normalizations and states as contiguous arrays for the JIT kernels."""
+        num_bands = len(self.filters)
+        coeffs = np.array([f.complex_filter_coefficient for f in self.filters], dtype=complex)
+        norms = np.array([f.normalization_factor for f in self.filters], dtype=float)
+
+        # Pack states into a contiguous 2D array [bands, order]
+        states = np.empty((num_bands, 4), dtype=complex)
+        for b in range(num_bands):
+            states[b, :] = self.filters[b].state * self.filters[b].complex_filter_coefficient
+        return coeffs, norms, states
+
+    def _unpack_filter_states(self, states: np.ndarray) -> None:
+        for b in range(len(self.filters)):
+            self.filters[b].state = states[b, :] / self.filters[b].complex_filter_coefficient
+
     def process(self, input_signal: np.ndarray) -> np.ndarray:
         num_bands = len(self.filters)
 
-        if _HAS_NUMBA and self.filters and self.filters[0].filter_order == 4:
+        if self._has_jit_path():
             # Vectorized JIT path: Process all bands simultaneously
-            coeffs = np.array([f.complex_filter_coefficient for f in self.filters], dtype=complex)
-            norms = np.array([f.normalization_factor for f in self.filters], dtype=float)
-
-            # Pack states into a contiguous contiguous 2D array [bands, order]
-            states = np.empty((num_bands, 4), dtype=complex)
-            for b in range(num_bands):
-                states[b, :] = self.filters[b].state * self.filters[b].complex_filter_coefficient
-
+            coeffs, norms, states = self._pack_filter_parameters()
             output_matrix = _numba_gfb_analyze(input_signal, coeffs, norms, states, 4)
-
-            # Unpack states back
-            for b in range(num_bands):
-                self.filters[b].state = states[b, :] / self.filters[b].complex_filter_coefficient
-
+            self._unpack_filter_states(states)
             return output_matrix
         else:
             # Fallback path
@@ -507,6 +582,24 @@ class GammatoneAnalyzer:
             for band_idx in range(num_bands):
                 output_matrix[band_idx, :] = self.filters[band_idx].process(input_signal)
             return output_matrix
+
+    def process_real(self, input_signal: np.ndarray) -> np.ndarray:
+        """`np.real(self.process(x))`, computed without materializing the complex output.
+
+        Bit-identical to that expression, but returns a contiguous float64
+        `(bands, samples)` array instead of the stride-16 real view of a
+        complex128 one -- half the output write traffic. The filterbank state is
+        unaffected and stays complex, so callers that need the complex subbands
+        (the decomposition, the delay-unit calibration) must keep using
+        `process`; this is a second entry point, not a change to that contract.
+        """
+        if self._has_jit_path():
+            coeffs, norms, states = self._pack_filter_parameters()
+            output_matrix = _numba_gfb_analyze_real(input_signal, coeffs, norms, states, 4)
+            self._unpack_filter_states(states)
+            return output_matrix
+        else:
+            return np.ascontiguousarray(self.process(input_signal).real)
 
     def get_z_plane_frequency_response(self, z_points: np.ndarray) -> np.ndarray:
         z_col = z_points[:, np.newaxis]

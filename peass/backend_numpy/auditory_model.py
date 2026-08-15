@@ -333,7 +333,9 @@ def generate_auditory_internal_representation(
 
     # 1. Gammatone Analysis Filterbank
     analyzer = GammatoneAnalyzer(sampling_frequency_hz, minimum_frequency, 1000.0, maximum_frequency, 1.0)
-    subbands = np.real(analyzer.process(scaled_signal_data))
+    # `process_real` is bit-identical to `np.real(analyzer.process(...))` and skips
+    # the complex128 output entirely -- the imaginary half is discarded right here.
+    subbands = analyzer.process_real(scaled_signal_data)
 
     # 2 & 3. Fused IHC Transduction and Nerve Adaptation
     haircell_filter_gain = math.exp(-math.pi * 2000.0 / sampling_frequency_hz)

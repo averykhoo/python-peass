@@ -334,6 +334,90 @@ def test_gammatone_fallback_vs_jit_equivalence():
 
 
 @pytest.mark.unit
+def test_gammatone_process_real_is_bit_identical_to_real_of_process():
+    """`process_real` must be exactly `np.real(process(...))`, not merely close.
+
+    It exists only to skip the complex128 output the auditory model discards, so
+    the recurrence and the mutated filter state have to be untouched. Asserted as
+    byte equality on the samples AND on every band's post-call state, from a
+    non-zero (warmed) starting state -- a zero state would hide any state bug.
+    """
+    import peass.backend_numpy.gammatone as gammatone
+    if not gammatone._HAS_NUMBA:
+        pytest.skip("Numba is not installed or enabled in this environment.")
+
+    rng = np.random.default_rng(seed=20260815)
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=16000.0,
+        lower_cutoff_frequency_hz=235.0,
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=7000.0,
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+
+    analyzer.process(rng.normal(0.0, 0.5, 500))  # warm the state so it is non-zero
+    warmed_state = [f.state.copy() for f in analyzer.filters]
+    assert any(np.any(s != 0.0) for s in warmed_state)
+
+    signal_input = rng.normal(0.0, 0.5, 3000)
+    complex_output = analyzer.process(signal_input)
+    state_after_complex = [f.state.copy() for f in analyzer.filters]
+
+    for filter_instance, state in zip(analyzer.filters, warmed_state):
+        filter_instance.state = state.copy()
+    real_output = analyzer.process_real(signal_input)
+    state_after_real = [f.state.copy() for f in analyzer.filters]
+
+    expected = np.real(complex_output)
+    assert real_output.dtype == np.float64
+    assert real_output.flags["C_CONTIGUOUS"]
+    assert real_output.tobytes() == np.ascontiguousarray(expected).tobytes()
+    assert np.array_equal(real_output, expected)
+    for after_complex, after_real in zip(state_after_complex, state_after_real):
+        assert np.array_equal(after_complex, after_real)
+
+
+@pytest.mark.unit
+def test_gammatone_process_real_fallback_matches_jit_path():
+    """The no-Numba branch of `process_real` must agree with the JIT branch.
+
+    `process_real` is the auditory model's entry point, so its fallback has to
+    stay usable when Numba is absent; without this the branch is never executed.
+    """
+    import peass.backend_numpy.gammatone as gammatone
+    if not gammatone._HAS_NUMBA:
+        pytest.skip("Numba is not installed or enabled in this environment.")
+
+    rng = np.random.default_rng(seed=99)
+    signal_input = rng.normal(0.0, 0.5, 800)
+    analyzer = GammatoneAnalyzer(
+        sampling_frequency_hz=16000.0,
+        lower_cutoff_frequency_hz=235.0,
+        specified_center_frequency_hz=1000.0,
+        upper_cutoff_frequency_hz=4000.0,
+        filters_per_equivalent_rectangular_bandwidth=1.0
+    )
+
+    original_has_numba = gammatone._HAS_NUMBA
+    try:
+        analyzer.clear_state()
+        jit_output = analyzer.process_real(signal_input)
+
+        gammatone._HAS_NUMBA = False
+        analyzer.clear_state()
+        fallback_output = analyzer.process_real(signal_input)
+    finally:
+        gammatone._HAS_NUMBA = original_has_numba
+
+    assert fallback_output.dtype == np.float64
+    assert fallback_output.flags["C_CONTIGUOUS"]
+    # Byte equality, not a tolerance: the two branches evaluate the same
+    # recurrence in the same order, and the measured deviation is exactly 0.0.
+    # A tolerance here would silently accept a real divergence appearing later.
+    assert np.array_equal(jit_output, fallback_output)
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("sampling_frequency_hz", [8000.0, 16000.0, 44100.0])
 def test_gammatone_analysis_reconstruction(sampling_frequency_hz):
     """
