@@ -74,18 +74,61 @@ def _solve_hermitian_batch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tenso
     ``cholesky_ex`` reports failure per matrix in ``info`` rather than raising, which
     is exactly the rank-deficiency test the NumPy backend already performs with LAPACK
     ``?posv`` (``backend_numpy/decomposition.py``). Frames it rejects fall back to
-    ``pinv``, so the degenerate cases -- above all the silent frames, whose Gram is
-    identically zero and which the NumPy backend bypasses explicitly -- still resolve
-    to the same minimum-norm solution as before.
+    ``pinv``, so a genuinely singular frame still resolves to a minimum-norm solution.
 
     The ``info.any()`` test does force a device sync on CUDA. That is one sync per
     band per solve (32 bands), against an SVD per frame; the trade is not close.
 
-    Deliberately NOT done here: the NumPy backend's 1e-15 diagonal regularization.
-    The Gram's minimum eigenvalue on real data is ~3.4e-10, so 1e-15 is a ~3e-6
-    relative perturbation -- measured at 1e-5 relative deviation on the solution, far
-    worse than anything the Cholesky switch itself costs.
+    The ``1e-15`` diagonal ridge below is not a NumPy-backend quirk: it is MATLAB PEASS
+    v2.0.1's own ``lambda`` in ``LSDecompose.m`` ("regularization parameter (useful when
+    a sequence of zeroes occurs in sources s)"), transcribed in
+    ``reference/LSDecompose.py`` and mirrored by ``backend_numpy/decomposition.py``. It
+    is an UNSCALED absolute constant added to the raw diagonal -- MATLAB writes
+    ``chol(gramSw + lambda*eye(size(gramSw)))``, with no trace or max normalization --
+    and it goes in *before* the factorization, so the ``info`` test and the fallbacks
+    below all see the same regularized matrix.
+
+    It was dropped here on 2026-08-10 on the grounds that against a minimum eigenvalue
+    of ~3.4e-10 it perturbs the solution by ~1e-5 relative. That is true of the
+    *weights* and does not reach the *output*. Restoring it, measured 2026-08-15 on the
+    MATLAB reference clip: ``true_target`` is bit-identical (it never touches the
+    solve), and the other three components move by at most 5.9e-8 of their peak on the
+    mono channel and 3.5e-7 stereo; correlation against the MATLAB gold WAVs moves by
+    at most 3.0e-12 over all four components and both channels, and the worst
+    *degradation* among the eight is 6.6e-13 (``artifacts`` CH0, deficit 3.3107e-6
+    either way, against a 1e-4 floor); the eight reported scores move by at most 2.2e-7
+    on the 0-100 scale and 1.6e-7 dB on the energy ratios, against 1.0 / 0.5
+    characterization tolerances. What dropping it cost was correctness on
+    rank-deficient input: on the tonal pair of
+    ``tests/regression/test_differential_numpy_vs_torch.py``'s ``baseline_signals`` --
+    where one gammatone band of a pure tone is a single complex exponential, so its
+    Toeplitz block is numerically rank ~1 -- torch-vs-NumPy correlation was 0.016490 on
+    ``target_distortion``, 0.016452 on ``interference`` and 0.966525 on ``artifacts``,
+    with torch peaking at 3.90e+2 against NumPy's 1.56. With the ridge they are
+    0.999991, 0.999995 and 0.998739, and the torch peak is 1.559.
+
+    Written as ``gram + lam*eye`` rather than an in-place diagonal ``add_`` so the
+    autograd path stays unambiguous; the eye is at most 42x42 here.
+
+    One consequence, and it is the correct one: a *silent* frame's Gram is identically
+    zero, and ``1e-15 * I`` is positive definite, so ``cholesky_ex`` now succeeds on it
+    instead of routing it to ``pinv``. That agrees, because ``gram`` and ``rhs`` are
+    assembled from the same Toeplitz factor -- ``gram = T^H diag(w^2) T`` and
+    ``rhs = T^H diag(w^2) est`` -- so a zero ``T`` forces ``rhs`` to be exactly zero and
+    the ridged solve returns bitwise-zero weights, which is what ``pinv(0) @ 0`` gives
+    and what MATLAB gives (``chol(0 + lambda*I)`` succeeds there too, and ``Sw'*se`` is
+    zero). A frame that is merely rank deficient rather than zero still fails the ridged
+    factorization and still takes the ``pinv`` path.
+
+    The one way to reach a zero Gram with a nonzero ``rhs`` is underflow, so do not
+    write down that the assembly cannot produce that state: at denormal source scale
+    (``T`` ~ 1e-180) the Gram's entries square to ~1e-360 and flush to exactly 0.0 while
+    ``rhs`` stays at ~9.9e-180, and the ridged solve duly returns weights ~9.9e-165.
+    That is harmless in magnitude rather than impossible -- the projection
+    ``T @ weights`` underflows straight back, measured bitwise 0.0 at ``T`` = 1e-180.
     """
+    # MATLAB LSDecompose.m: chol(gramSw + lambda*eye(size(gramSw))), lambda = 1e-15.
+    gram = gram + 1e-15 * torch.eye(gram.shape[-1], dtype=gram.dtype, device=gram.device)
     factor, info = torch.linalg.cholesky_ex(gram)
     if not bool(info.any()):
         return torch.cholesky_solve(rhs, factor)
@@ -404,8 +447,6 @@ def run_auditory_analysis_filterbank_torch(
             fs, subbands_output.shape[-1], tuple(analyzer.center_frequencies.tolist()), str(signal_waveform.device)
         )
 
-    subbands_output = subbands_output * modulation_matrix
-
     # -------------------------------------------------------------------------
     # OPTIMIZED: Group bands by unique decimation factors (decimations)
     # -------------------------------------------------------------------------
@@ -416,8 +457,31 @@ def run_auditory_analysis_filterbank_torch(
         factor_val = factor.item()
         band_indices = torch.where(analyzer.decimations == factor_val)[0]
 
-        # Extract the entire group block: shape (Batch, NumGroupBands, Time)
-        block = subbands_output[..., band_indices, :]
+        # Extract the group block and apply the analysis modulation in the same pass:
+        # shape (Batch, NumGroupBands, Time). This replaces a separate full-block
+        # `subbands_output = subbands_output * modulation_matrix` pass that used to sit
+        # above this loop. `torch.unique` + `torch.where` partition the bands, so every
+        # band lands in exactly one group and every element gets exactly one multiply by
+        # exactly the row it would have got from the full-block pass. Bit-identical
+        # forward and backward -- no reassociation, the same scalar multiply moved --
+        # asserted with `torch.equal` on all four decomposed components and on
+        # dL/dinput, mono and stereo. This is the analysis mirror of the fused synthesis
+        # alignment matrix.
+        #
+        # It buys memory, not time: it drops one full-block complex128 temporary per
+        # call. Measured on the 5 s / 16 kHz / 3-source MATLAB reference clip, where
+        # every decimation group is a single band, so the block this fuses into is
+        # 1/32 the size of the temporary it replaces:
+        #
+        #            batch  full block (dropped)  fused group block
+        #   mono     3 + 1   184.32 + 61.44 MB      5.76 / 1.92 MB
+        #   stereo   6 + 2   368.64 + 122.88 MB    11.52 / 3.84 MB
+        #
+        # (two calls per decomposition: the sources at batch S*C, the estimate at C.)
+        # It is a MEASURED SPEED DUD: 2026-08-12, ten paired interleaved A/B
+        # replications, mixed-sign, medians 0.999x / 1.002x. Do NOT re-prototype this
+        # expecting a speedup; take it for the temporary alone.
+        block = subbands_output[..., band_indices, :] * modulation_matrix[band_indices, :]
 
         # Resample the 3D block along the last axis in a single parallel call!
         resampled_block = fast_resample_poly_torch(block, 1, factor_val, axis=-1, half_length_factor=half_length_factor)

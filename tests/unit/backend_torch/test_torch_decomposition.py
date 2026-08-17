@@ -148,27 +148,57 @@ def test_torch_hermitian_solve_falls_back_on_rank_deficient_frames():
     """The Cholesky solver must reproduce `pinv` on frames it cannot factorize.
 
     `_solve_hermitian_batch` replaced an unconditional `torch.linalg.pinv` with
-    `cholesky_ex` plus a per-matrix fallback. Silent frames make the Gram identically
-    zero and genuinely rank-deficient ones make it merely singular, so both have to
-    keep resolving to the same minimum-norm solution `pinv` gave -- and, just as
-    importantly, the batched factorization must not leak inf/NaN out of the frames it
-    failed on. Nothing else in the suite exercises the failing branch directly.
+    `cholesky_ex` plus a per-matrix fallback, and applies MATLAB `LSDecompose.m`'s
+    1e-15 diagonal ridge before factorizing. A genuinely rank-deficient frame still
+    fails the ridged factorization and must resolve to the same minimum-norm solution
+    `pinv` gave -- and, just as importantly, the batched factorization must not leak
+    inf/NaN out of the frames it failed on. Nothing else in the suite exercises the
+    failing branch directly.
+
+    The Gram and the right-hand side are built here from a SHARED Toeplitz factor,
+    `gram = T^H diag(w^2) T` and `rhs = T^H diag(w^2) est`, exactly as
+    `perform_time_varying_least_squares_projection_torch` assembles them. That coupling
+    is load-bearing, not decoration. A silent frame is `T == 0`, which forces `rhs == 0`
+    *exactly*; the ridge makes `0 + 1e-15*I` positive definite, so `cholesky_ex` now
+    succeeds on such a frame and returns bitwise-zero weights instead of routing it to
+    `pinv`. Handing this function a zero Gram next to an INDEPENDENT random `rhs` -- as
+    this fixture used to -- asks it for `rhs * 1e15`, which is exactly what it correctly
+    returns, and which the coupled assembly only ever reaches at denormal source scale
+    (`T` ~ 1e-180 underflows the Gram to 0.0 while `rhs` survives), where the resulting
+    projection underflows back to 0.0 anyway. Do not decouple them again, and do not
+    delete the ridge to make an uncoupled fixture pass.
     """
     from peass.backend_torch.decomposition import _solve_hermitian_batch
 
     generator = torch.Generator().manual_seed(0)
-    size, batch = 9, 6
-    factor = torch.randn(batch, size, size, dtype=torch.float64, generator=generator)
-    gram = factor @ factor.transpose(1, 2) + size * torch.eye(size, dtype=torch.float64)
-    gram[1] = 0.0  # silent frame
-    gram[3] = gram[3][:, :1] @ gram[3][:1, :]  # rank 1, not positive definite
-    rhs = torch.randn(batch, size, 2, dtype=torch.float64, generator=generator)
+    num_frames, window_length, width, num_channels = 6, 40, 9, 2
 
-    _, info = torch.linalg.cholesky_ex(gram)
-    assert bool(info.any()), "test no longer exercises the fallback branch"
+    toeplitz = torch.randn(num_frames, window_length, width, dtype=torch.float64, generator=generator)
+    toeplitz[1] = 0.0  # silent frame: the source block itself is identically zero
+    # rank 1, so the Gram is singular but not zero, and stays singular under the ridge
+    toeplitz[3] = toeplitz[3][:, :1] @ torch.randn(1, width, dtype=torch.float64, generator=generator)
+    estimates = torch.randn(num_frames, window_length, num_channels, dtype=torch.float64, generator=generator)
+    window_sq = torch.rand(1, window_length, 1, dtype=torch.float64, generator=generator)
+
+    conjugate_transpose = toeplitz.transpose(1, 2)
+    gram = conjugate_transpose @ (window_sq * toeplitz)
+    rhs = conjugate_transpose @ (window_sq * estimates)
+
+    # The silent frame really is zero on both sides -- the premise of the whole fixture.
+    assert bool((gram[1] == 0).all()) and bool((rhs[1] == 0).all())
+
+    # The rank-deficient frame must still fail the factorization the solver actually
+    # performs (i.e. after the ridge), or this test stops covering the `pinv` branch.
+    _, info_ridged = torch.linalg.cholesky_ex(
+        gram + 1e-15 * torch.eye(width, dtype=torch.float64)
+    )
+    assert int(info_ridged[3]) != 0, "test no longer exercises the fallback branch"
+    assert int(info_ridged[1]) == 0, "the ridge should make the silent frame factorizable"
 
     solved = _solve_hermitian_batch(gram, rhs)
     assert bool(torch.isfinite(solved).all())
+    # A zero Gram with a zero rhs gives exactly zero weights -- no 1e15 amplification.
+    assert bool((solved[1] == 0).all())
     torch.testing.assert_close(solved, torch.linalg.pinv(gram) @ rhs, rtol=0.0, atol=1e-12)
 
 
