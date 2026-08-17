@@ -458,6 +458,14 @@ Two observations from the same sweep that are not opportunities but bear on sizi
   and the tap count is pinned at 21 by MATLAB parity (`half_length_factor = 10`). The
   only route to fewer MACs is folding the modulation into the taps — TODO P5, which is
   flagged as probably fatal for the same real-FIR reason in numpy as in torch.
+
+  **Amended 2026-08-18: the "probably fatal" flag was refuted in torch, and that is not an
+  endorsement of the numpy twin.** P5 landed at 1.1673x mono by making the folded kernel a
+  true complex `zgemm`; the widened real `dgemm` that would have preserved the real-FIR split
+  measured 0.717x, i.e. the caveat's mechanism is real and the way past it is a genuine
+  complex GEMM. numpy has no complex GEMM here to win with — its kernels are `ddot`/AXPY on
+  real planes, and this file's own "a numpy polyphase GEMM measured 3.3x slower" result is the
+  direct precedent. Do not port P5 to numpy without re-measuring the baseline first.
 - **The "VECTORIZED 2D BLOCK" comments oversell what happens.** All 32 bands have
   distinct decimation factors, so every "block" is literally one row — `shape=(1, 8572)`
   on every synthesis resample. The comments describe an intent, not a realized benefit.
@@ -557,6 +565,333 @@ deviations from the MATLAB reference".
 
 ## Resolved
 
+### P5 — the modulation folded into the polyphase filters: 1.167x mono, −117.9 MB (2026-08-18)
+
+The last survivor of the original P-numbered list, and the largest known remaining
+decomposition win. **Both halves are implemented and both gates have been run and passed.**
+`_get_analysis_mod_matrix_torch` (61.44 MB, `(32, 120000)` complex128) and
+`_get_synthesis_alignment_matrix_torch` (61.61 MB, `(32, 120336)`) are **gone**, replaced by
+`fast_demodulate_decimate_torch` and `fast_interpolate_modulate_torch` in
+`backend_torch/utils.py`: a true complex `zgemm` on both sides, range-reduced phase on both,
+folded on **both** the grad and no-grad decimation routes (interpolation has only one route).
+`decomposition.py`'s two `torch.unique` group loops are per-band loops now, and the synthesis
+half takes `GammatoneSynthesizerTorch.process`'s `alignment=None` default, so the surviving
+full-rate factor is a per-band complex scalar.
+
+Complex-exponential modulation distributes through convolution exactly, so the full-length
+modulation multiplies fold into the 21-tap filters. What survives the fold is a residual at
+the *decimated* rate — `m[(hf+i)·D]` on the analysis output, `m[U·i]` on the synthesis input
+— applied as its own elementwise pass, deliberately: summed over the 32 bands those are
+~0.35% of one full-rate pass, and fusing a factor into a shifted-diagonal *sum* is not
+expressible anyway.
+
+**Accuracy — parity, per band and end to end.** Every reference is built from an
+**independent** exact-`Fraction` modulation that shares no code with the library:
+
+| check | bar | measured |
+| --- | --- | --- |
+| analysis, per-band, 4 batch geometries | 5e-15 | **1.219e-15** of peak |
+| synthesis, per-band, mono + stereo | 5e-15 | **2.224e-15** of peak |
+| synthesis, whole-function, mono/stereo/unbatched | 1e-13 | **6.237e-16** of peak |
+| synthesis gradients, all 32 subband tensors | 1e-13 | **1.207e-15** of peak |
+| end-to-end, four components, folded vs pre-change | 1e-13 | **6.394e-16** of peak |
+
+The folds themselves therefore move nothing above ~1e-15. **P5's whole accuracy movement
+against unmodified HEAD is the range reduction**, which is a separate, strictly-improving
+change: measured end to end on the stereo 3-source reference, relative to each component's
+own peak, true_target 2.296e-12 / target_distortion 2.348e-12 / interference 2.607e-12 /
+artifacts 3.700e-12, toward truth.
+
+#### 1. Ground rule 2 — passed, and torch has converged onto numpy
+
+`measure.py p5` + `compare.py baseline p5` against the frozen `e960c5e` capture, verified
+genuine before use (`git_dirty = false`). Idle machine, run by the lead.
+
+- **numpy: exactly zero movement** on every correlation, gain error, score and waveform.
+- **All 8 torch correlations improved.** Worst correlation drop `+0.000e+00`.
+- Worst |gain error| growth `+6.814e-07` (torch/`target_distortion` ch0) — and, exactly as on
+  2026-08-17, it is **convergence onto numpy**, not regression: torch moved `-6.03e-07` →
+  `-1.28e-06`, and numpy's value *is* `-1.28e-06`. Same headline number, same explanation. A
+  tool that only knows "moved away from the reference" cannot tell the two apart.
+- **`overall_perceptual_score` is now `17.665620658898` on BOTH backends — identical to all
+  twelve digits** — and several torch gain errors now equal numpy's exactly. Largest torch
+  score move `-3.643e-04` (`interference_perceptual_score`) against a 1.0 bar.
+- Worst waveform deviation **6.144e-05** of peak (`matlabref_torch__artifacts`) — *unchanged*
+  from the pre-P5 series figure. P5 added nothing measurable to it.
+
+#### 2. Ground rule 3 — passed, and the two directions AGREE
+
+`benchmarks/ab.py`, driver a full torch decomposition of `tests/resources/database/exp01_*`
+through `benchmarks/measure.py`'s own `decompose()`, idle machine, with the old code loaded
+from a `git worktree` at HEAD **alongside** the new in ONE process. **All six A/Bs returned
+AGREE on the first attempt; none was retried.**
+
+| workload | ratio (>1 = P5 faster) | 95% CI | phases |
+| --- | --- | --- | --- |
+| mono, 96 calls/phase | **1.1673x** | [1.1631, 1.1751] | 1.1612 / 1.1759 |
+| stereo, 64 calls/phase | **1.1571x** | [1.1486, 1.1643] | 1.1561 / 1.1579 |
+
+Attribution, mono 96 calls/phase, measured in **both** directions as the 2026-08-15 lesson
+demands, all AGREE:
+
+| half | ON (from all-old) | OFF (from current tree) | ON saving | OFF saving |
+| --- | --- | --- | --- | --- |
+| analysis fold | **1.1047x** | **1.1062x** | 102.2 ms | 107.5 ms |
+| synthesis fold | **1.0514x** | **1.0735x** | 57.7 ms | 64.9 ms |
+| product / sum | 1.1615x | 1.1875x | 159.9 ms | 172.4 ms |
+
+**This is the notable methodological result, and it is the OPPOSITE of 2026-08-15.** There,
+leave-one-out read three real items as null because two of them overlapped on the same copy.
+Here the halves are genuinely independent — the analysis fold reads the same to ~5 ms in both
+directions, the synthesis fold's two ratios differ only because they are taken against
+denominators ~200 ms apart, and the absolute savings sum to 160-172 ms against 161 ms
+measured together. The ON-direction product 1.1615x reproduces the 1.1673x headline to 0.5%.
+Analysis is worth ~1.7x synthesis; neither half is a dud and neither can be dropped because
+the other one "already got it".
+
+**The 2026-08-15 lesson is vindicated by a case where the two directions AGREE, not only by
+the case where they disagreed.** Measuring both directions is what made that checkable at
+all; had only one been taken, this result would have been indistinguishable from a lucky
+guess.
+
+**Ground rule 3's "harnesses overstate" warning is CONFIRMED, less brutally than the three
+recorded 1.5x+ cases.** The kernel harness predicted 1.351x analysis / 1.426x synthesis *in
+isolation*; in situ the halves are 1.105x and 1.05-1.07x **of the whole decomposition**. The
+warning stands as written — 1.167x is well short of 1.35x/1.43x — but the in-situ result is
+nowhere near noise, and P5 does not have to fall back on its memory argument.
+
+**A new method fact worth having: absolute medians drift 11.4% BETWEEN processes.** The
+identical `new` code read 995 ms in one run and 882 ms minutes later on the same idle
+machine. Only *within-run* ratios are quotable; nobody may cross-quote the millisecond
+columns between two `ab.py` runs. This independently re-confirms ground rule 3's premise.
+
+#### 3. Memory — a MEMORY result, not an `ab.py` one
+
+Not governed by ground rule 3. Method: one clean process per state, one full decomposition,
+`gc.collect()` then a `gc.get_objects()` sweep for live complex tensors.
+
+Resident complex tensors fall **181.352 MiB → 68.926 MiB, −112.4 MiB**, against a predicted
+−117.9 MB ledger. **Both matrices are measurably absent, not merely unreferenced** — the
+sweep walks `gc.get_objects()`, so a live cache entry would show. Only the `(32, 131072)`
+gammatone `H` remains above 8 MiB. What replaces them is 128 small tensors — 64 modulated
+`(21, rate)` kernels and 64 residual/pre-multiply vectors — totalling 4.93 MiB.
+
+#### 4. Two anti-double-counting warnings — do not add these to anything
+
+- **P4's fusion win and P5's synthesis win are the SAME win re-banked.** The synthesis fold
+  deletes the very matrix P4 built (`_get_synthesis_alignment_matrix_torch`). P4's ~1.15-1.18x
+  and P5's synthesis 1.05-1.07x must not be added.
+- **P5 overlaps the standalone "complex real/imag round trip" item almost completely** (which
+  `TODO.md` carried at 4-8%). The folded path skips `_split_real_imag`/`_merge_real_imag`
+  entirely on both sides. Do not add that either.
+
+#### 5. The best lesson of the pass — the two matrices were bitwise exact conjugates
+
+The analysis and synthesis modulation matrices were **bitwise exact conjugates**
+(`max|a - conj(s)| == 0.0`), so their unreduced-exponential phase errors **cancelled end to
+end**. That is why a ~4e-11 phase error was invisible to every existing test — and, far more
+importantly, **why range-reducing only ONE half would have made the pipeline worse**: it
+breaks the cancellation and leaves the full 4.158e-11 on the output. A locally-correct change
+that degrades the whole. That is exactly what the first attempt did, and it was caught and
+fixed by reducing both sides; the fold then inherits the property, because the taps on both
+sides are built by the same `_reduced_phase_exp`.
+
+Generalise it: **before improving one side of a conjugate/inverse pair, check whether the two
+errors were cancelling.** An error that only exists in an intermediate is not an error in the
+output, and removing half of it is not half a fix.
+
+#### 6. A live defect that passed a fully green suite, because the reference shared code
+
+During the analysis half, `_modulation_phase` returned `limit_denominator(10**12)` of
+`fc/fs`, on the reasoning that capping the *ratio* (rather than `fc` and `fs` separately)
+bounds the error at ~1e-24 turns. **It does not: `limit_denominator` is a *best rational
+approximation* and can return a denominator far below its limit.** The analyzer's
+base-frequency band sits one ULP above 1000 Hz, and `1000.0000000000001/24000` collapsed to
+exactly `1/24` — 1.137e-16 relative, 3.572e-12 rad at `n = T`, and a measured **3.4373e-12**
+of that band's own peak, i.e. ~10x *worse* than unmodified HEAD on that one band while every
+other band improved by four orders. It happens at every supported rate, always on exactly one
+band.
+
+**It survived a green 630-test suite and two parity scripts because every reference was built
+by calling `_modulation_phase` itself, so the error cancelled on both sides** — precisely the
+trap that function's own docstring accused a prototype of. It was caught only by an
+*independent* exact-`Fraction` reference, and confirmed against a 50-digit `mpmath` gold
+value. The phase is now the **exact** ratio, split inside `_reduced_phase_exp` into a capped
+rational plus a float64 remainder.
+
+**Never approximate the ratio, and never build the reference for a phase check out of the
+code under test.** The new tests were then mutation-proved: with the fix monkeypatched back
+out, **5 of 13 cases fail**.
+
+#### 7. Two hard constraints, both re-confirmed by measurement
+
+1. **A true complex `zgemm`, never a widened real `dgemm`.** The variant keeping the folded
+   kernel on the real split path measures **0.717x** — four real GEMMs lose to one complex one
+   at these shapes.
+2. **Range-reduce the phase mod one turn before the exponential.** Naive folding measures
+   3.7e-11 (analysis) / 4.4e-11 (synthesis), because `2*pi*fc*n/fs` reaches **2.3465e5 rad**
+   at `fc = 7468.977`, `fs = 24000`, `n = T = 120000`, so `eps*theta = 5.2e-11 rad`. Reduced,
+   the same fold measures ~1e-15. (An older figure of "~2.2e8 rad" appeared in three places
+   and was wrong by three orders; it predicts ~5e-8, which nobody ever measured.)
+
+Also implemented and worth knowing: the folded path is no longer complex128-only — the
+kernel, residual vector and signal are brought to the signal's own complex precision, and the
+reduction still runs in float64 and is rounded once at the end. And the index split at `2**21`
+deleted a guard whose fallback was a per-sample pure-Python `Fraction` loop, which would have
+tripped at ~23.1M upsampled samples (~321 s at 48 kHz) with no warning.
+
+**Considered and not taken**, filed as a micro-item in `TODO.md`: reducing `turns` into
+`(-0.5, 0.5]` rather than `[0, 1)` halves the polar argument and measures **5.16e-16 against
+9.14e-16** on a 50-digit `mpmath` reference — a real 1.8x, orthogonal to the defect above,
+both forms already on the float64 floor.
+
+Evidence, all under the gitignored `.scratch/p5-2026-08-17/`: `AB_RESULTS.md`,
+`CHECKPOINT-analysis.md` (read its §8 revision first — §§1-7 describe a state that no longer
+exists), `CHECKPOINT-synthesis.md`, `parity_analysis.py`, `parity_synthesis.py`,
+`endtoend_synthesis.py`, `ab_p5_insitu.py`, `mem_p5_insitu.py`.
+
+### `resample_filter_half_length_factor` — error and halt, not tolerate (2026-08-18)
+
+The latent defect §5 of the 2026-08-17 verification pass found, decided and applied.
+`DecompositionConfiguration.__post_init__` (`peass/config.py`) now raises `ValueError` for
+any `resample_filter_half_length_factor < 1`, mirroring the `segmentation_factor` check
+beside it.
+
+**The decision, and the reasoning behind it: if the output was going to be wrong anyway,
+failing loudly beats failing silently.** Below 1 the fast `_polyphase_decimate` does not
+raise — it returns finite numbers that disagree with its own `_polyphase_decimate_padded`
+reference by **O(1)** (deviations 0.39 to 2.13 across 33 swept `(down, in_len, rows, dtype)`
+combinations, against 2.22e-16 for `hf >= 1`), and the gradient path, which routes to the
+padded reference, disagrees with the no-grad path there. The root cause is that the fast
+path's grid algebra needs `right_pad >= (hf-1)*down + 1 > 0`. This is a public behaviour
+change — a loud error where callers previously got silently wrong output — and it was taken
+deliberately rather than by default.
+
+Four new tests in `tests/unit/test_config.py`, **including three ACCEPTANCE cases pinning
+that 1 is the first valid value**, so a later edit cannot quietly move the boundary while the
+rejection tests still pass. The `_polyphase_decimate_padded` docstring in
+`backend_torch/utils.py` was corrected in the same pass: it had gone stale in exactly one
+respect, still claiming `hf = 0` "is accepted through the public API".
+
+**The reusable point, worth keeping independently of the fix:** a `__post_init__` that
+validates one field of several **reads as though it validates all of them**, and "nothing in
+the library passes that" is a statement about the library, not about the API. This dataclass
+is public; the field went unvalidated for as long as it did precisely because no internal
+caller ever exercised it.
+
+### `hypothesis` live-oracle property suite — applied, both stages (2026-08-18)
+
+`tests/regression/test_reference_oracle_property.py` fuzzes `peass/` against `reference/` as
+a live oracle: hypothesis draws a 9-scalar description of an input, a deterministic builder
+turns it into audio, `reference/` decomposes it once, and both backends are asserted to
+reproduce all four components within per-component, per-backend relative-L2 bars. This closes
+the gap the existing tests structurally cannot — every invariant we had (algebraic
+reconstruction, gain invariance, gammatone round trip) constrains the *form* of the answer
+and is satisfied by a **wrong** one.
+
+Opt-in via `pytest -m oracle` (`addopts = ["-m", "not oracle"]` deselects it; nothing in
+`.github/workflows/` reselects it, **deliberately** — decision 2026-08-17, a local opt-in run
+is practical and a CI leg is not worth buying). Declared as a `test` extra in `pyproject.toml`
+plus line 1 of `requirements.txt`; `[tool.flit.sdist]` already excludes `tests/*`, so nothing
+shipped to PyPI can import it. Sized by `PEASS_ORACLE_EXAMPLES`.
+
+Gates: `pytest -q` → **655 passed, 24 skipped, 4 deselected**; `pytest -m oracle -q` →
+**4 passed, 679 deselected in 37.48s**. (The deselected count is **4, not 3** — the Stage B
+liveness test is `oracle`-marked too.) The 37 s figure is rough wall clock, a **budget
+estimate**, explicitly outside ground rule 3.
+
+**The flat torch `1e-3` bar was replaced by per-component bars, and torch has essentially
+converged on numpy.** The flat bar dated from a torch that sat uniformly ~2-4e-6 off the
+reference, correctly blamed at the time on the float32 `torch.fft.fftfreq` grid. After the
+float64 grid (`6e0162d`) and P5's range reduction, torch improved by 1.6e4x to 1.2e7x per
+component and now measures 1.985e-13 / 5.072e-11 / 1.448e-10 / 1.266e-10 (worst of 120
+draws) — the *same magnitude as numpy*. Against 1e-3 that was seven to ten decades of slack,
+which is the vacuous-coverage failure mode this suite exists to prevent. The bars are now
+`{true_target 1e-10, target_distortion 1e-8, interference 1e-8, artifacts 1e-7}` — **numpy's
+own bars, unchanged, on three of the four components**. Only `true_target` still needs a
+looser bar, and only by ~100x (torch 1.985e-13 against numpy 2.060e-15, machine epsilon on
+the one component that is not an output of the ill-conditioned solve). That one factor, plus
+the fact that the two backends can regress independently, is why the tables stay separate.
+`true_target` is bounded at 1e-10 rather than 1e-11 on purpose: 1e-11 clears the observation
+by only 50.4x, the floor of this repo's band, against a 2.1x run-to-run spread.
+
+**The numpy bars never moved and no bar has ever been breached** — `{1e-13, 1e-8, 1e-8, 1e-7}`
+from the day the file landed, holding with 48.5x-1017.7x margin over 120 draws. Nothing was
+quietly loosened to fit.
+
+**The recurring defect is quoting a max-of-N or min-of-N observation as a bound, and this
+file has now done it THREE times.** Three runs of 40 show a *different* component is worst in
+each run, and that the worst swings by 6.3x (numpy `interference`) to 9.0x (torch
+`interference`) between runs of the identical strategy. `_DEGENERACY_FLOOR`'s documented
+per-component minima went **1.8x lower on 120 draws than on 14** (`interference` 1.11e-1 →
+6.104e-2), and the strategy-**corner** sweep (1.71e-1) is *higher* than the fuzzed minimum, so
+corners are not a bound either. **In every case the bar itself was fine and only the comment
+was wrong — fix the column, not the bars.** All tables now say "worst over N draws in M runs,
+dated" and carry an explicitly stated margin. The 1e-6 floor is unchanged and correct; it
+rests on a ~4.8-decade separation from the worst healthy component and ~5.9 decades from the
+linear-mix trap (1.24e-12 / 1.21e-12), not on any single figure.
+
+**All eight bars are mutation-proved live**, by a shipped test (`test_every_tolerance_bar_is_live`)
+and by bisection. Scaling one component by `1 + eps` drives its relative L2 to ~`eps`, so a bar
+`B` resolves a relative gain error of ~`B` on that component; measured, all eight trip at
+**1.0000x-1.0026x** their own value. The shipped test brackets each at 0.5x/2.0x and perturbs
+one component at a time, which additionally proves the four comparisons are independent. It
+calls the *shipped* `_compare_against_reference`, extracted for the purpose — a liveness proof
+against a re-implementation proves the re-implementation. Proved through the real pytest path
+too: `torch/artifacts` scaled by `1+2e-7` fails with `relative L2 2.000e-07 exceeds the 1e-07
+bar`; `1+5e-8` passes. And the liveness test is itself proved live — stubbing the comparison
+to report nothing makes it fail in 3.42 s.
+
+**The liveness proof's own limitation, stated honestly and recorded in the file:** because the
+perturbation is scaled *by* the bar, the test is invariant to bar size and **would have passed
+just as happily against the vacuous flat 1e-3 it now guards**. It proves reachability and
+independence, not tightness. The measured tables are what prove tightness. Anyone who reads
+the liveness test as sufficient will re-introduce a vacuous bar.
+
+**Partial vacuity is now detectable — and the prescribed fix did not work, which was measured
+rather than assumed.** `HealthCheck.filter_too_much` is suppressed, so total filtering raises
+`Unsatisfiable` but *partial* filtering passes silently. The plan's fix — a floor on the
+**count** of valid examples — was implemented first and measured **nearly blind**: with 95% of
+draws forced to filter, hypothesis simply compensated by drawing more and still delivered the
+full 40 valid examples, green. The diagnostic quantity is the **acceptance rate** (examples
+past both `assume`s over examples entered; `assume` raises from inside the property body, so
+both are countable). The same 95% filtering reads 5.0% — **40 valid out of 799 entered** — and
+fails loudly. Both ship: rate as the detector, count as the backstop for the case where
+hypothesis gives up early, and the rate check skipped below 10 draws so
+`PEASS_ORACLE_EXAMPLES=1` stays a legal smoke run. Healthy today: 3 x 40 draws accepted 40 of
+40 every time.
+
+**Cost of that check, disclosed in the file:** `@given` is driven by a plain wrapper so the
+counts can be checked after the run, and hypothesis' pytest plugin gates statistics on
+`is_hypothesis_test`, so `--hypothesis-show-statistics` now prints an empty block for this
+file. Three references to that flag were corrected. It is a net win — the one thing those
+statistics were used for here, the invalid-example count, is now *asserted* rather than left
+to be read — and falsifying examples, shrinking and `@reproduce_failure` blobs are unaffected.
+
+From Stage A, still worth keeping:
+
+- **The shipped cost claim was ~10x too high**, and the reason generalises: it applied the
+  **gold-clip** cost (5 s / 16 kHz / stereo / 3 sources, ~12-15 s) as the **per-example** cost
+  of a strategy box 10-45x structurally smaller. A real in-box reference call is ~0.3-1.2 s.
+- **`PEASS_ORACLE_EXAMPLES` needed a clamp, not just a defensive parse.** It was read at
+  module scope, so a bad value was a *collection* error that took down the whole session; and
+  `int()` alone is insufficient, because `max_examples=0` parses fine and then raises
+  `InvalidArgument`. Parsed lazily, clamped to >= 1.
+- **Four "nightly" claims, not three,** all deleted. **PyCharm wart, verified:** a command-line
+  `-m` *replaces* the `addopts` one, so running a single oracle test by node ID alone reports
+  `0 collected, 1 deselected` — put `-m oracle` in the run configuration's Additional
+  Arguments.
+- **Both documented traps are genuinely excluded and pinned as characterization tests.** A
+  linear estimate in the span of the sources collapses `target_distortion` **and** `artifacts`
+  (not `artifacts` alone) to ~1.2e-12 of the estimate RMS — an earlier "~1e-14" was wrong. And
+  FIR-related sources reproduce **in mono between two sources** (`[x, 0.5*x]`, 3.6e-1 / 3.9e-1
+  relative L2), so "constrain to mono" is *not* a sufficient exclusion, contrary to the earlier
+  wording.
+
+Full working under the gitignored `.scratch/hypothesis-2026-08-17/`: `APPLY_PLAN.md`,
+`STAGE_B_RESULTS.md`, `prove_oracle_bars.py`, `bars_run{1,2,3}.{txt,json}`,
+`bisect_bar_liveness.py`, `mutate_plugin.py`.
+
 ### The 2026-08-17 verification pass — the gate run, the A/Bs run, two defects closed (2026-08-17)
 
 A pass that added no optimisation. Everything the 2026-08-15 decomposition pass left owing
@@ -578,9 +913,14 @@ work sat in the working tree, reads as though it is uncommitted:
 | `12f32ea` | §3(a) — the structural half-spectrum negative tests |
 | `cd80f01` | §3(b) — the four re-derived parity bars |
 
-Nothing is pushed. Note the split: the perf items and the correctness fixes are in separate
+Note the split: the perf items and the correctness fixes are in separate
 commits, and the two test commits are separate again, so the near-exact `72992d9` can be
 reverted without taking the ridge with it.
+
+**Corrected 2026-08-18: this entry said "Nothing is pushed", and that is no longer true.**
+All five, plus the docs commit `9f78864` that recorded this entry, are pushed —
+`git ls-remote origin perf/2026-08-12-decomposition` returns `9f78864`. Nothing from
+2026-08-18 is committed at all; see `TODO.md`'s process-state section for the live picture.
 
 **The single most useful result is a method lesson about leave-one-out A/B, in §2. Read that
 one even if nothing else here is relevant.**
@@ -975,7 +1315,10 @@ contract nobody has.
 - **The analysis modulation folded into the band gather** (`decomposition.py`) —
   **bit-identical**, `torch.equal` on all four components plus `dL/dinput`, mono and
   stereo. Taken **only** for the ~61 MB mono / ~123 MB stereo temporary it removes; it
-  remains a measured speed dud and the comment at the site says so.
+  remains a measured speed dud and the comment at the site says so. *(Superseded 2026-08-18:
+  P5 folds the modulation into the polyphase taps instead and deletes the matrix outright, so
+  the gather has nothing left to fuse. Its "speed dud, do not re-prototype" ledger was
+  rewritten rather than deleted and is still at the site.)*
 
 **`TODO.md` predicted the real/imag round trip would not pay, and named a specific
 blocker; both were wrong.** It was carried at "confidence it pays: low" with the reasoning
@@ -1365,6 +1708,13 @@ which caches `modulation * phase_factors` as one tensor keyed on the phase facto
 dependency set (`delay_sec`, `fs`, cfs, `norms`, `coefs`) as well as the modulation's —
 it builds its own `exp` rather than reading the old bare-matrix cache, so resident cache
 memory is unchanged at one 62 MB tensor.
+
+**Amended 2026-08-18: `_get_synthesis_alignment_matrix_torch` is deleted, and P5's synthesis
+win is THIS win re-banked, not a second one.** P5 folds the modulation into the polyphase
+taps, so the 61.61 MB matrix this entry introduced is gone and the decomposition takes
+`GammatoneSynthesizerTorch.process`'s `alignment=None` default. The shift-accumulate below is
+untouched and its 2.6x on the chain still stands. **Do not add P4's ~1.15-1.18x to P5's
+synthesis 1.05-1.07x** — the second deletes the object the first built.
 
 **The third sub-change from the original P4 sketch was dropped.** Writing
 `x.real*c.real - x.imag*c.imag` by hand instead of a complex multiply then `.real` is
