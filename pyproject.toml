@@ -37,6 +37,16 @@ numba = [
 torch = [
     "torch >= 2.0.0"
 ]
+# Dev/test only. Nothing under `peass/` imports any of these, and nothing here is
+# needed to *use* the library -- `pip install python-peass` is unaffected.
+# `hypothesis` drives tests/regression/test_reference_oracle_property.py, which
+# fuzzes `peass/` against `reference/` as a live oracle. Opt-in only, never in CI:
+# see the `oracle` marker below. The floor is nominal -- everything used is far
+# older than it.
+test = [
+    "pytest >= 7.0",
+    "hypothesis >= 6.100.0"
+]
 
 [project.urls]
 Homepage = "https://github.com/averykhoo/python-peass"
@@ -60,8 +70,19 @@ exclude = [
 # hold ~25 MB of result waveforms per captured tag, and nothing there should ever be
 # imported or walked by a test run.
 norecursedirs = ["*.egg", ".*", "_darcs", "build", "CVS", "dist", "node_modules", "venv", "{arch}", "benchmarks"]
+# `oracle` is opt-in and OFF by default. Every example costs one full `reference/`
+# decomposition, and the reference is slow deliberately -- it mirrors the MATLAB loops.
+# Measured in the strategy box (mono, 2 sources, 8/16 kHz, 0.25-0.75 s) a call is
+# ~0.3-1.2 s, so the whole `-m oracle` selection is a ~1 minute local job at the default
+# 40 examples. It is opt-in because it is a *live oracle* whose cost scales with
+# `PEASS_ORACLE_EXAMPLES`, not because it is expensive -- and it is deliberately NOT in
+# CI: nothing in `.github/workflows/` reselects this marker.
+# A command-line `-m` REPLACES this one (last `-m` wins), so `pytest -m oracle` is the
+# opt-in and `pytest -m ""` clears the filter entirely.
+addopts = ["-m", "not oracle"]
 markers = [
     "unit: Isolated fast-running tests targeting single modules.",
     "integration: Multi-module system pipeline tests.",
-    "regression: Slower validation checks comparing with legacy reference data."
+    "regression: Slower validation checks comparing with legacy reference data.",
+    "oracle: Property-based fuzzing of peass/ against reference/ as a live oracle. Opt-in: deselected by default via addopts, one reference decomposition per example."
 ]
