@@ -14,7 +14,15 @@ import torch
 def _get_gammatone_H_torch(N_fft: int, fs: float, cfs_tuple: tuple, norms_tuple: tuple, coefs_tuple: tuple,
                            device_str: str):
     device = torch.device(device_str)
-    freqs_norm = torch.fft.fftfreq(N_fft, device=device)
+    # `dtype=` is load-bearing and must not be dropped: `fftfreq` otherwise inherits
+    # torch's *default* dtype, which is float32 unless the process changed it. The grid
+    # values themselves are exact either way (1/N is a power of two, so both dtypes
+    # return the same numbers) -- the loss is in the line below, where a Python complex
+    # scalar times a float32 tensor gives complex64, rounding pi and running `exp` in
+    # single precision. That is ~2e-7 on `z_inv`, and the 4th power of a near-resonant
+    # denominator amplifies it ~100x: measured 1.4e-5 of peak on H, 1.0e-6 of peak on
+    # the subbands, and 6.1e-5 of peak on the quietest decomposition component.
+    freqs_norm = torch.fft.fftfreq(N_fft, dtype=torch.float64, device=device)
     z_inv = torch.exp(-2j * math.pi * freqs_norm)
 
     coefs = torch.tensor(coefs_tuple, dtype=torch.complex128, device=device).view(-1, 1)
@@ -55,9 +63,11 @@ def _get_gammatone_H_real_torch(N_fft: int, fs: float, cfs_tuple: tuple, norms_t
     conventions agree everywhere except the Nyquist bin, where `fftfreq` says -0.5 and
     `rfftfreq` says +0.5; that bin also reflects onto itself, so ``conj(H[-N/2])`` is
     ``conj(H[N/2])`` and the conjugate-grid formula does not apply there. It is set
-    directly instead. (Both matter more than they look: the frequency grid inherits
-    torch's default float32, so ``exp(-+ i*pi)`` carries an ~8.7e-8 imaginary residue
-    rather than ~1.2e-16, and the two signs differ by ~1e-7 relative.)
+    directly instead. (The convention still matters even though the grid is now built
+    in float64: on the old float32 grid ``exp(-+ i*pi)`` carried an ~8.7e-8 imaginary
+    residue and the two signs differed by ~1e-7 relative, which is exactly why the
+    ``dtype=`` on the ``fftfreq`` call below is load-bearing. In float64 the residue
+    is ~1.2e-16 and the two signs differ by ~2.4e-16 -- quieter, not gone.)
 
     Returns shape ``(num_bands, N_fft // 2 + 1)`` -- half the elements of
     `_get_gammatone_H_torch`'s full grid, agreeing with ``(H[k] + conj(H[-k])) / 2``
@@ -70,7 +80,10 @@ def _get_gammatone_H_real_torch(N_fft: int, fs: float, cfs_tuple: tuple, norms_t
     stronger property -- ``process_real`` uses this filter and never the reflection.
     """
     device = torch.device(device_str)
-    freqs_norm = torch.fft.fftfreq(N_fft, device=device)[:N_fft // 2 + 1]
+    # See `_get_gammatone_H_torch`: the explicit `dtype=` must stay. Still `fftfreq`'s
+    # first half rather than `rfftfreq`, so `forward` remains bit-for-bit the full
+    # grid's `H[k]` and the Nyquist-convention note above still applies.
+    freqs_norm = torch.fft.fftfreq(N_fft, dtype=torch.float64, device=device)[:N_fft // 2 + 1]
     z_inv = torch.exp(-2j * math.pi * freqs_norm)
 
     coefs = torch.tensor(coefs_tuple, dtype=torch.complex128, device=device).view(-1, 1)
@@ -110,7 +123,11 @@ def _get_synthesizer_params_torch(delay_sec: float, fs: float, cfs_tuple: tuple,
     N_fft = 2 ** math.ceil(math.log2(impulse.shape[-1] + pad_len))
 
     X = torch.fft.fft(impulse, n=N_fft)
-    freqs_norm = torch.fft.fftfreq(N_fft, device=device)
+    # Same default-dtype trap as `_get_gammatone_H_torch`; the explicit `dtype=` must
+    # stay. On the float32 grid this cost 5.8e-6 relative on `phase_factors` and
+    # 3.2e-6 on `gains` (the integer `delays` were unaffected -- the argmax below does
+    # not flip at that scale, checked at both 0.004 s and 0.016 s).
+    freqs_norm = torch.fft.fftfreq(N_fft, dtype=torch.float64, device=device)
     z_inv = torch.exp(-2j * math.pi * freqs_norm)
     denom = 1.0 - coefs.view(-1, 1) * z_inv.unsqueeze(0)
     denom_sq = denom * denom
