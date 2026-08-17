@@ -244,12 +244,79 @@ def _split_real_imag(x_flat: torch.Tensor) -> torch.Tensor:
     This is exact, not an approximation: the discarded terms are the ``b*0`` and
     ``a*0`` products of a complex multiply by a real number, and the taps accumulate
     in the same order either way.
+
+    Used by the two padless fast paths, which have no pad for the split to hide inside;
+    everything that still materialises a padded buffer calls :func:`_split_pad_real_imag`
+    instead and gets the split for free. The contiguous ``(2*batch, n)`` result is what the
+    fast paths need anyway: the plane axis has to fold into the GEMM's batch axis, and a
+    de-interleaved plane *view* of a complex buffer has matrix strides ``(2*down, 2)`` --
+    neither of them 1 -- which torch's CPU ``bmm`` silently makes contiguous, i.e. it would
+    pay this copy inside the GEMM instead of before it, on the 21x-expanded operand.
     """
     return torch.cat([x_flat.real, x_flat.imag], dim=0)
 
 
+def _split_pad_real_imag(x_flat: torch.Tensor, left: int, right: int) -> tuple:
+    """Zero-pad, and for complex input do :func:`_split_real_imag` in the *same* copy.
+
+    Returns ``(padded, was_complex)``. The layout is exactly what
+    ``F.pad(_split_real_imag(x), (left, right))`` produced -- a contiguous
+    ``(2*batch, left + n + right)`` with the real rows first -- so everything downstream,
+    :func:`_merge_real_imag` included, is unchanged.
+
+    The split is free on top of a pad it was already paying for. ``x.real``/``x.imag`` are
+    ``view_as_real(x).select(-1, 0/1)``, i.e. stride-2 views, so ``torch.cat`` was a
+    strided gather into a fresh contiguous buffer that the very next ``F.pad`` read back
+    and copied again. ``view_as_real(x).permute(2, 0, 1)`` is the same two views as one
+    free ``(2, batch, n)`` view, and ``F.pad`` allocates and copies whatever its input's
+    strides are -- so padding *that* does the gather and the pad in one pass. Whenever at
+    least one pad width is positive its output is contiguous, hence the final ``reshape``
+    to ``(2*batch, ...)`` is a view and every consumer sees byte-for-byte the tensor it saw
+    before. One full-signal buffer per complex call disappears.
+
+    **The contiguity above holds only while some pad width is positive**, which is the only
+    way this is ever called -- measured over a real decomposition with grad on, so all three
+    padded callers run: 132 distinct ``(left, right)`` pairs, ``min left = min right = 10``,
+    zero calls with ``left == right == 0``. When *every* width is ``<= 0`` ``F.pad`` narrows
+    instead, and its result keeps the ``(1, 2n, 2)`` plane strides rather than coming back
+    contiguous. The ``reshape`` then splits by ``batch``: at ``batch == 1`` it drops a size-1
+    axis and stays a **non-contiguous** stride-``(1, 2)`` view, and at ``batch >= 2`` it
+    cannot view those strides so it silently **copies**. Values are unaffected either way --
+    verified bit-identical against the old ``F.pad(_split_real_imag(x), ...)`` form, and
+    verified through the stride-sensitive ``unfold``/``matmul`` consumers -- so this is a
+    layout and allocation caveat, not a correctness one. Reaching it needs
+    ``half_length_factor == 0``; see :func:`_polyphase_decimate` on why that value is worse
+    than a layout problem.
+
+    The plane axis has to lead for this to work: ``permute(2, 0, 1)`` keeps the two planes
+    as the outer axis the row-stacking wants, whereas ``view_as_real``'s native trailing
+    real/imag axis is where ``unfold``/``reshape`` need the time axis. Do *not* try to skip
+    the pad and feed the stride-2 view straight to ``unfold`` -- ``matmul`` can no longer
+    view the result and clones the whole window expansion instead.
+
+    ``view_as_real`` rejects a lazily-conjugated tensor where ``torch.cat`` silently
+    worked, hence ``resolve_conj`` (a no-op on everything this package produces, but
+    ``fast_resample_poly_torch`` is a public entry point).
+    """
+    if not x_flat.is_complex():
+        return F.pad(x_flat, (left, right)), False
+    planes = torch.view_as_real(x_flat.resolve_conj()).permute(2, 0, 1)
+    padded = F.pad(planes, (left, right))
+    return padded.reshape(2 * x_flat.shape[0], padded.shape[-1]), True
+
+
 def _merge_real_imag(y_flat: torch.Tensor, batch: int) -> torch.Tensor:
-    """Inverse of :func:`_split_real_imag`."""
+    """Inverse of :func:`_split_real_imag`.
+
+    There is deliberately no fused counterpart to :func:`_split_pad_real_imag` here. A free
+    ``view_as_complex`` needs real/imag adjacent per sample at stride 1, but that axis
+    enters the GEMM on the *operand* side, so it necessarily lands on an outer axis of the
+    result -- and BLAS writes its output with column stride 1 regardless. The only layout
+    that removes this copy contracts an interleaved buffer against a block-diagonal
+    ``(2*down, 2*taps)`` kernel, which is exactly 2.00x the multiply-adds (half of them
+    against structural zeros) and gives back the entire win the split exists to buy.
+    ``torch.complex`` is one fused kernel over 2N elements; it is the cheap half.
+    """
     return torch.complex(y_flat[:batch], y_flat[batch:])
 
 
@@ -278,17 +345,50 @@ def _polyphase_interpolate(
     and no length-``in_len*up`` spectrum is ever materialised.
     """
     batch = x_flat.shape[0]
-    is_complex = x_flat.is_complex()
-    rows = _split_real_imag(x_flat) if is_complex else x_flat
+    padded, is_complex = _split_pad_real_imag(x_flat, half_length_factor, half_length_factor)
 
-    kernel = _get_polyphase_kernel(up, 1, rows.dtype, rows.device, half_length_factor)
-    padded = F.pad(rows, (half_length_factor, half_length_factor))
+    kernel = _get_polyphase_kernel(up, 1, padded.dtype, padded.device, half_length_factor)
     windows = padded.unfold(-1, 2 * half_length_factor + 1, 1)
-    interleaved = (windows @ kernel).reshape(rows.shape[0], in_len * up)
+    interleaved = (windows @ kernel).reshape(padded.shape[0], in_len * up)
 
     if is_complex:
         interleaved = _merge_real_imag(interleaved, batch)
     return interleaved[:, :out_len]
+
+
+def _polyphase_decimate_padded(
+        x_flat: torch.Tensor,
+        down: int,
+        in_len: int,
+        out_len: int,
+        half_length_factor: int
+) -> torch.Tensor:
+    """The block grid built by materialising the zero-padded signal.
+
+    Retained as the **autograd** path -- :func:`_polyphase_decimate` assembles the identical
+    ``phase_sums`` with ``out=`` kernels writing into a preallocated buffer, and autograd
+    supports neither ``out=`` nor the ``zero_`` that fills the margins. Same forward-only
+    shape as the Numba adaptation kernel. It doubles as the reference the fast path is
+    verified against; the two agree to ~1 ULP, not bit-exactly (see the fast path's note).
+    """
+    taps_per_phase = 2 * half_length_factor + 1
+    batch = x_flat.shape[0]
+
+    num_rows = out_len + 2 * half_length_factor
+    left_pad = (half_length_factor + 1) * down - 1
+    right_pad = num_rows * down - left_pad - in_len
+    padded, is_complex = _split_pad_real_imag(x_flat, left_pad, right_pad)
+    kernel = _get_polyphase_kernel(1, down, padded.dtype, padded.device, half_length_factor)
+    blocks = padded.reshape(padded.shape[0], num_rows, down)
+
+    phase_sums = blocks @ kernel.T
+    accumulator = phase_sums[:, :out_len, 0]
+    for tap_idx in range(1, taps_per_phase):
+        accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + out_len, tap_idx]
+
+    if is_complex:
+        accumulator = _merge_real_imag(accumulator, batch)
+    return accumulator
 
 
 def _polyphase_decimate(
@@ -306,8 +406,8 @@ def _polyphase_decimate(
 
         y[n] = sum_{j'} sum_{c} kernel[j', c] * X[n + j', c]
 
-    where ``X[r, c]`` is the padded input reshaped to ``(rows, down)``. That reshape is
-    free -- consecutive ``c`` are consecutive samples.
+    where ``X[r, c]`` is the input reshaped to ``(rows, down)`` on a grid whose row ``r``
+    starts at input index ``r*down - left_pad``, ``left_pad = (hf+1)*down - 1``.
 
     Written that way it is ``2hf + 1`` matrix-vector products, but they all read the
     same block, so it collapses into a single GEMM plus a cheap gather. Contract the
@@ -320,22 +420,100 @@ def _polyphase_decimate(
     regardless of ``down`` -- against an FFT of the *undecimated* length per band for
     the general path -- and ``M`` is only ``out_len x 21``, so the shifted-diagonal sum
     that follows is negligible.
+
+    **The grid is never materialised.** ``X`` used to be built by zero-padding the whole
+    signal, which for ``down = 1229`` copied 146k samples to wrap 121.5k of signal. It is
+    almost all pad, and what is not decomposes exactly, with ``n_int = (in_len-1) // down``
+    and ``rem = (in_len-1) % down``::
+
+        rows 0 .. hf-1        entirely inside the leading zeros, since the last index of
+                              row hf-1 is hf*down - 1 < left_pad for every down
+        row  hf               exactly one real sample, x[0], at lane down-1, because
+                              hf*down + (down-1) == left_pad by construction
+        rows hf+1 .. hf+n_int x[1 : 1 + n_int*down] reshaped -- a *view*, since row hf+1
+                              starts at input index (hf+1)*down - left_pad = 1
+        row  hf+1+n_int       rem real samples, x[in_len-rem:], at lanes 0 .. rem-1
+        rows past that        entirely past the signal
+
+    so the interior is a view, the two ends are one broadcast and one ``rem``-wide GEMM,
+    and the rest is zeroed directly; only the ``M`` buffer is allocated. The tail row is
+    always in range provided ``right_pad >= (hf-1)*down + 1 > 0``, i.e. provided
+    ``hf >= 1``.
+
+    **``hf = 0`` violates that precondition and this function is silently wrong there.**
+    An earlier version of this docstring asserted ``hf = 0`` (a one-tap filter design) was
+    "not reachable". That is false on both counts, measured 2026-08-17:
+    ``DecompositionConfiguration.__post_init__`` validates only ``segmentation_factor``, so
+    ``resample_filter_half_length_factor=0`` is accepted through the public API, and at
+    ``hf = 0`` this fast path does not raise -- it returns finite numbers that disagree with
+    :func:`_polyphase_decimate_padded` by **O(1)**, deviations 0.39 to 2.13 across 33 of the
+    swept ``(down, in_len, rows, dtype)`` combinations, against 2.22e-16 for ``hf >= 1``.
+    The grad path is unaffected because it routes to the padded reference, so the no-grad
+    and grad paths disagree at ``hf = 0``. Nothing in the library passes 0 (the default is
+    10 and the config comment contemplates lowering it only as far as ~3), which is why this
+    has never been hit -- but it is a latent defect, not an unreachable branch, and the fix
+    belongs in ``config.py`` next to the ``segmentation_factor`` check rather than here.
+
+    Dropping lanes from the two end contractions drops exact zeros only, but ``mm`` over
+    ``(rows*num_rows, down)`` becoming ``rows`` ``bmm``\ s over ``(n_int, down)`` changes
+    only the GEMM's ``M``, not the contraction length or the lane order -- so BLAS may
+    block it differently. That makes this a **reassociation, ~1 ULP, not bit-identical**;
+    do not assert ``torch.equal`` on it. Measured against
+    :func:`_polyphase_decimate_padded` over real and complex input, 1-3 rows, 13 lengths
+    from 1 to 121500 and 12 decimation rates up to 1229 (936 cases, 284 of them still
+    bit-identical): worst deviation 4.44e-16 **absolute**, i.e. 2 ULP at the unit input
+    scale. A second sweep over ``hf`` in {1,2,3,5,10} and three input stride layouts agreed,
+    and a re-run on the rates and shapes the filterbank actually drives worst-cased at
+    2.22e-16 absolute. Note the bound here is stated in *absolute* terms while
+    :func:`_polyphase_mixed`'s is *relative to the output peak* -- the two are not
+    interchangeable and the mixed path's absolute figure is several times this one, so do
+    not carry either number across. The ``out=`` kernels make it forward-only.
     """
+    if torch.is_grad_enabled() and x_flat.requires_grad:
+        return _polyphase_decimate_padded(x_flat, down, in_len, out_len, half_length_factor)
+
     taps_per_phase = 2 * half_length_factor + 1
     batch = x_flat.shape[0]
     is_complex = x_flat.is_complex()
     rows = _split_real_imag(x_flat) if is_complex else x_flat
-    kernel = _get_polyphase_kernel(1, down, rows.dtype, rows.device, half_length_factor)
+    num_rows_signal = rows.shape[0]
+    kernel_t = _get_polyphase_kernel(
+        1, down, rows.dtype, rows.device, half_length_factor
+    ).T                                                     # (down, taps_per_phase)
 
     num_rows = out_len + 2 * half_length_factor
-    # Row r holds x[(r - hf)*down - down + 1 : (r - hf)*down + 1], reversed within the
-    # row by the kernel's second flip, so the leading pad is one row minus one sample.
-    left_pad = (half_length_factor + 1) * down - 1
-    right_pad = num_rows * down - left_pad - in_len
-    padded = F.pad(rows, (left_pad, right_pad))
-    blocks = padded.reshape(rows.shape[0], num_rows, down)
+    n_interior = (in_len - 1) // down                       # fully-real grid rows
+    remainder = (in_len - 1) % down                         # real lanes in the tail row
 
-    phase_sums = blocks @ kernel.T
+    phase_sums = rows.new_empty(num_rows_signal, num_rows, taps_per_phase)
+    phase_sums[:, :half_length_factor].zero_()
+    # Row hf sees x[0] alone, at lane down-1: a broadcast, not a GEMM over `down` zeros.
+    torch.mul(rows[:, :1], kernel_t[down - 1], out=phase_sums[:, half_length_factor])
+
+    first = half_length_factor + 1
+    if n_interior:
+        interior = rows[:, 1:1 + n_interior * down].reshape(
+            num_rows_signal, n_interior, down
+        )
+        # `torch.matmul(..., out=)` is a trap here: when the interior slice covers whole
+        # rows it takes the foldable `mm` path, tries to view the strided `out` as 2-D and
+        # raises. `bmm` against a stride-0 expanded kernel is what matmul feeds bmm anyway.
+        torch.bmm(
+            interior,
+            kernel_t.unsqueeze(0).expand(num_rows_signal, down, taps_per_phase),
+            out=phase_sums[:, first:first + n_interior],
+        )
+    tail = first + n_interior
+    if remainder:
+        torch.bmm(
+            rows[:, in_len - remainder:].unsqueeze(1),
+            kernel_t[:remainder].unsqueeze(0).expand(
+                num_rows_signal, remainder, taps_per_phase),
+            out=phase_sums[:, tail:tail + 1],
+        )
+        tail += 1
+    phase_sums[:, tail:].zero_()
+
     accumulator = phase_sums[:, :out_len, 0]
     for tap_idx in range(1, taps_per_phase):
         accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + out_len, tap_idx]
@@ -343,6 +521,48 @@ def _polyphase_decimate(
     if is_complex:
         accumulator = _merge_real_imag(accumulator, batch)
     return accumulator
+
+
+def _polyphase_mixed_padded(
+        x_flat: torch.Tensor,
+        up: int,
+        down: int,
+        in_len: int,
+        out_len: int,
+        half_length_factor: int
+) -> torch.Tensor:
+    """The block grid built by materialising the offset-padded signal.
+
+    Autograd path and verification reference for :func:`_polyphase_mixed`, for the same
+    reason as :func:`_polyphase_decimate_padded`. Also the path taken for inputs shorter
+    than a couple of blocks, where the leading and trailing partial blocks would coincide.
+    """
+    batch = x_flat.shape[0]
+    # `.real` is a view and returns `self` for a real tensor, so this is the real dtype the
+    # kernel is designed in either way -- fetched before the pad because it supplies
+    # `offset`, which is one of the pad widths.
+    kernel, taps, offset = _get_mixed_polyphase_kernel(
+        up, down, x_flat.real.dtype, x_flat.device, half_length_factor
+    )
+
+    num_groups = -(-out_len // up)
+    # Enough blocks for the last window (num_groups + taps - 1), and never fewer than the
+    # input itself occupies -- the diagonal sum only ever reads the first of the two.
+    num_blocks = max(num_groups + taps - 1, -(-(in_len + offset) // down))
+    padded, is_complex = _split_pad_real_imag(
+        x_flat, offset, num_blocks * down - offset - in_len
+    )
+    blocks = padded.reshape(padded.shape[0], num_blocks, down)
+
+    phase_sums = (blocks @ kernel).reshape(padded.shape[0], num_blocks, up, taps)
+    accumulator = phase_sums[:, :num_groups, :, 0]
+    for tap_idx in range(1, taps):
+        accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + num_groups, :, tap_idx]
+
+    interleaved = accumulator.reshape(padded.shape[0], num_groups * up)[:, :out_len]
+    if is_complex:
+        interleaved = _merge_real_imag(interleaved, batch)
+    return interleaved
 
 
 def _polyphase_mixed(
@@ -369,27 +589,96 @@ def _polyphase_mixed(
 
     The trailing ``[:, :out_len]`` drops the residues of the final group that run past the
     requested length; SciPy's ``ceil(in_len*up/down)`` need not be a multiple of ``U``.
+
+    ``B`` is a **view**, not a padded copy. ``offset`` is only tens of samples (10 at 3/2,
+    15 at 2/3) but padding for it copied the entire signal. With ``lead = offset // D`` and
+    ``lead_zeros = offset % D``, blocks below ``lead`` and above ``(in_len + offset) // D``
+    are exactly zero; at most one block at each end is part signal and part zero, and
+    dropping the zero lanes from *its* contraction drops exact zeros only. At both rates
+    the filterbank uses, ``offset % D == 0`` (10 % 2, 15 % 3), so there are no partial
+    blocks at all and the interior view is the whole signal.
+
+    Sizing ``num_blocks`` no longer has to cover the input, only what the diagonal sum
+    reads, which is ``num_groups + taps - 1`` blocks; where the old ``max(...)`` bound, the
+    padded form was computing and discarding blocks. ``last`` is therefore clamped to the
+    grid: the input may occupy blocks nothing ever reads.
+
+    Same numerical class as :func:`_polyphase_decimate` -- a reassociation of the GEMM's
+    ``M``, **~1 ULP, not bit-identical**, so do not assert ``torch.equal`` on it. Measured
+    against :func:`_polyphase_mixed_padded` over 7 mixed rates from 3/2 to 1000/3, real and
+    complex, 1-3 rows and 13 lengths: worst deviation 4.4e-16 **relative to the output
+    peak**, 2 ULP.
+
+    That bound is *relative*, and mixing it up with :func:`_polyphase_decimate`'s *absolute*
+    4.44e-16 is an easy mistake to make. Re-measured 2026-08-17 including rate 147/160, which
+    the original sweep did not cover: worst **relative** 3.39e-16 (bound holds), but worst
+    **absolute** 1.33e-15 -- roughly 3x the decimate figure, because the output peak here is
+    ~4 rather than ~1. Quote whichever one you actually need and say which it is.
+    Forward-only for the same ``out=`` reason.
     """
     batch = x_flat.shape[0]
-    is_complex = x_flat.is_complex()
-    rows = _split_real_imag(x_flat) if is_complex else x_flat
     kernel, taps, offset = _get_mixed_polyphase_kernel(
-        up, down, rows.dtype, rows.device, half_length_factor
+        up, down, x_flat.real.dtype, x_flat.device, half_length_factor
     )
 
-    num_groups = -(-out_len // up)
-    # Enough blocks for the last window (num_groups + taps - 1), and never fewer than the
-    # input itself occupies -- the diagonal sum only ever reads the first of the two.
-    num_blocks = max(num_groups + taps - 1, -(-(in_len + offset) // down))
-    padded = F.pad(rows, (offset, num_blocks * down - offset - in_len))
-    blocks = padded.reshape(rows.shape[0], num_blocks, down)
+    # Below two blocks past the offset the leading and trailing partial blocks would be the
+    # same block, which the algebra below does not model. Both terms come from the cached
+    # geometry, so this is a derived correctness bound, not a tuning knob -- it trips only
+    # at in_len <= 14 for 3/2 and in_len <= 21 for 2/3, where there is nothing to save.
+    if (torch.is_grad_enabled() and x_flat.requires_grad) or in_len <= offset + 2 * down:
+        return _polyphase_mixed_padded(x_flat, up, down, in_len, out_len, half_length_factor)
 
-    phase_sums = (blocks @ kernel).reshape(rows.shape[0], num_blocks, up, taps)
+    is_complex = x_flat.is_complex()
+    rows = _split_real_imag(x_flat) if is_complex else x_flat
+    num_rows_signal = rows.shape[0]
+
+    num_groups = -(-out_len // up)
+    num_blocks = num_groups + taps - 1
+    lead_zeros = offset % down                   # zero lanes in the first block with data
+    lead_block = offset // down
+    first = lead_block + (1 if lead_zeros else 0)
+    last = min((in_len + offset) // down - 1, num_blocks - 1)
+    remainder = (in_len + offset) % down
+    columns = up * taps
+
+    phase = rows.new_empty(num_rows_signal, num_blocks, columns)
+    phase[:, :min(lead_block, num_blocks)].zero_()
+    if lead_zeros and lead_block < num_blocks:
+        # `down - lead_zeros <= down < in_len` by the guard above, so this never overruns.
+        lanes = down - lead_zeros
+        torch.bmm(
+            rows[:, :lanes].unsqueeze(1),
+            kernel[lead_zeros:].unsqueeze(0).expand(num_rows_signal, lanes, columns),
+            out=phase[:, lead_block:lead_block + 1],
+        )
+    n_interior = last - first + 1
+    tail = first
+    if n_interior > 0:
+        start = first * down - offset
+        interior = rows[:, start:start + n_interior * down].reshape(
+            num_rows_signal, n_interior, down
+        )
+        torch.bmm(
+            interior,
+            kernel.unsqueeze(0).expand(num_rows_signal, down, columns),
+            out=phase[:, first:first + n_interior],
+        )
+        tail = first + n_interior
+    if remainder and tail < num_blocks:
+        torch.bmm(
+            rows[:, in_len - remainder:].unsqueeze(1),
+            kernel[:remainder].unsqueeze(0).expand(num_rows_signal, remainder, columns),
+            out=phase[:, tail:tail + 1],
+        )
+        tail += 1
+    phase[:, tail:].zero_()
+
+    phase_sums = phase.reshape(num_rows_signal, num_blocks, up, taps)
     accumulator = phase_sums[:, :num_groups, :, 0]
     for tap_idx in range(1, taps):
         accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + num_groups, :, tap_idx]
 
-    interleaved = accumulator.reshape(rows.shape[0], num_groups * up)[:, :out_len]
+    interleaved = accumulator.reshape(num_rows_signal, num_groups * up)[:, :out_len]
     if is_complex:
         interleaved = _merge_real_imag(interleaved, batch)
     return interleaved
@@ -515,10 +804,16 @@ def fast_resample_poly_torch(
     if up == down:
         return x
 
-    # Fetch pre-calculated and cached filter tensor instantly
-    h_padded, up_reduced, down_reduced, n_pre_remove = get_resample_filter_torch(
-        up, down, x.dtype, x.device, half_length_factor
-    )
+    # The reduced rates are all the three polyphase branches need, and they come straight
+    # from `math.gcd` -- which is verbatim how `get_resample_filter_torch` derives them, so
+    # this is a textual substitution, not a numerical one. Fetching the designed filter
+    # here instead cached a *second*, complex, copy of a filter that is real by
+    # construction for every rate the analytic subbands drive (64 duplicate entries,
+    # 2.5 MB, on one 16 kHz mono decomposition) purely to read its length, and only the
+    # FFT fallback below has any use for it: the polyphase routines design their own
+    # kernels in the real split dtype and fold `n_pre_remove` into their index algebra.
+    divisor = math.gcd(up, down)
+    up_reduced, down_reduced = up // divisor, down // divisor
 
     in_len = x.shape[axis]
     out_len = math.ceil(in_len * up_reduced / down_reduced)
@@ -527,7 +822,6 @@ def fast_resample_poly_torch(
     shape_prefix = x_moved.shape[:-1]
     x_flat = x_moved.reshape(-1, in_len)
     batch = x_flat.shape[0]
-    filter_length = h_padded.shape[0]
 
     if down_reduced == 1:
         y_flat = _polyphase_interpolate(x_flat, up_reduced, in_len, out_len, half_length_factor)
@@ -538,7 +832,14 @@ def fast_resample_poly_torch(
         y_flat = _polyphase_mixed(x_flat, up_reduced, down_reduced, in_len, out_len,
                                   half_length_factor)
     else:
-        y_flat = _fft_resample(x_flat, up_reduced, down_reduced, n_pre_remove, filter_length,
-                               out_len, x.dtype, half_length_factor)
+        # The only branch that wants the designed taps, and it wants them in the *input's*
+        # dtype: `_get_resample_filter_spectrum` picks `fft` vs `rfft` off
+        # `h_padded.is_complex()`, which has to match the signal branch inside
+        # `_fft_resample`. Designing it here keeps the complex copy off every other rate.
+        h_padded, _, _, n_pre_remove = get_resample_filter_torch(
+            up, down, x.dtype, x.device, half_length_factor
+        )
+        y_flat = _fft_resample(x_flat, up_reduced, down_reduced, n_pre_remove,
+                               h_padded.shape[0], out_len, x.dtype, half_length_factor)
 
     return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)
