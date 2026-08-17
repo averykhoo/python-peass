@@ -84,6 +84,70 @@ implementation, plus dropping the `__post_init__` guard and its test.
 
 ## Closed investigations (do not reopen)
 
+### Five decomposition items settled by measurement, all declined (2026-08-15)
+
+From the second 2026-08-15 pass, the one that worked the **decomposition** path. Four of
+these were queued in `TODO.md`; one of them was that file's own "cheapest decisive next
+step". None of them survived contact with a measurement.
+
+- **Routing torch's no-grad CPU resampler at the numpy Numba kernels — DEAD, 0.461x.**
+  This was the most-anticipated item on the list, precedented on the adaptation
+  recurrence (2026-08-08, ~2.2-2.3x by exactly this trick), and `TODO.md` carried it for
+  three passes as a cheap measurement nobody had run. It has now been run, with
+  `benchmarks/ab.py` at the real filterbank rates. All 10 configurations `AGREE` under
+  swapping:
+
+  | route | mean ratio (>1 would mean Numba faster) | share of MACs |
+  | --- | --- | --- |
+  | interpolate | **0.348** | 56.4% |
+  | decimate | **0.801** | 42.3% |
+  | mixed (scipy) | 0.768 | 1.25% |
+
+  Weighted, routing torch at the Numba kernels projects to **0.461x — about 2.2x
+  slower**. Numerical agreement was verified *first* (worst 1.255e-15 relative), so this
+  is a pure speed verdict and not a correctness one. torch's polyphase GEMM is simply the
+  better kernel at these shapes; the one discouraging data point already on file (the
+  `ab.py` demo showing the Numba path at 0.57x against SciPy `upfirdn` at `up=2`) turned
+  out to be representative rather than an artefact of an unused rate. The adaptation-loop
+  precedent does not transfer, because that win was about removing *dispatch* from a
+  per-timestep recurrence, and the resampler has no dispatch problem.
+
+  Incidentally confirmed while tracing this: **zero calls reach `_fft_resample`** in the
+  real workload.
+
+- **Deleting `_fft_resample` — declined; the decision is KEEP AND DOCUMENT.** The premise
+  for deleting it was that nothing reaches it, and that premise is now independently
+  confirmed (above). It stays anyway, for two reasons that outweigh ~90 lines and one
+  `lru_cache`: it is the mixed-rate tests' only *independent* oracle, which is the
+  strongest check in that file, and `next_fast_fft_length` has to stay regardless because
+  `auditory_model.py` uses it. This was always a "decide and write down why" item rather
+  than a perf win; this is the decision.
+
+- **`.flip(-1)` → `.index_select(-1, ...)` in the least-squares assembly — attempted,
+  REFUTED, dropped.** It was claimed bit-identical. It is not. `src_unfold` has a
+  **second consumer** — `T_s_all = src_unfold.permute(...)` feeding `torch.matmul` — and
+  the two routes hand it different strides (`(2926, 22, 1, 2)` under `flip` against
+  `(2926, 22, 11, 1)` under `index_select`). `matmul` is not stride-invariant there, and
+  `proj_all` comes out different. The lesson is the reusable part: a change that is
+  bit-identical *at the site you changed* can still move the output through an aliasing
+  consumer you did not look at. Check every consumer of a view before calling a view
+  substitution exact. Note this also removes the dependency the queued LS-assembly 2(c)
+  item was written against — see `TODO.md`.
+
+- **LS assembly 2(a), flipping the solved weights instead of the Toeplitz block —
+  refuted.** The idea was that flipping the far smaller solved weights is a pure
+  permutation and therefore free and exact. It is not exact, because the flip does not
+  commute with the factorization: `chol(J G J) ≠ J chol(G) J`. Measured 4.475e-16 on the
+  weights, and 4.25e-15 / 2.64 on the projection.
+
+- **LS assembly 2(b), a batched Hermitian rank-k Gram — declined.** The Gram is Hermitian
+  PSD built with a full batched GEMM, so it does about 2x the necessary flops, and a
+  `herk` would halve them. There is no batched Hermitian rank-k in torch or in BLAS, so
+  taking it means a per-frame Python loop over up to 251 frames x 32 bands — reinstating
+  exactly the overhead the 2026-08-09 batching removed. Reasoned, not prototyped, and
+  judged a near-certain loss. This is the same conclusion the 2026-08-12 rejected list
+  reached for the identical opportunity in the numpy backend.
+
 ### Auditory-path optimisations that measured worse, and four method traps (2026-08-15)
 
 From the same pass as the wins in "The 2026-08-15 auditory-path pass". The two rejections
@@ -492,6 +556,466 @@ deviations from the MATLAB reference".
 ---
 
 ## Resolved
+
+### The 2026-08-17 verification pass — the gate run, the A/Bs run, two defects closed (2026-08-17)
+
+A pass that added no optimisation. Everything the 2026-08-15 decomposition pass left owing
+got measured or fixed: the ground-rule-2 gate, in-situ A/Bs for the three `utils.py` perf
+items, an adversarial re-verification of the three bit-identity claims, and two of the three
+outstanding test defects. Green at **606 passed, 24 skipped** — up from 603, because the
+gammatone fix adds three tests. `.scratch/` and `benchmarks/results/` are gitignored, so this
+entry is the durable copy of all of it.
+
+**All of the code is now committed**, on branch `perf/2026-08-12-decomposition` above base
+`e960c5e`, in five commits — which is why the 2026-08-15 entry below, written while the same
+work sat in the working tree, reads as though it is uncommitted:
+
+| commit | contents |
+| --- | --- |
+| `f847817` | the `1e-15` solver ridge + the analysis-modulation fold (`decomposition.py`, and its unit test) |
+| `6e0162d` | the float64 gammatone frequency grid |
+| `72992d9` | the three `utils.py` items (Kaiser dedup, padless polyphase, fused split/pad) |
+| `12f32ea` | §3(a) — the structural half-spectrum negative tests |
+| `cd80f01` | §3(b) — the four re-derived parity bars |
+
+Nothing is pushed. Note the split: the perf items and the correctness fixes are in separate
+commits, and the two test commits are separate again, so the near-exact `72992d9` can be
+reverted without taking the ridge with it.
+
+**The single most useful result is a method lesson about leave-one-out A/B, in §2. Read that
+one even if nothing else here is relevant.**
+
+#### 1. The ground-rule-2 gate — run, and the tree moved torch onto numpy
+
+`measure.py current` (80.4 s) then `compare.py baseline current`, against the frozen
+`e960c5e` capture. The capture was verified genuine before trusting it: `git_commit =
+e960c5e4fa…`, `git_dirty = False`.
+
+- **numpy: exactly zero movement** on every correlation, gain error and score. No numpy file
+  was touched, and the gate says so rather than being assumed to.
+- **torch: every one of the 8 component/channel correlations improved.** `compare.py`
+  reports worst correlation drop `+0.000e+00` — none.
+- Correlation deficits (`1-corr`) in `current`, against the per-component floors in
+  `test_matlab_regression.py`:
+
+  | component | ch0 / ch1 deficit | bar | margin |
+  | --- | --- | --- | --- |
+  | `true_target` | 4.3804e-08 / 4.3508e-08 | 1e-5 | 228x / 230x |
+  | `interference` | 6.9628e-08 / 7.3593e-08 | 1e-5 | 144x / 136x |
+  | `target_distortion` | 2.4818e-07 / 2.4307e-07 | 1e-5 | 40x / 41x |
+  | `artifacts` | 3.3107e-06 / 3.2732e-06 | 1e-4 | 30x / 31x |
+
+- Worst `|gain_error|` anywhere in `current`: **1.1717e-05** (numpy/`artifacts` ch0) against
+  the 1e-4 bar — 8.5x, exactly the value `_GAIN_TOLERANCE`'s comment was derived from.
+- **`compare.py`'s one flagged growth is convergence, not regression, and must be read that
+  way.** It reports "worst |gain error| growth +6.814e-07 (torch/`target_distortion` ch0)".
+  torch went -6.03e-07 → -1.2846e-06, and numpy's value *is* -1.2846e-06. The same holds for
+  all eight. A comparison tool that only knows "moved away from the reference" cannot tell
+  the two apart; a reader has to.
+- **The headline: the tree moved torch onto numpy.** Per-component torch↔numpy agreement:
+
+  | quantity | before | after |
+  | --- | --- | --- |
+  | correlation | 7.6e-12 … 4.6e-10 | 4.4e-16 … 1.7e-14 |
+  | gain error | 9.4e-08 … 6.8e-07 | 8.9e-16 … 7.9e-12 |
+  | scores | 5.9e-07 … 3.6e-04 | 3.1e-15 … 8.5e-10 |
+
+- Scores: numpy exactly zero movement; largest torch move **3.643e-04**
+  (`interference_perceptual_score`) against a 1.0 bar. Tightest score margin 687x
+  (`target_perceptual_score`, 0.0015 from its locked value).
+- Worst waveform deviation against the pre-edit capture: **6.144e-05** relative to own peak
+  (`matlabref_torch__artifacts`) — the component whose LS Gram min-eigenvalue is ~3.4e-10, so
+  a 1-ULP upstream perturbation arrives ~1e6 larger. It moved *toward* MATLAB.
+
+**This corrects a claim in the 2026-08-15 entry below, and the correction is the argument for
+the frozen-capture rule.** That entry says the ridge's blast radius is "all 8 scores move
+≤2.2e-7". The measured *cumulative* score move is **3.643e-04**, ~1600x larger. That is not
+a refutation of the ridge figure itself — the ridge was measured alone, and the float64
+grid's own score blast radius was never quoted — but **no per-change number in that entry
+predicted the observed cumulative move**. Per-change agent measurements do not compose into
+a cumulative one, which is exactly why ground rule 2 asks for a capture frozen before the
+whole series rather than a stack of per-change deltas. The entry below now carries the
+correction inline.
+
+**`compare.py`'s section-1 timings remain unquotable, and this run illustrates why**:
+`numpy_mono` read **0.936x** — an *untouched* backend appearing to slow by 6.4% — with
+19.9%/9.4% spreads within the run. Use `compare.py` for accuracy; use `ab.py` for speed.
+
+#### 2. In-situ A/B of the three `utils.py` perf items — and the leave-one-out trap
+
+`benchmarks/ab.py`, driver = a full torch decomposition of
+`tests/resources/database/exp01_*` through `benchmarks/measure.py`'s own `decompose()`.
+Machine idle. This closes the 2026-08-15 gap "no per-change in-situ A/B exists".
+
+The tree as a whole, current code against all three items reverted:
+
+| workload | ratio (>1 = current faster) | 95% CI | phases | verdict |
+| --- | --- | --- | --- | --- |
+| mono, 96 calls/phase | **1.0394x** | [1.0310, 1.0467] | 1.0368 / 1.0390 | AGREE |
+| stereo, 64 calls/phase | **1.0334x** | [1.0198, 1.0446] | 1.0387 / 1.0284 | AGREE |
+
+Attribution, each item turned on individually from an all-old baseline (mono, 96
+calls/phase):
+
+| item | ratio | 95% CI | verdict |
+| --- | --- | --- | --- |
+| fused split/pad | **1.0327x** | [1.0267, 1.0386] | resolved |
+| padless polyphase interior | **1.0230x** | [1.0153, 1.0365] | resolved |
+| Kaiser double-design dedup | 1.0053x | [0.9966, 1.0098] | **null** |
+
+**The method lesson, and it is the most reusable thing in this pass. Measured the other way
+round — removing ONE item from the otherwise-current tree — all three come back null.**
+Kaiser 1.0040x (48 calls/phase), padless 0.9912x (48), fused split/pad 1.0035x (96); every
+CI spans 1.0. Those three point estimates multiply to ~0.999, which flatly contradicts the
+1.0394x measured for the three together.
+
+The cause is overlap, not measurement error. Items 2 and 3 attack the **same copy**: the
+fused split/pad removes one full-signal copy per complex call inside the padded variants,
+and the padless interior removes the pad those variants were doing at all. In the current
+tree the fast decimate/mixed paths never call `_split_pad_real_imag`, so once either item is
+present the other has almost nothing left to save. **Each is sufficient; neither is
+individually necessary.** A leave-one-out A/B alone would have reported three duds and
+thrown away a real 3.9%.
+
+Generalise it: for overlapping optimisations, leave-one-out measures *marginal* value
+against an already-optimised baseline and can read ~0 for a change that matters. Measure
+from the un-optimised baseline too, and report both directions. Neither number is wrong —
+they answer different questions ("what would I lose by dropping this?" versus "what does
+this buy?") and the answers genuinely differ when two changes fight over the same cost.
+
+**The Kaiser dedup is a null on speed in both directions**, and it stands on its memory
+result — the 2.5 MB / 64 duplicate complex cache entries its own comment describes — not on
+speed. The same is true of the analysis-modulation fold, whose comment already says so. Two
+of the six 2026-08-15 changes are therefore memory items with no speed claim, and the
+archive should not be read as crediting them with any part of the 1.0394x.
+
+Numerical agreement was re-verified end to end before any timing: Kaiser **bit-identical**
+mono and stereo; fused split/pad **bit-identical** mono and stereo; padless 1.674e-16 mono /
+4.4801e-14 stereo (~1 ULP at the resampler, arriving amplified through the LS stage).
+
+#### 3. Two of the three outstanding defects, closed
+
+**(a) The blinded gammatone test — fixed, and the recorded diagnosis was half wrong.**
+
+`test_torch_gammatone_half_spectrum_filter_is_the_exact_reflection`. The `1e-13 * peak` bar
+did go blind to both traps it exists to catch (trap A `rfftfreq`'s +0.5 Nyquist instead of
+`fftfreq`'s first half: 2.446e-07 → 1.110e-16; trap B omitting
+`combined[:, -1] = forward[:, -1].real`: 1.486e-07 → 1.304e-16).
+
+**But `TODO.md` concluded the test "catches neither", and that was wrong.** Injecting each
+trap into the source and running the *unmodified* test: trap A passed — genuinely blind —
+and trap B **failed**, caught by the structural `assert torch.equal(half[:, -1].imag, 0)` a
+few lines below the bar, on 1.1796e-16 of residual Nyquist imaginary part. The *bar* was
+blind to trap B; the *test* never was. Only trap A was a real hole. The reusable half: when
+a tolerance is found to be blind, check the rest of the test before declaring the test
+blind — a structural assert next door may already be carrying it, and the review that
+measured the bar had measured only the bar.
+
+**And trap A could never have been closed by re-tuning the bar**, which is why the fix is
+structural. Under the Nyquist fixup the output at that bin is `Re(H(f_nyq))`, and
+`e^{i*pi} = e^{-i*pi} = -1` **exactly**. The two conventions are the same number in exact
+arithmetic: the grids differ by exactly 1.0 at that one bin, `torch.exp` of them differs by
+~2.4e-16 in the imaginary part, and `.real` then discards even that. **No scalar bar can
+separate a difference whose true value is zero.**
+
+Fixed with explicit negative tests: a monkeypatch spy asserting the grid comes from
+`fftfreq` at float64 with `rfftfreq` forbidden (the only thing that catches trap A at live
+precision), a Nyquist-fixup negative test, and a float32-grid convention test whose
+separation is 2.4e6x the bar. Mutation-proved in both directions. Suite 603 → 606 passed.
+The general lesson holds: prefer negative tests to a scalar bar, because a bar blinded once
+by an accuracy improvement will be blinded again by the next one.
+
+**(b) The four fragile tolerances — re-derived, tightened, and their units fixed.**
+
+| bar | old | measured 2026-08-17 | new bar | margin |
+| --- | --- | --- | --- | --- |
+| FFT-vs-IIR analyzer | atol 1e-6 | 6.3503e-15 | `1e-12 * peak(numpy)` | 114x |
+| mixer gains | atol 1e-6 | 4.6412e-12 | `1e-9 * peak(numpy)` | 247x |
+| synthesizer delay/phase | atol 5e-6 | 9.6811e-14 | `1e-12 * peak(numpy)` | 50x |
+| DC rejection | 1e-2 absolute | 5.0460e-3 | `dc_bias * 4e-3` (== 1e-2 exactly) | 1.98x, deliberately unmoved |
+| `_MAX_AUDITORY_REPRESENTATION_DEFICIT` | 1e-5 | 0.0 exactly | 1e-12 | resolution-limited |
+| auditory max-deviation (**new bar**) | never asserted | 6.0163e-10 | `1e-10 * peak(numpy)` | 257x |
+
+**The "re-measure after the solver ridge" worry recorded in `TODO.md` was unfounded, and
+that is worth keeping.** The three filterbank numbers reproduced the pre-ridge measurements
+exactly, because **none of those three sites runs the decomposition solver** — the ridge
+could never reach them. Trace the call path before scheduling a re-measurement; "this change
+moves tonal input and that fixture is tonal" is not enough to establish that a site is
+downstream of it. DC rejection did not move either: it is pure NumPy, untouched by this
+tree, and its change is an exact numerical no-op that only fixes the units. Liveness was
+proven by re-injecting the float32 grid: all four re-derived sites fail, by 725x to 3e6x,
+and the auditory deficit by 4258x.
+
+**The principle question raised in review is settled: never `rtol`.** One rule, stated once
+in the file header and applied at all four sites: `atol = k * max|reference|` with
+`rtol = 0.0`, where `reference` is always the **NumPy** array. The reason is mechanical —
+`assert_allclose` scales `rtol` by `desired`, its second positional argument, which at every
+call site in that file is the **torch** output. A literal `rtol` therefore lets the value
+under test set its own bar, exactly what the analyzer comment ~50 lines above argues
+against. Applied uniformly even at sites where an `rtol` would have been numerically safe,
+so the file carries one rule rather than three exceptions.
+
+The stale pre-ridge patch in the handoff was rejected outright in its **widening** direction
+(it loosened all three bars by 1.85-2.92x), as was its `_FILTERBANK_PARITY_RTOL = 3e-6`:
+with the float64 grid the noise floor fell 8 decades while the bug signature stayed ~1e-6,
+so 3e-6 would leave the bars vacuous *and* still blind to a float32 regression at the gains
+site.
+
+Found and refreshed while in the file: all seven correlation-deficit floors have collapsed
+to 0..6.7e-16 and its two measured tables were stale by 4-6 decades. The measured columns
+were refreshed; the seven *allowed* values were deliberately left alone as a separate
+change. A comment describing the pre-ridge onset transient as present was corrected —
+post-ridge those components measure 9.1e-6 / 5.5e-6 / 1.3e-3.
+
+**One open risk came out of (b) and it is recorded in `TODO.md` rather than closed here.**
+`_MAX_AUDITORY_REPRESENTATION_DEFICIT` was tightened 1e-5 → **1e-12** against a deviation
+that measures **exactly zero** on this machine. Headroom that cannot be measured is not
+headroom, and ground rule 3 exists because this repo has twice written a one-machine
+observation down as a universal invariant. It is mitigated — the new companion `1e-10 *
+peak` bar has a real 257x margin, and 1e-12 still catches the float32 regression by 4258x —
+but it runs on ubuntu-latest 3.10/3.12/3.14 and windows-latest 3.14 in CI, and it is the one
+number in this pass that is not margin-justified.
+
+**(c) The `hypothesis` oracle property suite is still not done** and stays in `TODO.md`.
+`hypothesis` is approved as a dev/test extra but is not installed, and the ~700-line patch
+is not applied; the five reviewed defects still need fixing as part of applying it. One
+decision was taken on 2026-08-17: the suite should be **opt-in only, with the three
+"nightly" claims deleted**, rather than wired into CI. Nothing reselects the marker today
+and a reference call is only ~1.1-1.5 s, so a local opt-in run is practical and a CI leg is
+not worth buying.
+
+#### 4. Adversarial verification of the three bit-identity claims
+
+Each claim was isolated by patching only the changed function, so the gammatone grid change
+and the solver ridge were present on both sides and cancel. Negative controls first: a 1-ULP
+perturbation injected inside each old shim is detected end to end, so no A/B here was
+vacuous.
+
+- **Kaiser double-design dedup: confirmed bit-identical.** 5962 cases (86 rates x 12 lengths
+  x 3 rows x 2 dtypes), plus 608 with the FFT fallback force-enabled, plus cold/warm/
+  post-eviction cache states, plus 56 degenerate cases. All four internal consumers of
+  `get_resample_filter_torch` re-derive their own filter, and there is **no
+  `cache_info`/`cache_clear` anywhere in the repo**, so cache-population order is
+  unobservable and the function is pure. One non-numerical deviation, unreachable:
+  `down == 0` now raises `ZeroDivisionError` from `math.ceil` instead of `ValueError` from
+  `firwin`.
+- **Analysis-modulation fold: confirmed bit-identical**, including `dL/dest` and every
+  `dL/dsrc`. `subbands_output` has **exactly three** consumers and the two besides the gather
+  read only `.shape`, *before* the removed multiply — so there is no second value consumer.
+  That was checked head-on precisely because the earlier `.flip(-1)` → `index_select` claim
+  was refuted for exactly that reason: a second consumer whose strides changed. One refuted
+  claim is worth a permanent checklist item.
+- **Fused split/merge: values confirmed bit-identical, the docstring's layout claim
+  refuted.** No value deviation across ~3200 micro + 2472 consumer + 96 negative-pad cases,
+  three full end-to-end decompositions and two end-to-end gradients. But the docstring's
+  absolute claim that "`F.pad`'s output is contiguous, hence the final `reshape` is a view
+  and every consumer sees byte-for-byte the tensor it saw before" is **false when every pad
+  width is ≤ 0**: `F.pad` narrows, keeps the `(1, 2n, 2)` plane strides, and the reshape is
+  then a non-contiguous stride-`(1,2)` view at `batch == 1` and a **silent copy** at
+  `batch >= 2` (30 of 360 geometries). Values are unaffected, verified through the
+  stride-sensitive `unfold`/`matmul` consumers. Unreachable in practice: 132 traced pad pairs
+  on a real decomposition with grad on give `min left = min right = 10`, and zero calls at
+  `left == right == 0`. The comment is now scoped rather than absolute.
+- **The padless ~1 ULP bounds hold, but the two docstrings stated them in different units.**
+  `_polyphase_decimate` says 4.44e-16 **absolute** (reproduced; 2.22e-16 on the rates the
+  filterbank actually drives). `_polyphase_mixed` says 4.4e-16 **relative to the output
+  peak** (holds — worst relative 3.39e-16) while its **absolute** deviation reaches 1.33e-15
+  at rate 147/160, a rate the original sweep did not cover. Two adjacent functions with
+  numerically similar bounds in different units is an easy way to carry the wrong number
+  across; both are now labelled.
+- Confirmed incidentally: **`_fft_resample` takes zero calls on the real workload.** Branch
+  counts on a 1 s decomposition — interpolate 512, decimate 257, mixed 25, FFT fallback 0.
+  Independent support for the existing "keep and document" decision.
+- Not covered: CPU only, no CUDA/MPS. Multi-band decimation groups never occur at any
+  reachable sampling rate (the groups are singletons in practice), so the fused gather's
+  multi-band path is only covered synthetically.
+
+#### 5. A new latent defect, found while correcting a comment
+
+**`resample_filter_half_length_factor = 0` is reachable and silently produces wrong
+output.** Carried into `TODO.md` as open work, with the fix recommended but deliberately not
+applied.
+
+`DecompositionConfiguration.__post_init__` (`peass/config.py`) validates **only**
+`segmentation_factor`, so `resample_filter_half_length_factor=0` is accepted through the
+public API. At `hf = 0` the fast `_polyphase_decimate` does **not** raise: it returns finite
+numbers that disagree with its own `_polyphase_decimate_padded` reference by **O(1)** —
+deviations **0.39 to 2.13** across 33 of the swept `(down, in_len, rows, dtype)`
+combinations, against 2.22e-16 for `hf >= 1`. The gradient path is unaffected because it
+routes to the padded reference, so **the no-grad and grad paths disagree at `hf = 0`**. Root
+cause: the fast path's grid algebra needs `right_pad >= (hf-1)*down + 1 > 0`, i.e.
+`hf >= 1`.
+
+**The docstring asserted `hf = 0` was "not reachable", and that was false on both counts** —
+it is reachable through the public API, and it is not merely unreachable-but-guarded, it is
+unguarded. The comment now states the measured truth. Nothing in the library passes 0
+(default 10; the config comment contemplates lowering only to ~3), so it has never been hit,
+which is why an unvalidated public field went unnoticed for as long as it did. Reusable:
+"nothing in the library passes that" is a statement about the library, not about the API, and
+a `__post_init__` that validates one field of several reads as though it validates all of
+them.
+
+#### 6. Comment corrections applied to `peass/backend_torch/utils.py`
+
+Applied to the source in this pass, listed here so the archive matches the code:
+`_split_pad_real_imag`'s contiguity claim is now scoped and the ≤0-pad corner documented;
+`_polyphase_decimate`'s bound is labelled **absolute** and its false "`hf = 0` is not
+reachable" replaced with the measured truth above; `_polyphase_mixed`'s bound is labelled
+**relative** with the 1.33e-15 absolute figure added. `TODO.md`'s trap-B claim was corrected
+in place.
+
+#### What this pass did not do
+
+**P5 was not started.** Three implementation attempts died on transient **API 529
+Overloaded** errors — a server-side capacity issue, unrelated to the work. The tree was
+verified byte-for-byte untouched after each failure (`peass/` at 86/29/330 changed lines, no
+untracked files) and no checkpoint was written, so P5 is exactly where 2026-08-15 left it,
+with both hard constraints intact (a true complex `zgemm`, not a widened real `dgemm`; exact
+`Fraction` phase range reduction — naive is 3.7e-11/4.4e-11, reduced ~7e-16).
+
+One thing changed that P5 planning must account for: the resampler path P5 touches has now
+been measured **1.0394x faster in situ** by §2, and ground rule 3's "kernel harnesses
+overstate" warning applies to P5's 1.351x/1.426x isolated-harness numbers. Expect less in
+situ.
+
+### The 2026-08-15 correctness and `utils.py` pass — a missing solver ridge, and five exact changes (2026-08-15)
+
+The second pass of 2026-08-15, on the **decomposition** path rather than the metric one.
+Six changes across `backend_torch/{decomposition,gammatone,utils}.py` and one test file.
+
+**Recorded here while still uncommitted**, which was a deliberate exception: the work was
+green (`603 passed, 24 skipped`, verified twice) but sat in the working tree at branch
+`perf/2026-08-12-decomposition` on base `e960c5e`. **It was committed on 2026-08-17** as
+`f847817` / `6e0162d` / `72992d9`; see the 2026-08-17 entry above for the mapping. The
+accuracy numbers below are
+per-change agent measurements, not capture comparisons. The blow-by-blow, the patches and
+the harnesses are in `.scratch/handoff-2026-08-15/`, which is gitignored, so this entry is
+the durable copy.
+
+**Amended 2026-08-17: the ground-rule-2 gate has now been run, and it passed.** When this
+entry was written the gate (`measure.py current` + `compare.py baseline current` against the
+frozen `e960c5e` capture) was outstanding, and the entry said so. It was run on 2026-08-17:
+numpy exactly zero movement, **every one of torch's 8 component/channel correlations
+improved**, worst correlation drop `+0.000e+00`, every correlation deficit and gain error 30x
+to 230x inside its bar, and torch↔numpy agreement tightened from 7.6e-12…4.6e-10 to
+4.4e-16…1.7e-14 on correlation. See "The 2026-08-17 verification pass" above for the full
+tables — including why the one growth `compare.py` flags is convergence onto numpy rather
+than a regression.
+
+**The headline is a correctness fix, and the thing it fixed had been misdiagnosed here
+for a pass.** torch's `_solve_hermitian_batch` omitted the `1e-15` diagonal ridge that
+MATLAB PEASS v2.0.1's `LSDecompose.m` applies ("useful when a sequence of zeroes occurs in
+sources s"), which `reference/LSDecompose.py` transcribes and `backend_numpy` mirrors.
+torch was the only backend without it. Against the independent oracle
+`reference/LSDecompose_tv.py`, numpy was 1.3e-11..2.4e-3 off and torch was off by up to
+**2.5e3** — torch was simply wrong on rank-deficient input. On the tonal
+`baseline_signals` fixture, torch-vs-numpy correlation:
+
+| component | before | after |
+| --- | --- | --- |
+| `target_distortion` | 0.016490 | 0.999991 |
+| `interference` | 0.016452 | 0.999995 |
+| `artifacts` | 0.966525 | 0.998739 |
+
+torch's peak drops from 3.90e2 to 1.559, against numpy's 1.556. Blast radius on the
+MATLAB reference clip is small: `true_target` bit-identical, the other three components
+move ≤5.9e-8 of peak mono and 3.5e-7 stereo, gold-WAV correlation moves ≤3.0e-12, and all
+8 scores move ≤2.2e-7 against 1.0/0.5 tolerances.
+
+> **Corrected 2026-08-17: that ≤2.2e-7 figure does not describe the tree.** The gate
+> measures the *cumulative* largest torch score move at **3.643e-04**
+> (`interference_perceptual_score`) against a 1.0 bar — ~1600x larger, and still 2700x
+> inside the bar. The ridge figure itself is not refuted; it was measured with the ridge
+> alone, and the float64 grid's own score blast radius was never quoted anywhere. What is
+> refuted is the implicit arithmetic: **no per-change number in this entry predicted the
+> observed cumulative move.** Per-change deltas do not compose, which is the whole reason
+> ground rule 2 asks for one capture frozen before the series instead of a stack of
+> per-change comparisons. Also worth having: the worst waveform move against the capture is
+> 6.144e-05 of peak on `artifacts`, whose Gram min-eigenvalue is ~3.4e-10 — a 1-ULP upstream
+> perturbation arrives ~1e6 larger there — and it moved *toward* MATLAB.
+
+This reverses the "deliberately not
+copied" decision recorded under "Decomposition: torch ~2.2x, numpy ~1.47x"; that entry
+now carries a dated correction explaining why its eigenvalue argument did not reach the
+output.
+
+**`TODO.md`'s diagnosis of this was wrong in a specific and instructive way, and that is
+worth keeping.** It was carried as a *filter/solver warm-up on short input* — "most likely
+a filter/solver warm-up at the very start of the signal that the 5 s reference clip
+dilutes to nothing" — on the evidence that the transient sat in the first ~60 samples of a
+synthetic clip and that the same components measured 1e-11 parity on the MATLAB gold WAVs.
+Both observations were real; the inference was not. The divergence covered the whole clip
+and **grew with length**; the reference clip hid it because it is not rank-deficient, not
+because it is long. The reusable form: "it only shows up on short input" and "it is a
+transient at the start" are the same observation twice, and neither is evidence of a
+warm-up. Reaching for the independent oracle — which existed by then — settled in one run
+what two passes of reasoning from symptoms did not.
+
+Its unit test was rebuilt alongside, because the ridge makes a zero Gram factorize and the
+old fixture asserted something the assembly cannot produce: it paired a zero `gram` with an
+**independent** random `rhs`. The fixture is now coupled the way the real assembly is
+(`gram = T^H diag(w²) T`, `rhs = T^H diag(w²) est`), so `T == 0` forces `rhs == 0`. A
+fixture that constructs a state its caller cannot reach tests the solver against a
+contract nobody has.
+
+**The other five changes, all on the torch decomposition path:**
+
+- **float32 → float64 gammatone frequency grid** (`gammatone.py`, three sites). An
+  accuracy improvement: `torch.fft.fftfreq(N_fft, device=device)` inherited torch's
+  *default* dtype, so the cached filter was built on a float32 grid. Pre-existing, not
+  introduced by any recent pass.
+- **Kaiser double-design dedup** (`utils.py`) — **bit-identical**, `torch.equal` over 46
+  rate sweeps. Complex input was causing a complex copy of the filter to be designed and
+  cached per rate, used only for two scalars that the FFT fallback needs.
+- **Padless polyphase interior** (`utils.py`) — **~1 ULP**, worst 1.94e-16 over a wide
+  sweep. `F.pad` was copying the whole signal to give `unfold` a small margin at each end;
+  the interior region needs no pad and only the edge samples are handled separately.
+- **Fused complex real/imag round trip** (`_split_real_imag` / `_merge_real_imag`,
+  `utils.py`) — **bit-identical**, `torch.equal` over 96 cases.
+- **The analysis modulation folded into the band gather** (`decomposition.py`) —
+  **bit-identical**, `torch.equal` on all four components plus `dL/dinput`, mono and
+  stereo. Taken **only** for the ~61 MB mono / ~123 MB stereo temporary it removes; it
+  remains a measured speed dud and the comment at the site says so.
+
+**`TODO.md` predicted the real/imag round trip would not pay, and named a specific
+blocker; both were wrong.** It was carried at "confidence it pays: low" with the reasoning
+that `view_as_real` puts the real/imag axis last, which is exactly where `unfold` needs the
+time axis, so the permute forces the copy straight back. That reasoning about
+`view_as_real` is still correct — and irrelevant, because the route that landed does not
+use `view_as_real` at all. A confidence rating attached to *one* implementation of an idea
+is not a confidence rating on the idea. This is the second wrong prediction in this pass
+and the archive keeps both on purpose: the entries that record what the list *believed* are
+the ones that stop the same reasoning being trusted twice.
+
+**Two things this pass created rather than closed** — both were carried into `TODO.md` under
+"outstanding defects", and **both were fixed on 2026-08-17**; see that entry above for the
+re-derived bars, the structural negative tests that replaced the blinded one, and the two
+ways this paragraph's own diagnosis turned out to be wrong. The float64 grid made the correct path orders of magnitude more
+accurate, and in doing so it **blinded**
+`test_torch_gammatone_half_spectrum_filter_is_the_exact_reflection` — the two traps that
+test exists to catch went from 2.446e-07 and 1.486e-07 CAUGHT to 1.110e-16 and 1.304e-16
+MISSED, both now ~800x *under* its `1e-13 * peak` bar. And it slackened **three** of the
+four "fragile" tolerances by five to eight orders of magnitude, which means they now need
+re-deriving in the **tightening** direction, the opposite of what `TODO.md` predicted.
+(The fourth, the DC-rejection assert in `test_numpy_gammatone.py`, is a NumPy-backend test
+that a change to the *torch* frequency grid cannot reach; it is unmoved at 5.05e-3 against
+1e-2. Worth stating precisely, because "all four moved" would imply a coupling that does
+not exist.) Generalizable, and
+this is the third entry in this file to say something adjacent: **an accuracy improvement
+can invalidate a test without failing it.** A scalar tolerance separates right from wrong
+only while the distance between them is what it was when the bar was set.
+
+**No in-situ speedup number exists for any of this** — at the time of writing. The three
+`utils.py` items are perf items and none of them had been through `benchmarks/ab.py` driving
+a real entry point, so ground rule 3 forbade quoting a figure for them.
+
+**Amended 2026-08-17: it does now, and the attribution is not what a leave-one-out A/B would
+have said.** The three together measure **1.0394x** mono [1.0310, 1.0467] and **1.0334x**
+stereo [1.0198, 1.0446], both AGREE. Turned on individually from an all-old baseline: fused
+split/pad 1.0327x, padless interior 1.0230x, Kaiser dedup 1.0053x (null). Removed
+individually from the current tree, **all three read null** — the two real items overlap on
+the same copy, so each is sufficient and neither is necessary. Full numbers and the method
+lesson are in "The 2026-08-17 verification pass" above.
 
 ### The 2026-08-15 auditory-path pass — metric 1.75x, pipeline 1.24x (2026-08-15)
 
@@ -1039,6 +1563,24 @@ and poison the autograd graph even though the values are discarded.
 
 The numpy backend's 1e-15 diagonal regularization was deliberately *not* copied: against
 a minimum eigenvalue of ~3.4e-10 it is a ~3e-6 relative perturbation.
+
+**Amended 2026-08-15 — that decision is REVERSED, and the reasoning behind it was aimed
+at the wrong quantity.** The ridge is now applied in `_solve_hermitian_batch`, matching
+MATLAB `LSDecompose.m`, `reference/LSDecompose.py` and the numpy backend. The
+"~3e-6 relative perturbation against a ~3.4e-10 minimum eigenvalue" argument is about the
+**weights** the solve returns, and it is correct about them — but it never reached the
+**output**, which is what the caller uses, and on rank-deficient input the output without
+the ridge is not perturbed, it is wrong. Against the independent oracle
+`reference/LSDecompose_tv.py`, numpy was 1.3e-11..2.4e-3 off and torch was off by up to
+**2.5e3**. Correlation against numpy on the tonal `baseline_signals` fixture was **0.0165**
+on `target_distortion` and `interference`. MATLAB's own comment says what the ridge is for
+— "useful when a sequence of zeroes occurs in sources s" — and that is exactly the case
+the eigenvalue argument does not cover, because a zero Gram has no minimum eigenvalue to
+argue from. The cost of omitting it was correctness on rank-deficient input; the cost of
+including it, measured on the MATLAB clip, is ≤5.9e-8 of peak. See "The 2026-08-15
+correctness and `utils.py` pass" under Resolved for the full blast radius. The general
+lesson: an error bound on an intermediate is not an error bound on the result, and a
+deviation argued in eigenvalues does not transfer to a case where the matrix is singular.
 
 **numpy — vectorizable resampler kernels** (`backend_numpy/gammatone.py`). The decimate
 kernel's tap loop became `np.dot` on contiguous float64, which numba lowers to `ddot`

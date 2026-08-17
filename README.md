@@ -273,7 +273,9 @@ backend for tensor inputs (selected automatically by input type). The NumPy
 backend is the numerical reference and matches the MATLAB toolbox very closely
 (cross-correlation > 0.999 with the default full-order resampling; lower
 `DecompositionConfiguration.resample_filter_half_length_factor` from `10` toward
-`3` to trade a little fidelity for ~25% faster decomposition). The PyTorch backend is designed to be **fully
+`3` to trade a little fidelity for ~25% faster decomposition — **do not set it below `1`**;
+`0` is currently accepted and silently produces wrong output on the torch fast path, measured
+2026-08-17 and tracked in `TODO.md`). The PyTorch backend is designed to be **fully
 differentiable** (usable inside a training loop): it replaces the hard
 non-linearities and IIR recursions of the reference with smooth, backprop-safe
 surrogates (softplus, FIR-truncated filters). As a result its outputs match the
@@ -324,8 +326,22 @@ correlation against the MATLAB gold WAVs is unchanged to 13 decimals (worst delt
   `torch.linalg.pinv`.** The Gram matrix is Hermitian positive-semidefinite by
   construction and pinv's cutoff never truncated anything, so the SVD was an expensive
   way to solve a linear system. `cholesky_ex` reports failure per matrix, which gives
-  the same graceful handling of rank-deficient and silent frames that motivated pinv —
-  those frames fall back to it, and agree with the old path to 1.7e-16.
+  the same graceful handling of rank-deficient frames that motivated pinv — those frames
+  fall back to it, so a genuinely singular frame still resolves to a minimum-norm
+  solution.
+
+  As of 2026-08-15 the solve also applies MATLAB PEASS v2.0.1's own `1e-15` diagonal
+  ridge (`lambda` in `LSDecompose.m`, "useful when a sequence of zeroes occurs in
+  sources s"), which the NumPy backend and `reference/` always had and torch did not.
+  That changes what happens on **silent** frames specifically: a silent frame's Gram is
+  identically zero, `1e-15 * I` is positive definite, so `cholesky_ex` now succeeds on it
+  instead of routing it to pinv. The two agree, because `gram` and `rhs` are assembled
+  from the same Toeplitz factor — a zero factor forces `rhs` to be exactly zero, and the
+  ridged solve returns bitwise-zero weights, which is what `pinv(0) @ 0` and MATLAB both
+  give. Without the ridge, torch was wrong rather than merely different on rank-deficient
+  input: against `reference/LSDecompose_tv.py` it was off by up to 2.5e3, and on a tonal
+  two-source fixture its `target_distortion` and `interference` correlated with NumPy at
+  0.0165. See `ARCHIVE.md` for the full blast radius on the reference clip.
 
 - **The synthesis chain is one shift-accumulate rather than five passes** (2026-08-12).
   `GammatoneSynthesizerTorch.process` used to modulate, phase-align and take `.real`,
@@ -338,6 +354,49 @@ correlation against the MATLAB gold WAVs is unchanged to 13 decimals (worst delt
   +0.4 MB / +3.5 MB. Worth 2.6x on the chain and ~1.15-1.18x end-to-end; deviation
   8.0e-16 of each component's peak, from reassociating the phase multiply and summing
   the 32 bands in a different order than `einsum` did. Gradients are bit-identical.
+
+A further pass on 2026-08-15 worked the same path. One of its changes is a correctness
+fix and two of them move the output; the rest are exact. Each class below was
+re-verified adversarially on 2026-08-17 — each bit-identity claim isolated by patching only
+the changed function, with a 1-ULP perturbation injected into the old code first as a
+negative control, so none of the comparisons was vacuous:
+
+| change (2026-08-15) | class, verified 2026-08-17 | verified by |
+| --- | --- | --- |
+| MATLAB's `1e-15` diagonal ridge added to the per-frame solve | correctness fix; moves output | gold-WAV correlation *improved* on all 8 component/channel pairs; see the cumulative figures below |
+| gammatone frequency grid built at `float64` instead of torch's default `float32` | accuracy improvement; moves output | see below |
+| complex input no longer designs the Kaiser filter twice per rate | **bit-identical** | 5962 cases (86 rates x 12 lengths x 3 rows x 2 dtypes), plus 608 with the FFT fallback forced, plus cold/warm/post-eviction cache states and 56 degenerate cases |
+| polyphase interior runs padless instead of copying the whole signal | ~1 ULP | 4.44e-16 **absolute** at `_polyphase_decimate` (2.22e-16 on the rates the filterbank drives); 1.33e-15 absolute / 3.39e-16 relative at `_polyphase_mixed`; end to end 1.674e-16 mono / 4.4801e-14 stereo |
+| fused complex real/imag split and merge | **bit-identical** | ~3200 micro + 2472 consumer + 96 negative-pad cases, three full decompositions and two end-to-end gradients |
+| analysis modulation folded into the band gather | **bit-identical** | `torch.equal` on all four components, `dL/dest` and every `dL/dsrc`, mono and stereo |
+
+**Corrected 2026-08-17, two of the numbers this table used to carry.** The ridge row said
+"≤5.9e-8 of peak mono, 3.5e-7 stereo on the reference clip; gold-WAV correlation moves
+≤3.0e-12". Those were per-change measurements and they do not describe the pass. Against a
+capture frozen before any edit, the *cumulative* worst waveform move is **6.144e-05** of peak
+(on `artifacts`, whose least-squares Gram has a ~3.4e-10 minimum eigenvalue, so a 1-ULP
+upstream perturbation arrives ~1e6 larger) and the largest score move is **3.643e-04**
+against a 1.0 tolerance — ~1600x larger than the ≤2.2e-7 the archive entry implied. Every
+one of the eight correlations moved *toward* MATLAB, and torch↔numpy agreement tightened from
+7.6e-12…4.6e-10 to 4.4e-16…1.7e-14. The padless row said "worst 1.94e-16 over a wide sweep",
+which understated it and mixed units: the two functions state their bounds in *different*
+units, absolute at `_polyphase_decimate` and relative at `_polyphase_mixed`, and the mixed
+path reaches 1.33e-15 absolute at rate 147/160 — a rate the original sweep did not cover.
+
+**Speed, measured in situ on 2026-08-17.** The three `utils.py` items (Kaiser dedup, padless
+interior, fused split/merge) measure **1.0394x** together on a full torch mono decomposition,
+95% CI [1.0310, 1.0467], and **1.0334x** stereo [1.0198, 1.0446] — both AGREE under phase
+swapping. That is the only speed claim this pass supports, and it is a claim about the three
+together: measured individually from an all-old baseline they read 1.0327x (fused split/pad),
+1.0230x (padless) and 1.0053x (Kaiser, null), while measured by removing one at a time from
+the finished tree **all three read null**, every CI spanning 1.0. The two real items overlap
+on the same full-signal copy, so each is sufficient and neither is necessary. See
+`ARCHIVE.md` before quoting a per-item figure.
+
+Two of the six are memory changes with no speed claim at all: the analysis-modulation fold
+removes a ~61 MB mono / ~123 MB stereo temporary and measures flat on the clock, and the
+Kaiser dedup is a speed null in both A/B directions, standing on the 2.5 MB of duplicate
+complex cache entries it removes.
 
 Note that `GammatoneAnalyzerTorch.process` and `.process_real` chunk their batch to
 bound the frequency-domain intermediates. That is a memory bound, not a speedup; it
@@ -407,6 +466,19 @@ do is the durable part.) These are roundoff on a 0-100 scale, but they are a dif
 where there was none, so installing or removing the optional `numba` extra no longer
 guarantees the last digits of a score are untouched.
 
+**Read that table as an illustration, not as a current measurement.** It was taken before
+the 2026-08-15 decomposition pass, which moved torch numerics in three separate places
+(the solver ridge, the `float64` frequency grid, the ~1 ULP padless polyphase), so which
+three of the eight scores differ has very likely changed again. It has not been
+re-measured. The durable claim is the one above and it is unaffected: *some* scores
+differ, by ~1e-9 or less. Do not treat the specific field set as a contract, here or in a
+test.
+
+Still not re-measured as of 2026-08-17. The verification pass that day ran the frozen-capture
+gate, which compares the tree against itself before the edits — it says nothing about
+Numba-present versus Numba-absent, so this table stays flagged stale rather than being
+edited.
+
 Callers on CUDA/MPS, callers that need a gradient, and installs without Numba fall back
 to the torch functions, which are unchanged; training is unaffected, because the
 differentiable path was never touched. **`float32` callers do not fall back**, despite
@@ -437,12 +509,19 @@ needs the analytic subbands. This is a second method rather than a flag on the f
 
 The identity is exact, but the evaluation is not bit-identical — `rfft`/`irfft` sum the
 same terms in a different order, at the ULP level. Two details are easy to get wrong and
-invisible under `allclose`, so `tests/unit/backend_torch/test_torch_gammatone.py`
-asserts the half filter is *bit-for-bit* the fold of the full one: the frequency grid
-inherits torch's default float32, so `exp(∓iπ)` carries an ~8.7e-8 imaginary residue
-and `fftfreq`'s Nyquist convention (−0.5) disagrees with `rfftfreq`'s (+0.5) by ~1e-7
-relative; and the Nyquist bin reflects onto itself, so the conjugate-grid formula does
+invisible under `allclose`, and `tests/unit/backend_torch/test_torch_gammatone.py` exists
+to catch them: `fftfreq`'s Nyquist convention (−0.5) disagrees with `rfftfreq`'s (+0.5),
+so the half filter must be built on the first half of the *full* grid rather than on
+`rfftfreq`; and the Nyquist bin reflects onto itself, so the conjugate-grid formula does
 not apply there and it is set directly.
+
+Both details used to be worth ~1e-7 in that bin, because the frequency grid inherited
+torch's default `float32` and `exp(∓iπ)` on it carried an ~8.7e-8 imaginary residue. As
+of 2026-08-15 the grid is built at `float64` explicitly, which removes that term: getting
+either detail wrong now costs ~1e-16 rather than ~1e-7. That is an accuracy improvement
+with a consequence — the test's scalar bar no longer separates the right construction
+from the two wrong ones, and replacing it with explicit negative tests is tracked in
+`TODO.md`.
 
 Taken together with the kernel fusion above, and measured as a pair against both
 changes turned off — `calculate_auditory_quality_features` **1.7466x, 95% CI [1.6608,
@@ -573,8 +652,16 @@ The amplification is also strongly *configuration*-dependent. The larger figures
 to the multi-source stereo case, where the sensitivity comes from *correlated sources* —
 six correlated Toeplitz columns — rather than from any frame being intrinsically
 ill-conditioned. Keep ~1e-10 as the floor to design against for multi-source stereo, but
-expect ~1e-15 on simple mono material, and do not reach for the `1e-15` diagonal
-regularization as though every frame needed it.
+expect ~1e-15 on simple mono material.
+
+**Corrected 2026-08-15.** This passage used to close by advising against reaching "for the
+`1e-15` diagonal regularization as though every frame needed it". That advice was wrong,
+and the conditioning statistics above are why it looked right: they describe the frames
+that are *well* conditioned, and the ridge exists for the ones that are not. It is MATLAB
+PEASS v2.0.1's own `lambda` in `LSDecompose.m`, transcribed in `reference/LSDecompose.py`
+and present in the NumPy backend all along; the torch backend was the only one without it,
+and on rank-deficient input that cost real correctness rather than a rounding digit. See
+`ARCHIVE.md`, "The 2026-08-15 correctness and `utils.py` pass".
 
 ### Parallel Execution
 
