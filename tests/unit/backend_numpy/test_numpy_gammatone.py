@@ -492,9 +492,39 @@ def test_filterbank_dc_offset_rejection():
 
     subbands = np.real(analyzer.process(signal_with_dc))
 
-    # All subband outputs must have DC offset rejected (attenuation > 50 dB)
+    # Every subband must reject the constant input. The residual is *proportional to
+    # dc_bias*: measured 2026-08-17, |mean|/dc_bias is 2.018e-03 at the worst band
+    # (band 0, cf 236.3 Hz) and constant to four significant figures across dc_bias
+    # 0.25, 2.5, 25 and 250. So the bar is a fraction of the bias, not a bare absolute
+    # number that would silently re-tune itself the day the bias above is changed.
+    #
+    # `4e-3` of the bias reproduces the previous literal `1e-2` *exactly* at
+    # dc_bias=2.5 (2.5 * 4e-3 == 1e-2 is true in binary floating point, checked), so
+    # this is a units fix and nothing else: the bar has not moved in either direction
+    # and the margin stays 1.98x against the measured 2.018e-03.
+    #
+    # That 1.98x is thin by the standards of the cross-backend parity tests, and it is
+    # deliberately NOT widened to their ~30x. Those bars bound float64 arithmetic noise
+    # whose size varies with the platform's FFT/LAPACK/libm; this one bounds a
+    # deterministic property of one filterbank, computed by one backend, with no RNG and
+    # no resampling in the path -- there is nothing here for another platform to move by
+    # more than a few ULP. Widening it 30x would take the bar to 6e-2 of the bias, i.e.
+    # 24 dB of attenuation, which no longer asserts DC rejection at all.
+    #
+    # NOTE the comment that used to be here claimed "attenuation > 50 dB", which the
+    # code never asserted: 4e-3 of the bias is 47.96 dB, and a genuine 50 dB bar would
+    # be 3.162e-3 -- *tighter* than what was there. The worst band measures 53.90 dB.
+    # Making the 50 dB claim true would leave 1.57x of margin and is a separate,
+    # deliberate call, not a drive-by.
+    max_leakage = dc_bias * 4e-3
     for band_idx in range(subbands.shape[0]):
-        assert np.abs(np.mean(subbands[band_idx, :])) < 1e-2
+        leakage = float(np.abs(np.mean(subbands[band_idx, :])))
+        assert leakage < max_leakage, (
+            f"Band {band_idx} (cf {analyzer.center_frequencies[band_idx]:.1f} Hz) leaks "
+            f"{leakage:.3e} of a {dc_bias} DC bias, above the {max_leakage:.3e} bar "
+            f"({20 * np.log10(dc_bias / leakage):.2f} dB of attenuation, "
+            f"{20 * np.log10(1.0 / 4e-3):.2f} dB required)"
+        )
 
 
 @pytest.mark.unit
