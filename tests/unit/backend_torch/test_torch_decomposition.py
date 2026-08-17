@@ -106,36 +106,67 @@ def test_torch_shade_window_matches_numpy_backend():
 
 
 @pytest.mark.unit
-def test_synthesis_alignment_matrix_is_keyed_on_the_delay():
+def test_synthesis_per_band_constants_are_keyed_on_what_they_depend_on():
     """
-    `_get_synthesis_alignment_matrix_torch` caches `modulation * phase_factors`, and the
-    phase factors depend on the synthesizer delay while the modulation does not. Keying
-    the cache on the modulation's arguments alone would hand a matrix built for one delay
-    to a call that asked for another -- a silent, delay-dependent corruption of every
-    reconstruction that the single-delay regression test could not see.
+    A per-band cached constant must never be shared across synthesizer delays.
+
+    This test used to pin `_get_synthesis_alignment_matrix_torch`, which cached
+    `modulation * phase_factors` in one fused `(bands, max_len)` matrix: the phase factors
+    depend on the delay and the modulation does not, so keying that cache on the
+    modulation's arguments alone would have handed a matrix built for one delay to a call
+    that asked for another -- a silent, delay-dependent corruption of every reconstruction
+    that the single-delay regression test could not see.
+
+    P5 deleted the matrix: the modulation moved into the interpolation taps
+    (`fast_interpolate_modulate_torch`) and only the per-band phase factor is left, applied
+    as a scalar by `GammatoneSynthesizerTorch.process`'s `alignment=None` default. The
+    invariant survives the deletion and is re-aimed at the two caches that replaced it:
+
+    * the per-band constants the fold introduced -- the modulated kernel and the
+      pre-multiply vector -- must NOT depend on the delay, and must not be able to
+      collide across bands or across `half_length_factor`. They are keyed on the exact
+      `fc/fs` rational and the rate, neither of which the delay reaches;
+    * the delay-dependent factor now comes from `_get_synthesizer_params_torch` alone,
+      which is already keyed on `delay_sec`, and `GammatoneSynthesizerTorch` must pick up
+      the entry for the delay it was constructed with.
+
+    Bounds on the *values* of those constants are in `test_torch_utils.py`; what is checked
+    here is only that the keying cannot serve the wrong one.
     """
-    from peass.backend_torch.decomposition import _get_synthesis_alignment_matrix_torch
     from peass.backend_torch.gammatone import GammatoneAnalyzerTorch
     from peass.backend_torch.gammatone import _get_synthesizer_params_torch
+    from peass.backend_torch.utils import _get_modulated_polyphase_kernel
+    from peass.backend_torch.utils import _get_modulation_vector
+    from peass.backend_torch.utils import _modulation_phase
 
-    fs, max_len = 16000.0, 256
-    analyzer = GammatoneAnalyzerTorch(fs, 80.0, 1000.0, 4000.0, 1.0, torch.device("cpu"), torch.float64)
+    fs = 16000.0
+    device = torch.device("cpu")
+    analyzer = GammatoneAnalyzerTorch(fs, 80.0, 1000.0, 4000.0, 1.0, device, torch.float64)
     cfs = tuple(analyzer.center_frequencies.tolist())
     norms = tuple(analyzer.norms.tolist())
     coefs = tuple(analyzer.coefs.tolist())
 
-    short_delay = _get_synthesis_alignment_matrix_torch(fs, max_len, cfs, "cpu", 0.004, norms, coefs)
-    long_delay = _get_synthesis_alignment_matrix_torch(fs, max_len, cfs, "cpu", 0.008, norms, coefs)
-    assert not torch.equal(short_delay, long_delay)
+    # The delay is not an input to either fold-side cache, so a repeat call returns the
+    # identical object while a different band or a different filter length does not.
+    first_band, second_band = _modulation_phase(cfs[0], fs), _modulation_phase(cfs[1], fs)
+    kernel = _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 10)
+    assert _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 10) is kernel
+    assert not torch.equal(
+        kernel, _get_modulated_polyphase_kernel(20, 1, second_band, torch.float64, device, 10))
+    assert not torch.equal(
+        kernel, _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 3))
 
-    # And it really is modulation times that delay's phase factors, bitwise.
-    steps = torch.arange(max_len, dtype=torch.float64)
-    modulation = torch.exp(2j * math.pi / fs * analyzer.center_frequencies.unsqueeze(1) * steps)
-    for delay_seconds, cached in ((0.004, short_delay), (0.008, long_delay)):
-        _, phase_factors, _ = _get_synthesizer_params_torch(delay_seconds, fs, cfs, norms, coefs, "cpu")
-        assert torch.equal(cached, modulation * phase_factors.unsqueeze(-1))
+    pre_multiply = _get_modulation_vector(first_band, 1, 0, 20, 256, device)
+    assert _get_modulation_vector(first_band, 1, 0, 20, 256, device) is pre_multiply
+    assert not torch.equal(
+        pre_multiply, _get_modulation_vector(second_band, 1, 0, 20, 256, device))
 
-    # The shared parameter cache it reads from must come back untouched.
+    # The delay-dependent half: different delays give different phase factors, and the
+    # synthesizer picks up the ones its own delay was keyed on.
+    _, short_factors, _ = _get_synthesizer_params_torch(0.004, fs, cfs, norms, coefs, "cpu")
+    _, long_factors, _ = _get_synthesizer_params_torch(0.008, fs, cfs, norms, coefs, "cpu")
+    assert not torch.equal(short_factors, long_factors)
+
     delays, phase_factors, gains = _get_synthesizer_params_torch(0.004, fs, cfs, norms, coefs, "cpu")
     synth = GammatoneSynthesizerTorch(analyzer, 0.004)
     assert torch.equal(delays, synth.delays)

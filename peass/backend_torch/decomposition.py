@@ -4,7 +4,6 @@ File path: peass/backend_torch/decomposition.py
 """
 import math
 import pathlib
-from functools import lru_cache
 
 import soundfile as sf
 import torch
@@ -12,52 +11,13 @@ import torch.nn.functional as F
 
 from .gammatone import GammatoneAnalyzerTorch
 from .gammatone import GammatoneSynthesizerTorch
-from .gammatone import _get_synthesizer_params_torch
 from .utils import DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+from .utils import fast_demodulate_decimate_torch
+from .utils import fast_interpolate_modulate_torch
 from .utils import fast_resample_poly_torch
 from ..config import DecomposedFilePaths
 from ..config import DecomposedWaveforms
 from ..config import DecompositionResult
-
-
-@lru_cache(maxsize=16)
-def _get_analysis_mod_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str):
-    device = torch.device(device_str)
-    cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
-    time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
-    return torch.exp(-2j * math.pi / fs * cfs.unsqueeze(-1) * time_steps)
-
-
-@lru_cache(maxsize=16)
-def _get_synthesis_alignment_matrix_torch(fs: float, max_len: int, cfs_tuple: tuple, device_str: str,
-                                          delay_sec: float, norms_tuple: tuple, coefs_tuple: tuple):
-    """Synthesis modulation matrix pre-multiplied by the synthesizer's phase factors.
-
-    ``exp(+2j*pi*fc*t/fs) * phase_factor[band]`` -- the two per-band constants the
-    synthesis path applies back to back. Fusing them turns two full passes over the
-    (62 MB mono / 123 MB stereo) subband block into one, and re-associating
-    ``(x * mod) * phase`` into ``x * (mod * phase)`` costs ~1 ULP.
-
-    Keyed on the phase factors' full dependency set (``delay_sec``, ``fs``, the center
-    frequencies and the filter ``norms``/``coefs``) as well as the modulation's
-    (``fs``, ``max_len``, center frequencies, device). Keying it on the modulation's
-    arguments alone would silently serve a matrix built for a different delay.
-
-    This *replaces* a separate cache of the bare modulation matrix rather than adding to
-    one: the bare matrix had no other caller, so the resident cost is unchanged. The
-    analysis-side cache above is untouched, and `_get_synthesizer_params_torch` is only
-    read from here -- the product below is a fresh tensor, so neither cache entry is
-    disturbed.
-    """
-    device = torch.device(device_str)
-    cfs = torch.tensor(cfs_tuple, device=device, dtype=torch.float64)
-    time_steps = torch.arange(max_len, device=device, dtype=torch.float64)
-    modulation = torch.exp(2j * math.pi / fs * cfs.unsqueeze(1) * time_steps)
-
-    _, phase_factors, _ = _get_synthesizer_params_torch(
-        delay_sec, fs, cfs_tuple, norms_tuple, coefs_tuple, device_str
-    )
-    return modulation * phase_factors.unsqueeze(-1)
 
 
 def _solve_hermitian_batch(gram: torch.Tensor, rhs: torch.Tensor) -> torch.Tensor:
@@ -415,10 +375,22 @@ def extract_target_spatial_distortion_interference_artifacts_torch(
 def run_auditory_analysis_filterbank_torch(
         signal_waveform: torch.Tensor,
         fs: float,
-        modulation_matrix: torch.Tensor | None = None,
         half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
-) -> tuple[list[torch.Tensor], GammatoneAnalyzerTorch, torch.Tensor]:
-    """Runs parallel analytical complex-valued filterbanks."""
+) -> tuple[list[torch.Tensor], GammatoneAnalyzerTorch, None]:
+    """Runs parallel analytical complex-valued filterbanks.
+
+    The third tuple element is always ``None``. It used to be the ``(bands, T)`` analysis
+    modulation matrix, which the caller threaded into the second (estimate) pass so the
+    two shared a cache entry; the modulation now rides the resampler's taps
+    (:func:`~peass.backend_torch.utils.fast_demodulate_decimate_torch`) and there is no
+    matrix left to share. The arity is kept because several callers unpack three values.
+
+    Dropping the ``modulation_matrix`` pass-through parameter with it is
+    behaviour-preserving and was measured to be: both passes keyed the cache identically,
+    so without the pass-through the estimate pass was a plain hit returning the *identical
+    tensor object* (``CacheInfo(hits=1, misses=1)``, ``m1 is m2``). It saved one
+    ``lru_cache`` lookup and nothing else.
+    """
 
     minimum_frequency = 20.0
     maximum_frequency = fs / 2.0
@@ -442,55 +414,46 @@ def run_auditory_analysis_filterbank_torch(
     subbands_output = analyzer.process(signal_waveform)
     num_bands = subbands_output.shape[-2]
 
-    if modulation_matrix is None:
-        modulation_matrix = _get_analysis_mod_matrix_torch(
-            fs, subbands_output.shape[-1], tuple(analyzer.center_frequencies.tolist()), str(signal_waveform.device)
+    # -------------------------------------------------------------------------
+    # Demodulate and decimate each band in one folded polyphase call.
+    # -------------------------------------------------------------------------
+    # This used to group the bands by unique decimation factor, gather each group out of
+    # `subbands_output` while multiplying it by the modulation matrix in the same pass,
+    # and hand the whole `(Batch, GroupBands, Time)` block to one resample call.
+    #
+    # A modulated kernel is per BAND, not per rate, so a multi-band group cannot share one
+    # GEMM -- and the grouping turns out to have nothing left to buy. It existed to hand
+    # the FFT resampler a batch the filterbank otherwise lacks (see
+    # `fast_resample_poly_torch`'s docstring); the polyphase GEMM does not want one, and
+    # every group is a singleton anyway: swept over 777 input rates from 1 kHz to 192 kHz,
+    # rebuilding the analyzer at each, ZERO rates produce a non-singleton decimation group.
+    # So a per-band loop is identical work where the grouping was real and correct where it
+    # would not have been, and nothing downstream now assumes singleton-ness.
+    #
+    # The 2026-08-12 fused gather this replaces is not being given back. That change
+    # dropped one full-block complex128 temporary per call (mono 184.32 + 61.44 MB, stereo
+    # 368.64 + 122.88 MB) and was a MEASURED SPEED DUD -- ten paired interleaved A/B
+    # replications, mixed-sign, medians 0.999x / 1.002x, so do NOT re-prototype a fused
+    # gather expecting a speedup. P5 removes the multiply *and* the gather: `select` is a
+    # view and `reshape(-1, in_len)` inside the entry point aliases it (same `data_ptr`)
+    # despite the row stride of `num_bands*T`, so the 1.92 MB per-band advanced-index copy
+    # disappears rather than moving, and with it the 61.44 MB modulation matrix.
+    #
+    # The centre frequencies must come from `analyzer.center_frequencies` -- the same
+    # source the deleted matrix used. On a float32 in-memory input the analyzer's ERB grid
+    # is float32 (`cf[-1] = 7468.97607421875`, a 1.2e-7 shift); reading `cf` from anywhere
+    # else would disagree with the pre-fold output by that much.
+    decimated_bands = [None] * num_bands
+    center_frequencies = analyzer.center_frequencies.tolist()
+    decimations = analyzer.decimations.tolist()
+
+    for band_idx in range(num_bands):
+        decimated_bands[band_idx] = fast_demodulate_decimate_torch(
+            subbands_output.select(-2, band_idx), decimations[band_idx],
+            center_frequencies[band_idx], fs, axis=-1, half_length_factor=half_length_factor
         )
 
-    # -------------------------------------------------------------------------
-    # OPTIMIZED: Group bands by unique decimation factors (decimations)
-    # -------------------------------------------------------------------------
-    decimated_bands = [None] * num_bands
-    unique_factors = torch.unique(analyzer.decimations)
-
-    for factor in unique_factors:
-        factor_val = factor.item()
-        band_indices = torch.where(analyzer.decimations == factor_val)[0]
-
-        # Extract the group block and apply the analysis modulation in the same pass:
-        # shape (Batch, NumGroupBands, Time). This replaces a separate full-block
-        # `subbands_output = subbands_output * modulation_matrix` pass that used to sit
-        # above this loop. `torch.unique` + `torch.where` partition the bands, so every
-        # band lands in exactly one group and every element gets exactly one multiply by
-        # exactly the row it would have got from the full-block pass. Bit-identical
-        # forward and backward -- no reassociation, the same scalar multiply moved --
-        # asserted with `torch.equal` on all four decomposed components and on
-        # dL/dinput, mono and stereo. This is the analysis mirror of the fused synthesis
-        # alignment matrix.
-        #
-        # It buys memory, not time: it drops one full-block complex128 temporary per
-        # call. Measured on the 5 s / 16 kHz / 3-source MATLAB reference clip, where
-        # every decimation group is a single band, so the block this fuses into is
-        # 1/32 the size of the temporary it replaces:
-        #
-        #            batch  full block (dropped)  fused group block
-        #   mono     3 + 1   184.32 + 61.44 MB      5.76 / 1.92 MB
-        #   stereo   6 + 2   368.64 + 122.88 MB    11.52 / 3.84 MB
-        #
-        # (two calls per decomposition: the sources at batch S*C, the estimate at C.)
-        # It is a MEASURED SPEED DUD: 2026-08-12, ten paired interleaved A/B
-        # replications, mixed-sign, medians 0.999x / 1.002x. Do NOT re-prototype this
-        # expecting a speedup; take it for the temporary alone.
-        block = subbands_output[..., band_indices, :] * modulation_matrix[band_indices, :]
-
-        # Resample the 3D block along the last axis in a single parallel call!
-        resampled_block = fast_resample_poly_torch(block, 1, factor_val, axis=-1, half_length_factor=half_length_factor)
-
-        # Unpack back into the list
-        for idx, band_idx in enumerate(band_indices.tolist()):
-            decimated_bands[band_idx] = resampled_block[..., idx, :]
-
-    return decimated_bands, analyzer, modulation_matrix
+    return decimated_bands, analyzer, None
 
 
 def run_auditory_synthesis_filterbank_torch(
@@ -512,47 +475,55 @@ def run_auditory_synthesis_filterbank_torch(
         processed = torch.zeros((num_bands, max_len), dtype=torch.complex128, device=analyzer.center_frequencies.device)
 
     # -------------------------------------------------------------------------
-    # OPTIMIZED: Group subbands by unique decimation factors (decimations)
+    # Interpolate and re-modulate each band in one folded polyphase call.
     # -------------------------------------------------------------------------
-    unique_factors = torch.unique(analyzer.decimations)
+    # This used to group the bands by unique decimation factor, `torch.stack` each group
+    # into a `(Batch, GroupBands, T_decimated)` block and hand the whole block to one
+    # resample call. A modulated kernel is per BAND, not per rate, so a multi-band group
+    # cannot share one GEMM -- and the grouping has nothing left to buy: it existed to give
+    # the FFT resampler a batch the filterbank otherwise lacks, every group is a singleton
+    # at every supported rate (777 input rates swept from 1 kHz to 192 kHz, zero
+    # non-singleton groups), and the `stack` was a full copy of every subband. See the
+    # analysis mirror above for the ledger; the two loops are deliberately the same shape.
+    #
+    # The centre frequencies must come from `analyzer.center_frequencies`, the same source
+    # the deleted alignment matrix used, or a float32 analyzer's ERB grid would disagree by
+    # ~1.2e-7 Hz.
+    center_frequencies = analyzer.center_frequencies.tolist()
+    decimations = analyzer.decimations.tolist()
 
-    for factor in unique_factors:
-        factor_val = factor.item()
-        band_indices = torch.where(analyzer.decimations == factor_val)[0]
-
-        # Stack the subbands for this group: shape (..., GroupBands, T_decimated)
-        block = torch.stack([subband_list[b] for b in band_indices.tolist()], dim=-2)
-
-        # Upsample the 3D block in a single parallel call!
-        upsampled_block = fast_resample_poly_torch(block, factor_val, 1, axis=-1, half_length_factor=half_length_factor)
-
-        # Unpack back into the processed buffer
-        for idx, band_idx in enumerate(band_indices.tolist()):
-            upsampled = upsampled_block[..., idx, :]
-            curr_len = upsampled.shape[-1]
-            if curr_len >= max_len:
-                if is_batched:
-                    processed[:, band_idx, :] = upsampled[..., :max_len]
-                else:
-                    processed[band_idx, :] = upsampled[:max_len]
+    for band_idx in range(num_bands):
+        upsampled = fast_interpolate_modulate_torch(
+            subband_list[band_idx], decimations[band_idx], center_frequencies[band_idx],
+            analyzer.fs, axis=-1, half_length_factor=half_length_factor
+        )
+        curr_len = upsampled.shape[-1]
+        if curr_len >= max_len:
+            if is_batched:
+                processed[:, band_idx, :] = upsampled[..., :max_len]
             else:
-                if is_batched:
-                    processed[:, band_idx, :curr_len] = upsampled
-                else:
-                    processed[band_idx, :curr_len] = upsampled
+                processed[band_idx, :] = upsampled[:max_len]
+        else:
+            if is_batched:
+                processed[:, band_idx, :curr_len] = upsampled
+            else:
+                processed[band_idx, :curr_len] = upsampled
 
-    # Re-modulate back to center frequencies and phase-align, in one cached matrix that
-    # the synthesizer applies band by band. Multiplying `processed` by the modulation
-    # here would cost a full extra pass over a 62-123 MB block for nothing.
+    # `processed` is already re-modulated -- the modulation rode the interpolation taps
+    # (`fast_interpolate_modulate_torch`), and the interpolator's own output index is the
+    # same subband time index `process` multiplies its alignment by (the band delay enters
+    # only through `narrow`), so the fold is index-aligned with no shift. What survives is
+    # the per-band phase factor, a complex SCALAR, which is exactly `process`'s
+    # `alignment=None` default.
+    #
+    # This un-does P4's fusion of `modulation * phase_factors` into one cached
+    # (32, max_len) matrix, and that is the point: P4 fused two full passes over a
+    # 62-123 MB block into one, and there is now only one per-band scalar left to apply, so
+    # there is nothing to fuse. P4's win is RE-BANKED here, not additive -- do not count
+    # the two separately.
     desired_delay_seconds = 1000.0 / analyzer.fs
-    alignment = _get_synthesis_alignment_matrix_torch(
-        analyzer.fs, max_len, tuple(analyzer.center_frequencies.tolist()),
-        str(analyzer.center_frequencies.device), desired_delay_seconds,
-        tuple(analyzer.norms.tolist()), tuple(analyzer.coefs.tolist())
-    )
-
     synth = GammatoneSynthesizerTorch(analyzer, desired_delay_seconds)
-    reconstructed = synth.process(processed, alignment=alignment)
+    reconstructed = synth.process(processed)
 
     # 1. Downsample back to the original frequency to prevent duration expansion
     original_fs = analyzer.original_sampling_frequency_hz
@@ -705,13 +676,16 @@ def decompose_distortion_components(
     # negative on stereo, because it also raises the peak frequency-domain footprint.
     # The batching argument had force when resampling was an FFT starved of batch;
     # the polyphase GEMM path in `utils.py` removed that.
-    subbands_sources_flat, analyzer, mod_matrix = run_auditory_analysis_filterbank_torch(
+    subbands_sources_flat, analyzer, _ = run_auditory_analysis_filterbank_torch(
         sources_flat, sampling_frequency_hz, half_length_factor=resample_factor
     )
 
     estimate_flat = shaded_estimate.transpose(0, 1)  # (C, T)
+    # No modulation matrix to thread from the sources pass into this one any more: the
+    # per-band kernels and residuals are cached in `utils.py` on their own exact
+    # `(fc/fs, rate, length)` keys, so the second pass hits what the first built.
     subband_estimate_flat, _, _ = run_auditory_analysis_filterbank_torch(
-        estimate_flat, sampling_frequency_hz, mod_matrix, half_length_factor=resample_factor
+        estimate_flat, sampling_frequency_hz, half_length_factor=resample_factor
     )
 
     num_bands = len(subbands_sources_flat)

@@ -406,8 +406,16 @@ class GammatoneSynthesizerTorch:
         ``subbands`` is ``(*, Bands, Time)`` with an optional leading batch dimension.
         ``alignment`` is an optional ``(Bands, Time)`` (or ``(Bands, 1)``) complex tensor
         that pre-multiplies each band; it defaults to the per-band phase factors alone.
-        The decomposition passes the *fused* modulation-times-phase matrix, which is why
-        this hook exists -- see ``_get_synthesis_alignment_matrix_torch``.
+
+        The decomposition used to pass a *fused* modulation-times-phase ``(Bands, Time)``
+        matrix here, which is what this hook was built for. It no longer does: P5 folded
+        the synthesis modulation into the interpolation taps
+        (``utils.fast_interpolate_modulate_torch``), so the bands arrive already
+        re-modulated and only the per-band phase factor is left -- i.e. the decomposition
+        now takes the ``alignment=None`` default. The hook stays because it is a
+        general ``(Bands, Time)`` pre-multiply with its own test, and because the index it
+        multiplies is the *subband* time index (the delay enters only through ``narrow``),
+        which is the property that lets a tap-side fold be index-aligned with no shift.
 
         The band loop is deliberate. The vectorized formulation this replaced built the
         whole phase-aligned block (``(subbands * phase).real``), then an ``int64`` index

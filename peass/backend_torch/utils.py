@@ -3,6 +3,7 @@ PEASS PyTorch Sub-Utilities
 File path: peass/backend_torch/utils.py
 """
 import math
+from fractions import Fraction
 from functools import lru_cache
 
 import torch
@@ -134,6 +135,13 @@ def _get_polyphase_kernel(
     Reshaping the zero-padded filter to ``(L, rate)`` gives ``hp[j, p] = h[j*rate + p]``,
     i.e. row ``j`` of phase ``p``'s branch. The flips fold the convolution's index
     reversal in here once, at design time, instead of per call.
+
+    Keyed per *rate*, and deliberately kept that way:
+    :func:`_get_modulated_polyphase_kernel` is the per-*band* sibling that carries a
+    gammatone band's modulation in the taps, and it has its own cache. Widening this one
+    to hold both would need 26..42 entries per filterbank configuration and would evict
+    the plain real kernels that the fullband 3/2 and 2/3 resamples, ``auditory_model.py``
+    and every unmodulated complex caller still need.
     """
     h_padded = get_resample_filter_torch(up, down, dtype, device, half_length_factor)[0]
     rate = max(up // math.gcd(up, down), down // math.gcd(up, down))
@@ -143,6 +151,273 @@ def _get_polyphase_kernel(
     if up == 1:
         # Decimation additionally reverses within each phase; see the derivation in
         # `_polyphase_decimate`.
+        kernel = kernel.flip(1)
+    return kernel.contiguous()
+
+
+# Denominator at which the exact rational ``fc / fs`` is *split* (not truncated) into a
+# coarse rational plus a float64 remainder, so that the coarse part's modular multiply
+# stays inside int64. See :func:`_reduced_phase_exp` for why this must be a split and not
+# a `limit_denominator` approximation: 10**12 < 2**40, which with the index split below
+# leaves the modular product bounded by 2**61.
+_PHASE_DENOMINATOR_LIMIT = 10 ** 12
+
+# The index is split as ``n = hi * _PHASE_INDEX_SPLIT + lo`` before the modular multiply,
+# so that neither partial product leaves int64. With ``num < 2**40`` and ``lo < 2**21``
+# the low product is under ``2**61``; the high product is under ``2**60`` for any
+# ``|n| < 2**41``, i.e. 2.2e12 samples -- 47000 years at 48 kHz, and 35 TB of complex128,
+# so the bound is structural rather than a limit worth branching on. This replaces an
+# earlier ``numerator * max|index| >= 2**62`` guard whose fallback was a per-sample pure
+# Python ``Fraction`` loop: that guard tripped at 23.1M upsampled samples (~321 s at
+# 48 kHz) and turned the cache fill into tens of millions of Python-level operations per
+# band with no warning.
+_PHASE_INDEX_SPLIT = 2 ** 21
+
+
+@lru_cache(maxsize=256)
+def _modulation_phase(center_frequency_hz: float, sampling_frequency_hz: float) -> Fraction:
+    """``fc / fs`` as an **exact** rational -- no approximation of any kind.
+
+    ``Fraction(float)`` is exact for any float64 and both arguments are float64, so this
+    is the true ratio the band was designed at, and it is what :func:`_reduced_phase_exp`
+    reduces. The denominator is large -- measured over every band of every supported
+    geometry (8k/16k/22.05k/44.1k/48k, 26..42 bands each), worst ``1.013e19`` at
+    ``fc = 42.330280964441435``, ``fs = 72000`` -- which is why the reduction splits it
+    rather than working with it directly.
+
+    **This function used to return ``limit_denominator(10**12)`` of the ratio and that was
+    a live accuracy defect**, measured 2026-08-18. ``limit_denominator`` is a *best
+    rational approximation*: it is free to return a denominator far below the limit when
+    the continued fraction has a large early partial quotient, and the analyzer's ERB grid
+    puts one centre frequency exactly one ULP above the base frequency
+    (``cf = 1000.0000000000001``). At ``fs = 24000`` the exact ratio
+    ``2932031007402667/70368744177664000`` collapsed to exactly ``1/24``, discarding
+    1.137e-16 *relative* -- which is 3.572e-12 rad at ``n = T = 120000`` and measured
+    3.4373e-12 of that band's own peak on the real 32-band filterbank, against ~1e-15 on
+    every other band. At a fixed clip *duration* it is rate-invariant, because the ratio
+    error scales as ``1/fs`` and the index range as ``fs``: the denominator collapses to
+    12 at 8 kHz, 24 at 16 kHz, 1323 at 22.05k and 44.1k, 72 at 48 kHz, always on that one
+    band and on no other.
+
+    That is the identical failure mode this docstring used to *reject* the separate
+    ``limit_denominator(fc)/limit_denominator(fs)`` recipe of
+    ``.scratch/handoff-2026-08-15/harnesses/verify_exp.py`` for (5 of 176 swept centre
+    frequencies do not round-trip, worst 1.14e-16 relative). Limiting the ratio commits
+    the same 1.14e-16 by the same mechanism. Neither is safe; nothing may approximate the
+    ratio.
+
+    It was invisible for the same reason ``verify_exp.py``'s was: every check compared the
+    fold against a reference built from *this function's own* return value, so the cap
+    error cancelled on both sides. Only a reference built from an independent, uncapped
+    ``Fraction(cf) / Fraction(fs)`` can see it -- which is what
+    ``tests/.../test_torch_utils.py::test_torch_reduced_phase_exp_matches_an_exact_fraction_reference``
+    now does, at the collapsing centre frequency.
+    """
+    return Fraction(center_frequency_hz) / Fraction(sampling_frequency_hz)
+
+
+def _reduced_phase_exp(
+        phase: Fraction,
+        sign: int,
+        start: int,
+        step: int,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.complex128
+) -> torch.Tensor:
+    r"""``exp(sign * 2j*pi * phase * (start + step*i))`` for ``i = 0..count-1``.
+
+    The phase is reduced modulo one turn **before** the exponential, and that reduction --
+    not the fold's algebra -- is where all of the accuracy lives. Measured on this
+    geometry: ``2*pi*fc*n/fs`` reaches **2.3465e5 rad** at ``fc = 7468.977``,
+    ``fs = 24000``, ``n = 120000``, so ``eps*theta = 5.2e-11 rad`` and any ``torch.exp``
+    of the raw argument carries that. The modulation matrix this replaced was built
+    exactly that way; folding it into the taps with the same naive exponential reproduces
+    that matrix to only 7.538e-12 relative over the 32 bands, while the identical fold
+    with this reduction on both sides measures **9.538e-16**. Four orders of magnitude,
+    from the exponential alone. Reduced-fold against the *unreduced* matrix -- i.e. the
+    move this change actually lands -- is 1.128e-11, and it is toward the true value, not
+    away from it.
+
+    (``TODO.md`` and ``.scratch/handoff-2026-08-15/notes/p5_notes.md`` state the argument
+    reaches "~2.2e8 rad". That is wrong by three orders and must not be repeated: it
+    would predict ~5e-8 of error, which nobody has ever measured, whereas
+    ``2.2e-16 * 2.35e5 = 5.2e-11`` matches what was.)
+
+    **The exact ratio is split, never approximated.** ``phase`` carries a denominator up
+    to 1.013e19 (measured worst over every supported geometry), which no int64 modular
+    multiply can hold, so it is written as ``coarse + residual``:
+
+    * ``coarse = phase.limit_denominator(_PHASE_DENOMINATOR_LIMIT)`` drives an exact
+      integer reduction ``(num * n) mod den``, with ``n`` itself split at
+      ``_PHASE_INDEX_SPLIT`` so neither partial product leaves int64;
+    * ``residual = float(phase - coarse)`` carries *everything the cap dropped*, in
+      float64, and is applied as ``n * residual`` turns on top.
+
+    That second term is what makes this correct. ``limit_denominator`` is a best rational
+    approximation and can collapse hard -- ``cf = 1000.0000000000001`` at ``fs = 24000``
+    goes to exactly ``1/24``, throwing away 1.137e-16 relative, which was measured as
+    3.4373e-12 of that band's peak (see :func:`_modulation_phase`). Carrying the remainder
+    costs one multiply and one add and cannot itself lose anything that matters:
+    ``|residual| < 1/(q * 1e12) <= 1e-12`` turns per index, so ``n*residual`` is at most
+    ~1.2e-7 turns at ``n = T = 120000`` and its own float64 rounding is ~1e-23 turns,
+    seven orders below the ULP of the sum it is added to.
+
+    The coarse reduction is exact end to end: ``den <= 1e12 < 2**53``, so the residue and
+    the divisor are both exact in float64 and ``reduced / den`` is correctly rounded.
+
+    Measured. Against a 50-digit ``mpmath`` reference at the collapsing centre frequency
+    the split is **9.75e-16** where the capped-only form is 1.18e-12. Swept over all 176
+    bands of the five supported geometries at ``count = 120000``, split minus capped-only:
+    every band except the collapsing one moves by at most **1.6e-16** (median ~1e-18, i.e.
+    the cap was already tight there and the remainder only trims the last bit), while the
+    collapsing band moves by 7.14e-12 (8 kHz), 3.57e-12 (16 kHz), 2.59e-12 (22.05 kHz),
+    1.30e-12 (44.1 kHz), 1.19e-12 (48 kHz).
+
+    Reducing ``turns`` into ``(-0.5, 0.5]`` instead of ``[0, 1)`` halves the magnitude of
+    the ``2*pi*turns`` argument and measures 5.16e-16 against the same gold reference,
+    versus 9.14e-16 here -- a real 1.8x, recorded and deliberately not taken: both forms
+    sit on the float64 floor of ``cos``/``sin`` at an argument of magnitude 2*pi, four
+    orders inside the bar, and it is an accuracy micro-optimisation orthogonal to the
+    defect this split exists to fix. Do not take it without a measurement that shows it
+    changing something downstream.
+
+    ``torch.remainder`` follows the *divisor's* sign, so a negative ``start`` -- the
+    synthesis tap index runs down to ``-hf*U = -4090`` -- still lands in ``[0, den)``, and
+    ``torch.div(..., rounding_mode="floor")`` splits negative indices consistently with
+    it.
+
+    ``dtype`` is the complex dtype of the result. The reduction always runs in float64 and
+    is rounded once at the end -- reducing in the signal's precision would defeat the
+    point of reducing at all.
+
+    Cost: this runs once per cache fill, never per call, exactly like
+    :func:`_get_polyphase_kernel`, and it is now O(count) torch work with no Python-level
+    loop at any length. Summed over the 32 bands it reduces ~157k points (77,312 tap
+    phases + 80,257 residual points) against the 3.84M-element modulation matrix it
+    removes -- ~2% of the work it deletes.
+    """
+    coarse = phase.limit_denominator(_PHASE_DENOMINATOR_LIMIT)
+    denominator = coarse.denominator
+    numerator = coarse.numerator % denominator               # 0 <= num < den, exactly
+    residual = float(phase - coarse)                         # turns per unit index
+
+    index = torch.arange(count, dtype=torch.int64, device=device) * step + start
+    high = torch.div(index, _PHASE_INDEX_SPLIT, rounding_mode="floor")
+    low = index - high * _PHASE_INDEX_SPLIT
+    high_step = (numerator * _PHASE_INDEX_SPLIT) % denominator
+    reduced = (numerator * low + high_step * high).remainder(denominator)
+
+    turns = reduced.to(torch.float64) / denominator + index.to(torch.float64) * residual
+    return torch.polar(torch.ones_like(turns), (sign * 2.0 * math.pi) * turns).to(dtype)
+
+
+def _complex_dtype_for(real_dtype: torch.dtype) -> torch.dtype:
+    """The complex dtype a folded (modulated) kernel of real precision ``real_dtype`` takes.
+
+    ``promote_types(x, complex64)`` is the standard widening: float32 and float16 go to
+    complex64, float64 to complex128, and a complex dtype passed in comes back unchanged.
+    The folded path builds its phase vector in float64 for accuracy and rounds once, so
+    this is the only place that decides the precision the fold actually runs at.
+    """
+    return torch.promote_types(real_dtype, torch.complex64)
+
+
+@lru_cache(maxsize=256)
+def _get_modulation_vector(
+        phase: Fraction,
+        sign: int,
+        start: int,
+        step: int,
+        count: int,
+        device: torch.device,
+        dtype: torch.dtype = torch.complex128
+) -> torch.Tensor:
+    """Cached :func:`_reduced_phase_exp` -- the residual/pre-multiply the fold leaves behind.
+
+    Folding a band's modulation into the taps does not make it vanish; it moves it off the
+    full-rate signal and onto the *decimated* one. For analysis that is
+    ``m[(hf+i)*down]``, ``out_len`` long (294..8572 per band here, against the 120000 the
+    modulation matrix multiplied); for synthesis it is ``m[up*i]`` on the decimated
+    **input**, ``in_len`` long (the same 294..8572, against the 120336-wide alignment row
+    it replaces). Either way ~0.35% of one full-rate pass summed over all 32 bands.
+
+    Applied as its own elementwise multiply, deliberately. Folding it into the last term
+    of the shifted-diagonal sum is not expressible -- it is a factor on the whole sum, and
+    a factor does not distribute into one addend -- and fusing it into the final *add*
+    would still take two kernels, because torch has ``addcmul`` (``a + b*c``) and nothing
+    for ``(a + b) * c``. At 0.35% there is nothing to spend on it.
+
+    ``maxsize=256`` is sized by **bands**, not by rates: one entry per band per side, 84
+    at 48 kHz (42 bands x 2), where :func:`_get_polyphase_kernel`'s same-sized cache holds
+    one entry per *rate*. ``dtype`` is part of the key so the residual comes back in the
+    same precision the folded kernel ran at; the filterbank only ever asks for
+    complex128.
+    """
+    return _reduced_phase_exp(phase, sign, start, step, count, device, dtype)
+
+
+@lru_cache(maxsize=256)
+def _get_modulated_polyphase_kernel(
+        up: int,
+        down: int,
+        phase: Fraction,
+        real_dtype: torch.dtype,
+        device: torch.device,
+        half_length_factor: int
+) -> torch.Tensor:
+    r""":func:`_get_polyphase_kernel` with one gammatone band's modulation in the taps.
+
+    Complex modulation distributes through convolution exactly, so with
+    ``m[n] = exp(-2j*pi*fc*n/fs)`` (unit modulus, hence ``m[a-b] = m[a]*conj(m[b])``) the
+    full-rate demodulate-then-decimate collapses onto the 21 taps::
+
+        y[i] = m[(hf+i)*down] * sum_k ( h[k] * conj(m[k]) ) * x[(hf+i)*down - k]
+
+    and the mirror for interpolate-then-modulate, whose taps carry ``m_s[k - hf*up]``.
+    **Both sides use ``sign = +1``; only the start offset differs** -- the analysis
+    conjugation flips the modulation's minus to a plus, and the synthesis tap needs no
+    conjugation but is offset by ``-n_pre_remove = -hf*up``. A sign slip shows up as an
+    O(1) error; a dropped offset is a per-band *constant rotation* with no shape change
+    and no test failure, so it is only visible to a per-band parity check.
+
+    **The flat tap index needs no shift.** ``get_resample_filter_torch`` returns
+    ``n_pre_pad == 0`` identically whenever ``up == 1`` or ``down == 1`` (``half_len`` is
+    then a multiple of ``down_reduced``), so ``h_padded`` is the designed filter
+    unshifted and its flat index *is* SciPy's ``k``. The modulation therefore multiplies
+    the flat filter **before** the pad/reshape/flip, and the flips carry it to the right
+    ``(j, c)`` for free; applying it afterwards means re-deriving
+    ``h[(L-1-j)*down + (down-1-c)]``, which buys nothing and is easy to get wrong. The
+    ``flip(1)`` is decimation-only for the same reason it is in
+    :func:`_get_polyphase_kernel`; omitting it there, or adding it on the interpolation
+    side, silently permutes the lanes.
+
+    ``real_dtype`` is the *signal's real* dtype, not the signal's. Handing
+    ``get_resample_filter_torch`` a complex dtype **silently succeeds** -- it returns a
+    complex filter with an all-zero imaginary part and caches a duplicate of every filter,
+    which is exactly the 64-entry / 2.5 MB regression recorded at
+    :func:`fast_resample_poly_torch`. Design real, promote via the complex phase vector.
+    The promotion lands in :func:`_complex_dtype_for` of ``real_dtype``, not in
+    complex128 unconditionally: the phase vector is reduced in float64 whatever the
+    signal's precision, but the *kernel* has to come back in the precision the GEMM will
+    run at, or a complex64 signal meets a complex128 kernel and ``bmm`` raises
+    "expected m1 and m2 to have the same dtype".
+
+    Own cache, keyed per band (``phase``) rather than per rate, and ``maxsize=256`` is
+    sized by **bands**: 84 entries at 48 kHz for both sides. Resident cost 1.298 MB per
+    side for the 32 bands here, against the 61.44 MB modulation matrix removed. ``None``
+    is not a valid ``phase``, so the unmodulated kernels can never collide with these.
+    """
+    h_padded = get_resample_filter_torch(up, down, real_dtype, device, half_length_factor)[0]
+    rate = max(up, down)                                # one of the two is 1 on this path
+    taps_per_phase = 2 * half_length_factor + 1
+    start = 0 if up == 1 else -half_length_factor * up
+    taps = h_padded * _reduced_phase_exp(
+        phase, 1, start, 1, h_padded.shape[0], device, _complex_dtype_for(real_dtype)
+    )
+    kernel = F.pad(taps, (0, taps_per_phase * rate - taps.shape[0]))
+    kernel = kernel.reshape(taps_per_phase, rate).flip(0)
+    if up == 1:
         kernel = kernel.flip(1)
     return kernel.contiguous()
 
@@ -245,6 +520,16 @@ def _split_real_imag(x_flat: torch.Tensor) -> torch.Tensor:
     ``a*0`` products of a complex multiply by a real number, and the taps accumulate
     in the same order either way.
 
+    **"The resample filter is real" is not a universal.** Where a gammatone band's
+    modulation has been folded into the taps (:func:`_get_modulated_polyphase_kernel`)
+    the kernel is complex by construction, the premise above does not hold, and the
+    folded callers skip the split entirely and run a true complex GEMM. Keeping the
+    folded kernel on this split path -- widening ``N`` to 42 with ``[K_re | K_im]`` --
+    pays the same 2x flops without recovering the split, and measured **0.717x**: it
+    loses. It is the same family as the block-diagonal form :func:`_merge_real_imag`
+    already rejects at exactly 2.00x the multiply-adds. Do not reintroduce either as
+    "the obvious way to keep the real GEMM".
+
     Used by the two padless fast paths, which have no pad for the split to hide inside;
     everything that still materialises a padded buffer calls :func:`_split_pad_real_imag`
     instead and gets the split for free. The contiguous ``(2*batch, n)`` result is what the
@@ -297,6 +582,10 @@ def _split_pad_real_imag(x_flat: torch.Tensor, left: int, right: int) -> tuple:
     ``view_as_real`` rejects a lazily-conjugated tensor where ``torch.cat`` silently
     worked, hence ``resolve_conj`` (a no-op on everything this package produces, but
     ``fast_resample_poly_torch`` is a public entry point).
+
+    Carries the same qualifier as :func:`_split_real_imag`: the folded (modulated) kernel
+    is complex, so those callers pad with a plain ``F.pad`` on the complex block instead
+    and never split. The pad is unchanged; only the split half goes away.
     """
     if not x_flat.is_complex():
         return F.pad(x_flat, (left, right)), False
@@ -316,6 +605,11 @@ def _merge_real_imag(y_flat: torch.Tensor, batch: int) -> torch.Tensor:
     ``(2*down, 2*taps)`` kernel, which is exactly 2.00x the multiply-adds (half of them
     against structural zeros) and gives back the entire win the split exists to buy.
     ``torch.complex`` is one fused kernel over 2N elements; it is the cheap half.
+
+    Not reached on the folded path -- a complex kernel produces a complex accumulator
+    directly, so there is nothing to merge. That is the second half of P5's saving, on top
+    of the modulation pass itself; the widened-real alternative that would have kept this
+    function in play measured 0.717x (see :func:`_split_real_imag`).
     """
     return torch.complex(y_flat[:batch], y_flat[batch:])
 
@@ -325,7 +619,8 @@ def _polyphase_interpolate(
         up: int,
         in_len: int,
         out_len: int,
-        half_length_factor: int
+        half_length_factor: int,
+        phase: Fraction | None = None
 ) -> torch.Tensor:
     r"""Zero-insert by ``up`` then FIR-filter, as one GEMM against the polyphase kernel.
 
@@ -343,15 +638,49 @@ def _polyphase_interpolate(
     so the whole interpolation is ``(batch*in_len, 2hf+1) @ (2hf+1, up)`` followed by a
     reshape -- the ``(q, p)`` grid is already in output order. No zero-inserted signal
     and no length-``in_len*up`` spectrum is ever materialised.
+
+    **``phase`` folds a gammatone band's re-modulation into the taps.** Passing the band's
+    exact ``fc/fs`` (:func:`_modulation_phase`) makes this compute
+    ``interpolate(x) * exp(+2j*pi*fc*n/fs)`` up to the ``in_len``-long pre-multiply that
+    :func:`fast_interpolate_modulate_torch` applies to the *decimated* input first -- one
+    complex zgemm instead of a full-rate 62 MB alignment pass, a ``_split_pad_real_imag``
+    gather and a ``_merge_real_imag`` allocation. Same trade as the decimation side and the
+    same verdict: the GEMM's flops double, ``K = 21`` is far too skinny for that to bind,
+    and the rejected widened ``N = 42`` real dgemm measured **0.717x**.
+
+    There is no grad branch here and none is needed -- ``F.pad``, ``unfold``, complex
+    ``matmul`` and the pre-multiply are all autograd-safe, so unlike
+    :func:`_polyphase_decimate` this half of the fold cannot create a grad/no-grad
+    numerical split. Gradients w.r.t. all 32 complex subband tensors, folded against the
+    interpolate-then-multiply route, measured 1.513e-14 of peak.
+
+    ``phase=None`` is today's behaviour byte for byte; the real and unmodulated-complex
+    callers never take the folded branch.
     """
     batch = x_flat.shape[0]
-    padded, is_complex = _split_pad_real_imag(x_flat, half_length_factor, half_length_factor)
+    folded = phase is not None
+    if folded:
+        # The split exists to keep a complex signal off a real filter; the folded kernel is
+        # complex, so only the pad half of `_split_pad_real_imag` is wanted. Design in the
+        # *real* dtype -- a complex dtype into `get_resample_filter_torch` silently caches a
+        # zero-imaginary duplicate of every filter (see `fast_resample_poly_torch`).
+        kernel = _get_modulated_polyphase_kernel(
+            up, 1, phase, x_flat.real.dtype, x_flat.device, half_length_factor
+        )
+        # A real signal has to be widened to meet a complex kernel; `.to` returns the same
+        # object when the dtypes already agree, which is what the filterbank drives.
+        padded = F.pad(x_flat.to(kernel.dtype), (half_length_factor, half_length_factor))
+        is_split = False
+    else:
+        padded, is_split = _split_pad_real_imag(x_flat, half_length_factor,
+                                                half_length_factor)
+        kernel = _get_polyphase_kernel(up, 1, padded.dtype, padded.device,
+                                       half_length_factor)
 
-    kernel = _get_polyphase_kernel(up, 1, padded.dtype, padded.device, half_length_factor)
     windows = padded.unfold(-1, 2 * half_length_factor + 1, 1)
     interleaved = (windows @ kernel).reshape(padded.shape[0], in_len * up)
 
-    if is_complex:
+    if is_split:
         interleaved = _merge_real_imag(interleaved, batch)
     return interleaved[:, :out_len]
 
@@ -361,7 +690,8 @@ def _polyphase_decimate_padded(
         down: int,
         in_len: int,
         out_len: int,
-        half_length_factor: int
+        half_length_factor: int,
+        phase: Fraction | None = None
 ) -> torch.Tensor:
     """The block grid built by materialising the zero-padded signal.
 
@@ -370,15 +700,39 @@ def _polyphase_decimate_padded(
     supports neither ``out=`` nor the ``zero_`` that fills the margins. Same forward-only
     shape as the Numba adaptation kernel. It doubles as the reference the fast path is
     verified against; the two agree to ~1 ULP, not bit-exactly (see the fast path's note).
+
+    ``phase`` folds a gammatone band's modulation into the taps, exactly as on the fast
+    path -- see :func:`_polyphase_decimate`. **This route had to be folded too, not routed
+    back to the pre-fold formulation.** ``decompose_distortion_components`` really runs
+    this branch with grad live (``tests/integration/test_backprop.py``), and keeping the
+    old path here would have meant giving the training and inference paths *different
+    numerics*, which is the same latent class of defect as the ``hf = 0`` grad/no-grad
+    disagreement documented below. One is enough. Folded, the two routes agree to
+    **8.14e-17** of peak over the 32 real bands and 3.73e-16 over random complex input at
+    ``down`` in {14, 17, 409} -- the same ~1 ULP reassociation the unmodulated pair
+    already has, and the assertion that would catch the ``hf = 0`` class of defect.
     """
     taps_per_phase = 2 * half_length_factor + 1
     batch = x_flat.shape[0]
+    folded = phase is not None
 
     num_rows = out_len + 2 * half_length_factor
     left_pad = (half_length_factor + 1) * down - 1
     right_pad = num_rows * down - left_pad - in_len
-    padded, is_complex = _split_pad_real_imag(x_flat, left_pad, right_pad)
-    kernel = _get_polyphase_kernel(1, down, padded.dtype, padded.device, half_length_factor)
+    if folded:
+        # The split exists to keep a complex signal off a real filter; the folded kernel
+        # is complex, so only the pad half of `_split_pad_real_imag` is wanted here.
+        kernel = _get_modulated_polyphase_kernel(
+            1, down, phase, x_flat.real.dtype, x_flat.device, half_length_factor
+        )
+        # A real signal has to be widened to meet a complex kernel -- `matmul` requires
+        # matching dtypes and the result is complex by construction anyway. Free (`.to`
+        # returns self) for the complex input the filterbank actually drives.
+        padded = F.pad(x_flat.to(kernel.dtype), (left_pad, right_pad))
+        is_split = False
+    else:
+        padded, is_split = _split_pad_real_imag(x_flat, left_pad, right_pad)
+        kernel = _get_polyphase_kernel(1, down, padded.dtype, padded.device, half_length_factor)
     blocks = padded.reshape(padded.shape[0], num_rows, down)
 
     phase_sums = blocks @ kernel.T
@@ -386,7 +740,7 @@ def _polyphase_decimate_padded(
     for tap_idx in range(1, taps_per_phase):
         accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + out_len, tap_idx]
 
-    if is_complex:
+    if is_split:
         accumulator = _merge_real_imag(accumulator, batch)
     return accumulator
 
@@ -396,7 +750,8 @@ def _polyphase_decimate(
         down: int,
         in_len: int,
         out_len: int,
-        half_length_factor: int
+        half_length_factor: int,
+        phase: Fraction | None = None
 ) -> torch.Tensor:
     r"""FIR-filter then keep every ``down``-th sample, without filtering the discards.
 
@@ -442,17 +797,24 @@ def _polyphase_decimate(
 
     **``hf = 0`` violates that precondition and this function is silently wrong there.**
     An earlier version of this docstring asserted ``hf = 0`` (a one-tap filter design) was
-    "not reachable". That is false on both counts, measured 2026-08-17:
-    ``DecompositionConfiguration.__post_init__`` validates only ``segmentation_factor``, so
-    ``resample_filter_half_length_factor=0`` is accepted through the public API, and at
-    ``hf = 0`` this fast path does not raise -- it returns finite numbers that disagree with
+    "not reachable". That was false on both counts, measured 2026-08-17: at ``hf = 0`` this
+    fast path does not raise -- it returns finite numbers that disagree with
     :func:`_polyphase_decimate_padded` by **O(1)**, deviations 0.39 to 2.13 across 33 of the
     swept ``(down, in_len, rows, dtype)`` combinations, against 2.22e-16 for ``hf >= 1``.
     The grad path is unaffected because it routes to the padded reference, so the no-grad
-    and grad paths disagree at ``hf = 0``. Nothing in the library passes 0 (the default is
-    10 and the config comment contemplates lowering it only as far as ~3), which is why this
-    has never been hit -- but it is a latent defect, not an unreachable branch, and the fix
-    belongs in ``config.py`` next to the ``segmentation_factor`` check rather than here.
+    and grad paths disagree at ``hf = 0``.
+
+    **Guarded at the entry point since 2026-08-18**, and deliberately there rather than
+    here: ``DecompositionConfiguration.__post_init__`` now raises ``ValueError`` below 1,
+    next to the ``segmentation_factor`` check. So the public API no longer reaches this
+    case. This function is still *internally* wrong below 1 and the precondition above is
+    still the real one -- a direct caller passing ``half_length_factor=0`` bypasses the
+    dataclass entirely -- which is why the analysis is kept rather than deleted.
+
+    Worth keeping as a general point: ``__post_init__`` validated exactly one field of
+    several for a long time, and a validator that checks one field reads as though it
+    checks all of them. "Nothing in the library passes that" was true, and was a statement
+    about the library rather than about the API.
 
     Dropping lanes from the two end contractions drops exact zeros only, but ``mm`` over
     ``(rows*num_rows, down)`` becoming ``rows`` ``bmm``\ s over ``(n_int, down)`` changes
@@ -468,18 +830,49 @@ def _polyphase_decimate(
     :func:`_polyphase_mixed`'s is *relative to the output peak* -- the two are not
     interchangeable and the mixed path's absolute figure is several times this one, so do
     not carry either number across. The ``out=`` kernels make it forward-only.
+
+    **``phase`` folds a gammatone band's demodulation into the taps.** Passing the band's
+    exact ``fc/fs`` (:func:`_modulation_phase`) makes this compute
+    ``decimate(x * exp(-2j*pi*fc*n/fs))`` up to the ``out_len``-long residual that
+    :func:`fast_demodulate_decimate_torch` applies -- one complex zgemm instead of a
+    full-rate 61 MB modulation pass, a ``_split_real_imag`` gather, a real dgemm at twice
+    the rows and a ``_merge_real_imag`` allocation. The GEMM's flops double (complex-by-
+    complex is 4 real multiplies where complex-by-real split is 2), which the FLOP ledger
+    says should lose; it does not, because ``N = 21`` is far too skinny for the GEMM to be
+    flop-bound and the terms removed are streaming passes over blocks that do not fit in
+    cache. The rejected alternative -- keeping the folded kernel on the split path as a
+    widened ``N = 42`` real dgemm -- measured **0.717x**.
+
+    ``phase=None`` is today's behaviour byte for byte; the real and unmodulated-complex
+    callers never take the folded branch.
     """
     if torch.is_grad_enabled() and x_flat.requires_grad:
-        return _polyphase_decimate_padded(x_flat, down, in_len, out_len, half_length_factor)
+        return _polyphase_decimate_padded(
+            x_flat, down, in_len, out_len, half_length_factor, phase
+        )
 
     taps_per_phase = 2 * half_length_factor + 1
     batch = x_flat.shape[0]
-    is_complex = x_flat.is_complex()
-    rows = _split_real_imag(x_flat) if is_complex else x_flat
+    folded = phase is not None
+    is_split = x_flat.is_complex() and not folded
+    rows = _split_real_imag(x_flat) if is_split else x_flat
     num_rows_signal = rows.shape[0]
-    kernel_t = _get_polyphase_kernel(
-        1, down, rows.dtype, rows.device, half_length_factor
-    ).T                                                     # (down, taps_per_phase)
+    if folded:
+        # Design in the *real* dtype and promote through the phase vector: handing
+        # `get_resample_filter_torch` a complex dtype silently caches a zero-imaginary
+        # duplicate of every filter (see `fast_resample_poly_torch`).
+        kernel_t = _get_modulated_polyphase_kernel(
+            1, down, phase, rows.real.dtype, rows.device, half_length_factor
+        ).T
+        # `bmm` will not mix dtypes and `new_empty` below takes the *signal's*, so a real
+        # signal against the complex kernel has to be widened here. `.to` returns the same
+        # object when the dtypes already agree, which is the only case the filterbank
+        # reaches (`GammatoneAnalyzerTorch.process` hands over complex128).
+        rows = rows.to(kernel_t.dtype)
+    else:
+        kernel_t = _get_polyphase_kernel(
+            1, down, rows.dtype, rows.device, half_length_factor
+        ).T                                                 # (down, taps_per_phase)
 
     num_rows = out_len + 2 * half_length_factor
     n_interior = (in_len - 1) // down                       # fully-real grid rows
@@ -518,7 +911,7 @@ def _polyphase_decimate(
     for tap_idx in range(1, taps_per_phase):
         accumulator = accumulator + phase_sums[:, tap_idx:tap_idx + out_len, tap_idx]
 
-    if is_complex:
+    if is_split:
         accumulator = _merge_real_imag(accumulator, batch)
     return accumulator
 
@@ -841,5 +1234,162 @@ def fast_resample_poly_torch(
         )
         y_flat = _fft_resample(x_flat, up_reduced, down_reduced, n_pre_remove,
                                h_padded.shape[0], out_len, x.dtype, half_length_factor)
+
+    return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)
+
+
+def fast_demodulate_decimate_torch(
+        x: torch.Tensor,
+        down: int,
+        center_frequency_hz: float,
+        sampling_frequency_hz: float,
+        axis: int = -1,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+) -> torch.Tensor:
+    """``fast_resample_poly_torch(x * exp(-2j*pi*fc*n/fs), 1, down)``, folded into the taps.
+
+    Demodulates a gammatone band to baseband and decimates it, without ever materialising
+    the full-rate modulation. The modulation rides the 21 polyphase taps
+    (:func:`_get_modulated_polyphase_kernel`) and only a length-``out_len`` residual
+    survives, at the decimated rate.
+
+    The equivalence holds at the *signal's own* precision: the modulation is taken in
+    ``_complex_dtype_for(x.real.dtype)``, so complex64 in gives complex64 out and a real
+    input widens to the matching complex dtype rather than to complex128. (The phase is
+    always reduced in float64 and rounded once -- reducing in the signal's precision would
+    defeat the reduction.) An earlier revision built the kernel and the residual in
+    complex128 unconditionally while sizing the accumulator off the signal, which made the
+    folded path silently complex128-only: complex64 raised "Expected out tensor to have
+    dtype c10::complex<double>", real float64 raised "result type ComplexDouble can't be
+    cast to Double", and both gradient routes raised "expected m1 and m2 to have the same
+    dtype". Unreachable from the filterbank -- ``GammatoneAnalyzerTorch.process`` hands
+    over complex128 -- but the contract above is unconditional, so it had to be.
+
+    Deliberately a new entry point rather than a keyword on
+    :func:`fast_resample_poly_torch`: that function has six library call sites and 20+ in
+    the tests, and widening it would give it a contract that silently admits mixed rates
+    the fold cannot serve. This one's contract is the single line above, and
+    ``.scratch/p5-2026-08-17/parity_analysis.py`` checks exactly that, per band, against
+    ``_polyphase_decimate(band * exact_mod_row, ...)`` -- where ``exact_mod_row`` is built
+    by an *independent* exact-``Fraction`` reduction in Python integers, sharing no code
+    with this module: worst **1.219e-15** of peak over all 32 bands at all four batch
+    geometries the pipeline drives (mono 2/1 rows, stereo 6/2 rows). Building that
+    reference out of :func:`_modulation_phase` instead turns the check into a
+    self-consistency test and hides any error in the ratio itself -- which is exactly how
+    a 3.4373e-12 error on the base-frequency band passed a green suite once already.
+
+    Against *unmodified* HEAD -- whose modulation matrix built its exponential on the raw
+    argument -- the same comparison is **1.128e-11**, and that is the matrix being wrong,
+    not this. See :func:`_reduced_phase_exp`; the fold moves the output toward truth.
+
+    What it deletes, measured on the 16 kHz mono reference geometry: the ``(32, 120000)``
+    complex128 analysis modulation matrix (**61.44 MB** resident) and the full-rate pass
+    over it, against +1.298 MB of modulated kernels and +1.284 MB of residual vectors for
+    all 32 bands. The split/merge round trip goes with it on this path.
+    """
+    phase = _modulation_phase(center_frequency_hz, sampling_frequency_hz)
+    in_len = x.shape[axis]
+    x_moved = x.transpose(axis, -1)
+    shape_prefix = x_moved.shape[:-1]
+    x_flat = x_moved.reshape(-1, in_len)
+    # The whole path runs at the signal's own precision -- a complex64 band stays
+    # complex64 rather than being silently widened by a complex128 modulation, and a real
+    # band widens to the matching complex dtype because the result is complex either way.
+    dtype = _complex_dtype_for(x_flat.real.dtype)
+
+    if down == 1:
+        # Contract guard, not a hot path. `fast_resample_poly_torch` returns `x` unchanged
+        # at `up == down`, and the modulation used to be a separate pass, so `down == 1`
+        # has to come back as `x * m` at the full rate. `decimations` is `clamp(..., min=1)`
+        # and the measured minimum across every supported input rate is 13..15, so this is
+        # unreachable from the filterbank; it is here so the docstring's equivalence is
+        # true for every `down`.
+        out_len = in_len
+        y_flat = x_flat * _get_modulation_vector(
+            phase, -1, 0, 1, in_len, x_flat.device, dtype
+        )
+    else:
+        out_len = math.ceil(in_len / down)
+        y_flat = _polyphase_decimate(x_flat, down, in_len, out_len, half_length_factor, phase)
+        # The surviving residual: m[(hf+i)*down], indexed by the full-rate sample each
+        # decimated output came from. The `hf` offset is `n_pre_remove`; dropping it is a
+        # per-band constant rotation that no shape check and no existing test would catch.
+        y_flat = y_flat * _get_modulation_vector(
+            phase, -1, half_length_factor * down, down, out_len, x_flat.device, dtype
+        )
+
+    return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)
+
+
+def fast_interpolate_modulate_torch(
+        x: torch.Tensor,
+        up: int,
+        center_frequency_hz: float,
+        sampling_frequency_hz: float,
+        axis: int = -1,
+        half_length_factor: int = DEFAULT_RESAMPLE_HALF_LENGTH_FACTOR
+) -> torch.Tensor:
+    """``fast_resample_poly_torch(x, up, 1) * exp(+2j*pi*fc*n/fs)``, folded into the taps.
+
+    The mirror of :func:`fast_demodulate_decimate_torch`: interpolates a decimated
+    gammatone band back to the full rate and re-modulates it to its centre frequency,
+    without ever materialising the full-rate modulation. The re-modulation rides the 21
+    polyphase taps and what survives is a length-``in_len`` pre-multiply on the *decimated
+    input*, applied here before the GEMM.
+
+    **The signs are not symmetric with the analysis half and must not be assumed.**
+    Analysis demodulates with ``exp(-2j*pi*fc*n/fs)`` and its taps carry the *conjugate*
+    ``exp(+2j*pi*fc*k/fs)``; synthesis re-modulates with ``exp(+2j*pi*fc*n/fs)`` and its
+    taps carry that same sign *unconjugated*, offset by ``-n_pre_remove = -hf*up``, so
+    both sides end up asking :func:`_get_modulated_polyphase_kernel` for ``sign = +1`` and
+    differ only in the start offset. A sign slip is O(1); a dropped offset is a per-band
+    constant rotation with no shape change, which is why the bar below is per band.
+
+    **The synthesizer's phase factor is deliberately NOT folded in here.** It stays a
+    full-rate per-band complex scalar, which is exactly
+    ``GammatoneSynthesizerTorch.process``'s existing ``alignment=None`` default -- an
+    already-tested path that needs no new code. Folding it into the taps as well would
+    delete that scalar pass, but ``phase_factors`` is only unit modulus to ~1.3e-11
+    (``gammatone.py`` normalises ``slopes``, not the reciprocal) whereas the fold's
+    ``m[a-b] = m[a]*conj(m[b])`` identity needs exact unit modulus, and the variant is
+    unmeasured. Do not take it without a measurement.
+
+    Runs at the signal's own precision, for the same reason and by the same mechanism as
+    :func:`fast_demodulate_decimate_torch`: the phase is reduced in float64 and rounded
+    once into ``_complex_dtype_for(x.real.dtype)``.
+
+    What it deletes, measured on the 16 kHz mono reference geometry: the ``(32, 120336)``
+    complex128 fused modulation-times-phase alignment matrix (**61.61 MB** resident, built
+    once and streamed four times, once per component sweep) and the full-rate pass over
+    it, against +1.298 MB of modulated kernels and +1.284 MB of pre-multiply vectors for
+    all 32 bands. The split/merge round trip goes with it on this path -- 128 interpolation
+    calls per decomposition.
+
+    Per-band parity against ``_polyphase_interpolate(sub, U, ...) * exact_m_s_row`` with
+    the reference row built by an *independent* exact-``Fraction`` reduction sharing no
+    code with this module: see ``.scratch/p5-2026-08-17/parity_synthesis.py``.
+    """
+    phase = _modulation_phase(center_frequency_hz, sampling_frequency_hz)
+    in_len = x.shape[axis]
+    x_moved = x.transpose(axis, -1)
+    shape_prefix = x_moved.shape[:-1]
+    x_flat = x_moved.reshape(-1, in_len)
+    dtype = _complex_dtype_for(x_flat.real.dtype)
+
+    if up == 1:
+        # Contract guard, not a hot path -- the mirror of the `down == 1` guard above, and
+        # unreachable from the filterbank for the same reason (`decimations` is clamped at
+        # 1 and its measured minimum is 13..15 across every supported input rate).
+        out_len = in_len
+        return (x_flat * _get_modulation_vector(phase, 1, 0, 1, in_len, x_flat.device, dtype)
+                ).reshape(*shape_prefix, out_len).transpose(axis, -1)
+
+    out_len = in_len * up
+    # The surviving pre-multiply: m[up*i] on the decimated input index i. Indices outside
+    # [0, in_len) are the `F.pad` zeros the interpolation adds, so they need no modulation.
+    x_flat = x_flat.to(dtype) * _get_modulation_vector(
+        phase, 1, 0, up, in_len, x_flat.device, dtype
+    )
+    y_flat = _polyphase_interpolate(x_flat, up, in_len, out_len, half_length_factor, phase)
 
     return y_flat.reshape(*shape_prefix, out_len).transpose(axis, -1)

@@ -129,9 +129,16 @@ def test_torch_synthesizer_matches_gather_formulation(shape_prefix):
 def test_torch_synthesizer_alignment_argument_matches_premultiplying():
     """
     Passing a fused `(Bands, Time)` alignment matrix must equal pre-multiplying the
-    subbands by it and letting `process` apply the phase factors itself. This is exactly
-    what the decomposition does with the cached modulation-times-phase matrix, so a
-    broadcasting or indexing slip here would silently corrupt every reconstruction.
+    subbands by it and letting `process` apply the phase factors itself.
+
+    The decomposition no longer drives this: P5 folded the synthesis modulation into the
+    interpolation taps, so `run_auditory_synthesis_filterbank_torch` takes the
+    `alignment=None` default and the fused modulation-times-phase matrix this test was
+    written against is gone. The hook and the test stay because the `(Bands, Time)`
+    pre-multiply is a general argument on a public-ish method, and because the equivalence
+    it pins -- that `alignment` multiplies the *subband* time index, the same index the
+    interpolator produces -- is precisely the property that lets the fold be index-aligned
+    with no shift. A broadcasting or indexing slip here would invalidate that reasoning.
     """
     fs = 16000.0
     time_steps = 1500
