@@ -27,11 +27,43 @@ from tests.conftest import to_numpy_format
 _MATLAB_RESAMPLER_GAIN_OFFSET = 1.0025651
 
 # Worst measured deviation from the constant across all four components and both
-# channels is 1.5e-5, on `artifacts` -- the quietest component, whose gold WAV sits
-# closest to the PCM16 quantization floor. 1e-3 leaves ~60x headroom for platform
-# FFT/LAPACK variation while still being ~500x tighter than the 0.5..2.0 band it
-# replaces.
-_GAIN_TOLERANCE = 1e-3
+# channels is 1.17e-5, on `artifacts` -- the quietest component, whose gold WAV sits
+# closest to the PCM16 quantization floor. 1e-4 keeps ~8x headroom for platform
+# FFT/LAPACK variation. Tightened from 1e-3 on 2026-08-15.
+_GAIN_TOLERANCE = 1e-4
+
+# Per-component correlation floors, expressed as the largest tolerated `1 - corr`.
+#
+# A single global threshold is dominated by `artifacts` and wastes the rest: the
+# components differ by ~75x, so a bar set for `artifacts` would let `true_target`
+# degrade 75-fold without failing. These are per-component for that reason.
+#
+# Measured 2026-08-15 on the reference platform, worst over both backends and both
+# channels; the allowance is the next round number at least ~30x above it:
+#
+#     component            measured 1-corr     allowed     margin
+#     true_target                  4.4e-08       1e-05       ~227x
+#     interference                 7.4e-08       1e-05       ~135x
+#     target_distortion            2.5e-07       1e-05        ~40x
+#     artifacts                    3.3e-06       1e-04        ~30x
+#
+# `artifacts` gets its own decade because it is the smallest-peak residual and the
+# least-squares Gram's minimum eigenvalue is ~3.4e-10, so a 1-ULP perturbation
+# upstream arrives ~1e6 larger -- see ARCHIVE.md. Margins are deliberately generous
+# rather than snug: these are one machine's numbers, CI also runs ubuntu-latest, and
+# ground rule 3 in TODO.md exists because platform-specific observations have been
+# written down here as universal invariants before.
+_MAX_CORRELATION_DEFICIT = {
+    "true_target": 1e-5,
+    "interference": 1e-5,
+    "target_distortion": 1e-5,
+    "artifacts": 1e-4,
+}
+
+# CUDA is not exercised in CI and has never been measured against these WAVs, so it
+# keeps a documented loose bound rather than inheriting the CPU floors. Tighten it
+# once there is a measurement to justify a number.
+_CUDA_MAX_CORRELATION_DEFICIT = 1e-2
 
 
 @pytest.mark.regression
@@ -72,12 +104,12 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
         (to_numpy_format(py_waveforms.artifacts), "targetEstimate_eArtif.wav", "artifacts")
     ]
 
-    # With full-order resampling (the default) the NumPy backend matches MATLAB to
-    # ~0.9999. The torch backend's differentiable approximations (softplus,
-    # FIR-truncated IIRs) live in the PEMO-Q metric rather than this decomposition
-    # path, so it measures 1.00000 here too; the looser bound is kept only as
-    # headroom for float64 CUDA, not because torch is known to be worse.
-    corr_threshold = 0.999 if backend_type == "numpy" else 0.99
+    # The torch backend's differentiable approximations (softplus, FIR-truncated IIRs)
+    # live in the PEMO-Q metric rather than this decomposition path, so torch-on-CPU
+    # measures the same as numpy here -- within 5e-10 correlation of it across the
+    # whole swept history (see ARCHIVE.md, "History sweep"). Both therefore share the
+    # per-component floors; only CUDA, which has never been measured, stays loose.
+    is_cuda = device is not None and "cuda" in str(device)
 
     for py_val, gold_filename, label in validation_map:
         gold_val, _ = sf.read(matlab_ref_resources / gold_filename)
@@ -95,9 +127,17 @@ def test_regression_against_matlab_references(matlab_ref_resources, peass_backen
                 assert np.std(py_ch) < 1e-4, f"Energy mismatch in {label} channel {ch}"
             else:
                 corr = np.corrcoef(py_ch, gold_ch)[0, 1]
-                assert corr > corr_threshold, (
+                max_deficit = (_CUDA_MAX_CORRELATION_DEFICIT if is_cuda
+                               else _MAX_CORRELATION_DEFICIT[label])
+                # Compare the deficit rather than the correlation: these values sit
+                # at 0.999996+, where printing `corr` to a few decimals renders every
+                # one of them as "1.0000" and a failure message says nothing about
+                # how far off it actually was.
+                deficit = 1.0 - corr
+                assert deficit < max_deficit, (
                     f"Regression failure on {backend_type} (device: {device}): "
-                    f"{label} (CH{ch}) correlation is {corr:.4f}"
+                    f"{label} (CH{ch}) correlation deficit is {deficit:.3e}, "
+                    f"above the {max_deficit:.0e} floor (correlation {corr:.12f})"
                 )
                 # Correlation is blind to gain, so also assert the energy (RMS) ratio
                 # equals the known, root-caused resampler-normalization offset.
