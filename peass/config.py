@@ -74,10 +74,36 @@ class DecompositionConfiguration:
     # Anti-aliasing FIR half-length as a multiple of the up/down ratio, used for
     # the polyphase resampling inside the decomposition. 10 matches SciPy/MATLAB
     # (near bit-exact reference agreement); lower values (e.g. 3) trade accuracy
-    # for speed (~-6% component energy, correlation ~0.99 at 3x).
+    # for speed (~-6% component energy, correlation ~0.99 at 3x). Values below 1
+    # are rejected in `__post_init__`; see the check for why.
     resample_filter_half_length_factor: int = 10
 
     def __post_init__(self) -> None:
+        # The fast `_polyphase_decimate` path does not raise below 1 -- it returns
+        # finite numbers that disagree with its own `_polyphase_decimate_padded`
+        # reference by O(1). Measured 2026-08-17 at hf = 0: deviations 0.39 to 2.13
+        # across 33 of the swept (down, in_len, rows, dtype) combinations, against
+        # 2.22e-16 for hf >= 1. The grid algebra needs
+        # `right_pad >= (hf-1)*down + 1 > 0`, i.e. `hf >= 1`. The gradient path
+        # routes to the padded reference instead, so below 1 the no-grad and grad
+        # paths silently disagree as well.
+        #
+        # Raising here is a deliberate public behaviour change: callers who pass 0
+        # get a loud error where they used to get silently wrong output. Nothing in
+        # the library passes it (default 10, and the comment above contemplates
+        # lowering only to ~3), so it has never been hit -- but "nothing in the
+        # library passes that" is a statement about the library, not about the API,
+        # and this dataclass is public.
+        if self.resample_filter_half_length_factor < 1:
+            raise ValueError(
+                f"resample_filter_half_length_factor="
+                f"{self.resample_filter_half_length_factor} is invalid; it must be >= 1. "
+                f"Below 1 the polyphase resampler's grid algebra breaks down and the fast "
+                f"path returns finite but O(1)-wrong output instead of failing, and the "
+                f"gradient path (which uses the padded reference) disagrees with it. "
+                f"The default is 10, which matches SciPy/MATLAB; 3 is the lowest value "
+                f"that has been characterized as a usable accuracy/speed trade."
+            )
         if self.segmentation_factor != 1:
             raise NotImplementedError(
                 f"segmentation_factor={self.segmentation_factor} is not supported; only 1 is. "

@@ -8,6 +8,7 @@ from peass.backend_torch.decomposition import apply_window_shading_torch
 from peass.backend_torch.decomposition import decompose_distortion_components
 from peass.backend_torch.decomposition import matlab_shade_length
 from peass.backend_torch.decomposition import matlab_shade_window_torch
+from peass.backend_torch.gammatone import GammatoneSynthesizerTorch
 
 # (fs, shade_ms) pairs exercised by the MATLAB-fidelity shade window tests. The
 # 44100/5.0, 44100/25.0 and 22050/10.0 entries land exactly on a .5 sample count,
@@ -105,31 +106,130 @@ def test_torch_shade_window_matches_numpy_backend():
 
 
 @pytest.mark.unit
+def test_synthesis_per_band_constants_are_keyed_on_what_they_depend_on():
+    """
+    A per-band cached constant must never be shared across synthesizer delays.
+
+    This test used to pin `_get_synthesis_alignment_matrix_torch`, which cached
+    `modulation * phase_factors` in one fused `(bands, max_len)` matrix: the phase factors
+    depend on the delay and the modulation does not, so keying that cache on the
+    modulation's arguments alone would have handed a matrix built for one delay to a call
+    that asked for another -- a silent, delay-dependent corruption of every reconstruction
+    that the single-delay regression test could not see.
+
+    P5 deleted the matrix: the modulation moved into the interpolation taps
+    (`fast_interpolate_modulate_torch`) and only the per-band phase factor is left, applied
+    as a scalar by `GammatoneSynthesizerTorch.process`'s `alignment=None` default. The
+    invariant survives the deletion and is re-aimed at the two caches that replaced it:
+
+    * the per-band constants the fold introduced -- the modulated kernel and the
+      pre-multiply vector -- must NOT depend on the delay, and must not be able to
+      collide across bands or across `half_length_factor`. They are keyed on the exact
+      `fc/fs` rational and the rate, neither of which the delay reaches;
+    * the delay-dependent factor now comes from `_get_synthesizer_params_torch` alone,
+      which is already keyed on `delay_sec`, and `GammatoneSynthesizerTorch` must pick up
+      the entry for the delay it was constructed with.
+
+    Bounds on the *values* of those constants are in `test_torch_utils.py`; what is checked
+    here is only that the keying cannot serve the wrong one.
+    """
+    from peass.backend_torch.gammatone import GammatoneAnalyzerTorch
+    from peass.backend_torch.gammatone import _get_synthesizer_params_torch
+    from peass.backend_torch.utils import _get_modulated_polyphase_kernel
+    from peass.backend_torch.utils import _get_modulation_vector
+    from peass.backend_torch.utils import _modulation_phase
+
+    fs = 16000.0
+    device = torch.device("cpu")
+    analyzer = GammatoneAnalyzerTorch(fs, 80.0, 1000.0, 4000.0, 1.0, device, torch.float64)
+    cfs = tuple(analyzer.center_frequencies.tolist())
+    norms = tuple(analyzer.norms.tolist())
+    coefs = tuple(analyzer.coefs.tolist())
+
+    # The delay is not an input to either fold-side cache, so a repeat call returns the
+    # identical object while a different band or a different filter length does not.
+    first_band, second_band = _modulation_phase(cfs[0], fs), _modulation_phase(cfs[1], fs)
+    kernel = _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 10)
+    assert _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 10) is kernel
+    assert not torch.equal(
+        kernel, _get_modulated_polyphase_kernel(20, 1, second_band, torch.float64, device, 10))
+    assert not torch.equal(
+        kernel, _get_modulated_polyphase_kernel(20, 1, first_band, torch.float64, device, 3))
+
+    pre_multiply = _get_modulation_vector(first_band, 1, 0, 20, 256, device)
+    assert _get_modulation_vector(first_band, 1, 0, 20, 256, device) is pre_multiply
+    assert not torch.equal(
+        pre_multiply, _get_modulation_vector(second_band, 1, 0, 20, 256, device))
+
+    # The delay-dependent half: different delays give different phase factors, and the
+    # synthesizer picks up the ones its own delay was keyed on.
+    _, short_factors, _ = _get_synthesizer_params_torch(0.004, fs, cfs, norms, coefs, "cpu")
+    _, long_factors, _ = _get_synthesizer_params_torch(0.008, fs, cfs, norms, coefs, "cpu")
+    assert not torch.equal(short_factors, long_factors)
+
+    delays, phase_factors, gains = _get_synthesizer_params_torch(0.004, fs, cfs, norms, coefs, "cpu")
+    synth = GammatoneSynthesizerTorch(analyzer, 0.004)
+    assert torch.equal(delays, synth.delays)
+    assert torch.equal(phase_factors, synth.phase_factors)
+    assert torch.equal(gains, synth.gains)
+
+
+@pytest.mark.unit
 def test_torch_hermitian_solve_falls_back_on_rank_deficient_frames():
     """The Cholesky solver must reproduce `pinv` on frames it cannot factorize.
 
     `_solve_hermitian_batch` replaced an unconditional `torch.linalg.pinv` with
-    `cholesky_ex` plus a per-matrix fallback. Silent frames make the Gram identically
-    zero and genuinely rank-deficient ones make it merely singular, so both have to
-    keep resolving to the same minimum-norm solution `pinv` gave -- and, just as
-    importantly, the batched factorization must not leak inf/NaN out of the frames it
-    failed on. Nothing else in the suite exercises the failing branch directly.
+    `cholesky_ex` plus a per-matrix fallback, and applies MATLAB `LSDecompose.m`'s
+    1e-15 diagonal ridge before factorizing. A genuinely rank-deficient frame still
+    fails the ridged factorization and must resolve to the same minimum-norm solution
+    `pinv` gave -- and, just as importantly, the batched factorization must not leak
+    inf/NaN out of the frames it failed on. Nothing else in the suite exercises the
+    failing branch directly.
+
+    The Gram and the right-hand side are built here from a SHARED Toeplitz factor,
+    `gram = T^H diag(w^2) T` and `rhs = T^H diag(w^2) est`, exactly as
+    `perform_time_varying_least_squares_projection_torch` assembles them. That coupling
+    is load-bearing, not decoration. A silent frame is `T == 0`, which forces `rhs == 0`
+    *exactly*; the ridge makes `0 + 1e-15*I` positive definite, so `cholesky_ex` now
+    succeeds on such a frame and returns bitwise-zero weights instead of routing it to
+    `pinv`. Handing this function a zero Gram next to an INDEPENDENT random `rhs` -- as
+    this fixture used to -- asks it for `rhs * 1e15`, which is exactly what it correctly
+    returns, and which the coupled assembly only ever reaches at denormal source scale
+    (`T` ~ 1e-180 underflows the Gram to 0.0 while `rhs` survives), where the resulting
+    projection underflows back to 0.0 anyway. Do not decouple them again, and do not
+    delete the ridge to make an uncoupled fixture pass.
     """
     from peass.backend_torch.decomposition import _solve_hermitian_batch
 
     generator = torch.Generator().manual_seed(0)
-    size, batch = 9, 6
-    factor = torch.randn(batch, size, size, dtype=torch.float64, generator=generator)
-    gram = factor @ factor.transpose(1, 2) + size * torch.eye(size, dtype=torch.float64)
-    gram[1] = 0.0  # silent frame
-    gram[3] = gram[3][:, :1] @ gram[3][:1, :]  # rank 1, not positive definite
-    rhs = torch.randn(batch, size, 2, dtype=torch.float64, generator=generator)
+    num_frames, window_length, width, num_channels = 6, 40, 9, 2
 
-    _, info = torch.linalg.cholesky_ex(gram)
-    assert bool(info.any()), "test no longer exercises the fallback branch"
+    toeplitz = torch.randn(num_frames, window_length, width, dtype=torch.float64, generator=generator)
+    toeplitz[1] = 0.0  # silent frame: the source block itself is identically zero
+    # rank 1, so the Gram is singular but not zero, and stays singular under the ridge
+    toeplitz[3] = toeplitz[3][:, :1] @ torch.randn(1, width, dtype=torch.float64, generator=generator)
+    estimates = torch.randn(num_frames, window_length, num_channels, dtype=torch.float64, generator=generator)
+    window_sq = torch.rand(1, window_length, 1, dtype=torch.float64, generator=generator)
+
+    conjugate_transpose = toeplitz.transpose(1, 2)
+    gram = conjugate_transpose @ (window_sq * toeplitz)
+    rhs = conjugate_transpose @ (window_sq * estimates)
+
+    # The silent frame really is zero on both sides -- the premise of the whole fixture.
+    assert bool((gram[1] == 0).all()) and bool((rhs[1] == 0).all())
+
+    # The rank-deficient frame must still fail the factorization the solver actually
+    # performs (i.e. after the ridge), or this test stops covering the `pinv` branch.
+    _, info_ridged = torch.linalg.cholesky_ex(
+        gram + 1e-15 * torch.eye(width, dtype=torch.float64)
+    )
+    assert int(info_ridged[3]) != 0, "test no longer exercises the fallback branch"
+    assert int(info_ridged[1]) == 0, "the ridge should make the silent frame factorizable"
 
     solved = _solve_hermitian_batch(gram, rhs)
     assert bool(torch.isfinite(solved).all())
+    # A zero Gram with a zero rhs gives exactly zero weights -- no 1e15 amplification.
+    assert bool((solved[1] == 0).all())
     torch.testing.assert_close(solved, torch.linalg.pinv(gram) @ rhs, rtol=0.0, atol=1e-12)
 
 

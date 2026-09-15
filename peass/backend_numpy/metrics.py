@@ -176,9 +176,20 @@ def calculate_auditory_quality_features(
     channel_artifacts_quality = np.zeros(num_channels)
     channel_global_quality = np.zeros(num_channels)
 
-    # --- FUTURE WORK: Potential Parallelization Bottleneck ---
-    # These sequential generate_auditory_internal_representation calls are independent.
-    # To optimize multi-core throughput, offload these tasks to a concurrent.futures.ThreadPoolExecutor.
+    # These `generate_auditory_internal_representation` calls are independent, and
+    # an earlier note here suggested handing them to a ThreadPoolExecutor. Do not:
+    # the library spawns no threads, no subprocesses and no multiprocessing (see
+    # TODO.md ground rule 1, and the Numba `prange` entry in ARCHIVE.md that was
+    # measured at 1.8x and declined on exactly this basis). Speed here has to come
+    # from efficiency, not from fanning out.
+    #
+    # 5 runs per channel. The four references are leave-one-out sums of the same
+    # four components, and the model's front end (scale, resample, gammatone) is
+    # linear, so four filterbank passes could in principle serve all five. That
+    # was measured on 2026-08-15 and is a loss: the saving is one gammatone pass
+    # (~44 ms) and the cost is forming the combinations on (27, N) subbands
+    # instead of (N,) waveforms, ~11 ms per full-array op. It is also only a
+    # reassociation, not bit-identical. Summing in the time domain is correct.
     for channel_idx in range(num_channels):
         mtest, fr = generate_auditory_internal_representation(composite_estimate[:, channel_idx], sampling_frequency_hz)
 

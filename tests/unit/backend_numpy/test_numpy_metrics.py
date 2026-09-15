@@ -41,7 +41,14 @@ def test_pemo_similarity_identity():
     test_rep = ref_rep.copy()
 
     sim = calculate_auditory_similarity_metric(ref_rep, test_rep, fs)
-    assert 0.9 <= sim <= 1.0
+
+    # Measured 2026-08-15: exactly 1.0, deficit 0.0. The metric is a normalized
+    # correlation, so comparing a representation with a copy of itself divides an
+    # expression by itself; the only way this is not exactly 1.0 is a summation-
+    # order difference, which 1e-12 (~1e4 ULP) absorbs. Tightened from
+    # `0.9 <= sim`, which allowed a 1e-1 deficit against a measured 0.
+    assert sim <= 1.0, f"Similarity metric exceeded its upper bound: {sim!r}"
+    assert 1.0 - sim < 1e-12, f"Self-similarity deficit is {1.0 - sim:.3e}, expected 0"
 
 
 @pytest.mark.unit
@@ -71,6 +78,8 @@ def test_perceptual_assimilation_behavior():
     # Perceptual metric must be higher than standard correlation due to threshold masking
     assert perceptual_metric > standard_corr
 
-    # Perfect identity constraint
+    # Perfect identity constraint. Measured 2026-08-15: exactly 1.0. Tightened from
+    # atol=1e-5, which had no measured basis; see test_pemo_similarity_identity for
+    # why 1e-12 is the right order for a self-comparison.
     identity_metric = calculate_auditory_similarity_metric(ref_rep, ref_rep.copy(), fs)
-    np.testing.assert_allclose(identity_metric, 1.0, atol=1e-5)
+    np.testing.assert_allclose(identity_metric, 1.0, atol=1e-12)

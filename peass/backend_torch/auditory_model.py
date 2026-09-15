@@ -74,6 +74,95 @@ try:
 
         return outputs
 
+
+    @numba.njit(cache=True, fastmath=False)
+    def _numba_fused_haircell_adaptation(
+            subbands: np.ndarray,
+            haircell_gain: float,
+            thresholds: np.ndarray,
+            gains: np.ndarray,
+            abs_thresh: float,
+            final_thresh: float,
+            output_scale: float,
+    ) -> np.ndarray:
+        """Rectify, transduce, floor, adapt and rescale in one row-major pass.
+
+        This is the whole of ``simulate_inner_haircell_transduction`` followed by
+        ``simulate_auditory_nerve_adaptation``, for one ``(rows, num_samples)``
+        block, and it is a *fast path* -- the two torch functions remain the
+        definition and still serve grad / non-CPU / no-Numba callers. Note that
+        float32 callers are NOT among them: the gammatone analyzer promotes before
+        this is reached, so a float32 caller of the metric runs this kernel too. See
+        ``_can_fuse_haircell_adaptation``.
+
+        Two pieces of arithmetic differ from what those two functions do, and both
+        are deliberate:
+
+        * The haircell lowpass is evaluated as the exact one-pole recurrence
+          ``y[n] = g*y[n-1] + (1-g)*x[n]`` rather than as its impulse response
+          truncated at 10 ms and convolved by FFT. Those are the same filter to
+          ``g**(0.01*fs) == exp(-20*pi) == 5.2e-28`` relative -- the exponent is
+          ``fs``-independent, so the truncation is twelve orders below float64
+          eps at every rate. Measured against a double-double (~106-bit) oracle on
+          the reference clip's real subbands, the recurrence is the *more* accurate
+          of the two: 1.96e-16 worst absolute error against the FFT path's 4.31e-16
+          (2.1e-16 vs 4.6e-16 of the signal's own peak). See
+          ``tests/unit/backend_torch/test_torch_auditory_model.py`` for the pinned
+          comparison. Note ``np.longdouble`` is float64 on Windows/MSVC, so an
+          80-bit oracle is not available on the reference platform and a
+          longdouble "oracle" here silently measures nothing.
+        * The five adaptation stages are transcribed exactly as in
+          ``_numba_adaptation_loop`` -- running product over the *previous* step's
+          state, one divide, then ``c*(1-g) + s*g`` as two multiplies and an add,
+          under ``fastmath=False``. Same order, same result.
+
+        The final affine ``(100/(1 - final_thresh)) * (adapted - final_thresh)`` is
+        folded in here as ``output_scale`` so it costs no extra pass.
+
+        The win is memory traffic, not arithmetic: the unfused path materialises
+        the relu, an rfft spectrum, an irfft output, a clamp, two full transposes
+        and two more full-size buffers for the affine. This writes one buffer.
+        """
+        num_rows, num_samples = subbands.shape
+        outputs = np.empty((num_rows, num_samples), dtype=subbands.dtype)
+
+        haircell_weight = 1.0 - haircell_gain
+        input_weight = 1.0 - gains
+
+        state = np.empty(5, dtype=subbands.dtype)
+        for row_idx in range(num_rows):
+            haircell_state = 0.0
+            for stage_idx in range(5):
+                state[stage_idx] = thresholds[stage_idx]
+
+            for sample_idx in range(num_samples):
+                # 1. Half-wave rectification (F.relu).
+                value = subbands[row_idx, sample_idx]
+                if value < 0.0:
+                    value = 0.0
+
+                # 2. Haircell 1 kHz lowpass, as the exact causal one-pole IIR.
+                haircell_state = haircell_gain * haircell_state + haircell_weight * value
+                floored = haircell_state
+
+                # 3. Absolute-hearing-threshold floor (torch.clamp).
+                if floored < abs_thresh:
+                    floored = abs_thresh
+
+                # 4. Five-stage adaptation cascade, folded over the running product.
+                running_product = 1.0
+                compressed = 0.0
+                for stage_idx in range(5):
+                    running_product *= state[stage_idx]
+                    compressed = floored / running_product
+                    updated = compressed * input_weight[stage_idx] + state[stage_idx] * gains[stage_idx]
+                    state[stage_idx] = max(updated, thresholds[stage_idx])
+
+                # 5. Global dB offset scaling.
+                outputs[row_idx, sample_idx] = output_scale * (compressed - final_thresh)
+
+        return outputs
+
 except ImportError:
     _HAS_NUMBA = False
 
@@ -284,6 +373,71 @@ def simulate_auditory_nerve_adaptation(subbands: torch.Tensor, fs: float) -> tor
     return (100.0 / (1.0 - final_thresh)) * (adapted - final_thresh)
 
 
+def _can_fuse_haircell_adaptation(subbands: torch.Tensor) -> bool:
+    """Gate for the fused Numba fast path: CPU, float64, no gradient, Numba present.
+
+    Deliberately the same four conditions as the adaptation-only Numba branch in
+    ``simulate_auditory_nerve_adaptation``, since this is the same kind of path --
+    forward-only, native, optional-dependency -- just covering two stages instead
+    of one. Everything it rejects falls through to the torch functions unchanged.
+
+    The ``float64`` condition is **not** a float32 opt-out, and must not be read as
+    one. ``GammatoneAnalyzerTorch`` promotes unconditionally -- ``process`` casts its
+    rows to ``complex128`` and ``process_real`` to ``float64`` -- so the subbands the
+    only production call site passes here are float64 whatever dtype the caller
+    handed the metric. A float32 caller of ``calculate_auditory_quality_features``
+    therefore *does* run this kernel and does move by the haircell roundoff below
+    (measured 2.4e-12, 2.3e-15 of peak, on the internal representation; <=4.4e-16
+    absolute on the four features). The condition is live only for a hypothetical
+    caller reaching these internals directly, and is kept because the kernel really
+    would be wrong on a float32 buffer -- not because anything reaches it that way.
+    ``tests/unit/backend_torch/test_torch_auditory_model.py`` pins both readings.
+    """
+    return (
+            _HAS_NUMBA
+            and subbands.device.type == "cpu"
+            and subbands.dtype == torch.float64
+            and not (torch.is_grad_enabled() and subbands.requires_grad)
+    )
+
+
+def _fused_haircell_adaptation(subbands: torch.Tensor, fs: float) -> torch.Tensor:
+    """``simulate_auditory_nerve_adaptation(simulate_inner_haircell_transduction(...))``.
+
+    The constants are taken from the same cache the unfused path uses, so the
+    kernel sees exactly the thresholds and gains the torch loop would have seen;
+    only the haircell filter's *evaluation* differs (see the kernel's docstring).
+
+    ``subbands`` arrives from ``GammatoneAnalyzerTorch.process_real`` as a contiguous
+    real block, so ``reshape`` and ``.numpy()`` are both views and the kernel reads
+    unit-stride rows. It used to arrive as the stride-2 ``.real`` view of the
+    analyzer's complex output, and was handed over strided on purpose: the
+    contiguising copy would have been another full-size buffer, and `ARCHIVE.md`
+    records the same experiment on the NumPy backend's fused kernel at 1.03x -- that
+    loop is latency-bound on its five serial divisions, not on load bandwidth. The
+    real-output analysis path made the block contiguous for free, as a side effect of
+    not building the complex one; nothing here had to change for it, and the kernel
+    still accepts either layout.
+    """
+    abs_thresh, gains, thresholds = _get_adaptation_constants(fs, str(subbands.device), subbands.dtype)
+    haircell_gain = math.exp(-math.pi * 2000.0 / fs)
+    final_thresh = abs_thresh ** (0.5 ** 5)
+
+    orig_shape = subbands.shape
+    flat = subbands.reshape(-1, orig_shape[-1])
+
+    adapted = _numba_fused_haircell_adaptation(
+        flat.numpy(),
+        haircell_gain,
+        thresholds.numpy(),
+        gains.numpy(),
+        abs_thresh,
+        final_thresh,
+        100.0 / (1.0 - final_thresh),
+    )
+    return torch.from_numpy(adapted).view(*orig_shape)
+
+
 def generate_auditory_internal_representation_torch(
         signal_data: torch.Tensor, fs: float,
         modulation_type: ModulationProcessingType = ModulationProcessingType.LOWPASS
@@ -303,10 +457,16 @@ def generate_auditory_internal_representation_torch(
         fs = float(new_fs)
 
     analyzer = GammatoneAnalyzerTorch(fs, low_freq, 1000.0, high_freq, 1.0, signal_data.device, signal_data.dtype)
-    subbands = analyzer.process(scaled).real
+    # Real-output analysis path: this stage discards the imaginary part, so the
+    # subbands come back as a contiguous real block from a half-length inverse
+    # transform instead of `.real` on a complex one. See `process_real`.
+    subbands = analyzer.process_real(scaled)
 
-    transduced = simulate_inner_haircell_transduction(subbands, fs)
-    adapted = simulate_auditory_nerve_adaptation(transduced, fs)
+    if _can_fuse_haircell_adaptation(subbands):
+        adapted = _fused_haircell_adaptation(subbands, fs)
+    else:
+        transduced = simulate_inner_haircell_transduction(subbands, fs)
+        adapted = simulate_auditory_nerve_adaptation(transduced, fs)
 
     mod_str = "LOWPASS" if modulation_type == ModulationProcessingType.LOWPASS else "FILTERBANK"
     centers, bandwidths = _get_modulation_constants(mod_str, str(signal_data.device), signal_data.dtype)

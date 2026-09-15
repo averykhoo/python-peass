@@ -61,12 +61,16 @@ def test_auditory_fallback_kernels():
     assert res_loops.shape == subband_signals.shape
 
     # 2. Fallback fused auditory kernel
+    # `output_scale=1.0, output_offset=0.0` is the identity affine: this test is
+    # about the cascade, not the dB scaling the production call site passes in.
     res_fused = _fallback_fused_auditory_kernel(
         subband_signals=subband_signals.copy(),
         sampling_frequency_hz=16000.0,
         haircell_filter_gain=haircell_gain,
         adaptation_bandwidths=adaptation_loop_bandwidths,
-        absolute_hearing_threshold=1e-5
+        absolute_hearing_threshold=1e-5,
+        output_scale=1.0,
+        output_offset=0.0
     )
     assert res_fused.shape == subband_signals.shape
 
@@ -78,7 +82,7 @@ def test_auditory_fallback_kernels():
         np.testing.assert_allclose(res_loops, jit_loops, rtol=1e-9, atol=1e-12)
 
         jit_fused = _numba_fused_auditory_kernel(
-            subband_signals.copy(), 16000.0, haircell_gain, adaptation_loop_bandwidths, 1e-5
+            subband_signals.copy(), 16000.0, haircell_gain, adaptation_loop_bandwidths, 1e-5, 1.0, 0.0
         )
         np.testing.assert_allclose(res_fused, jit_fused, rtol=1e-9, atol=1e-12)
 
@@ -193,9 +197,10 @@ def test_auditory_numba_fallback_equivalence():
     np.testing.assert_allclose(numba_adapt, fallback_adapt, rtol=1e-12, atol=1e-12)
 
     # 3. Compare Fused Kernels
-    numba_fused = _numba_fused_auditory_kernel(subbands, fs, haircell_filter_gain, adaptation_loop_bandwidths, thresh)
+    numba_fused = _numba_fused_auditory_kernel(subbands, fs, haircell_filter_gain, adaptation_loop_bandwidths,
+                                               thresh, 1.0, 0.0)
     fallback_fused = _fallback_fused_auditory_kernel(subbands, fs, haircell_filter_gain, adaptation_loop_bandwidths,
-                                                     thresh)
+                                                     thresh, 1.0, 0.0)
     np.testing.assert_allclose(numba_fused, fallback_fused, rtol=1e-12, atol=1e-12)
 
 

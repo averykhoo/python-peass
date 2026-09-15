@@ -1,3 +1,4 @@
+hypothesis
 numba
 numpy
 pytest

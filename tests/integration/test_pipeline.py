@@ -168,7 +168,7 @@ def test_predictor_pipeline_on_database_assets(database_audio_pair):
 @pytest.mark.integration
 def test_decomposition_correctness_on_database_assets(database_audio_pair):
     """Tests the physical least-squares decomposition on real files."""
-    target, interferer, fs, _ = database_audio_pair
+    target, interferer, fs, identifier = database_audio_pair
     estimate = target + 0.1 * interferer
 
     config = DecompositionConfiguration()
@@ -179,6 +179,22 @@ def test_decomposition_correctness_on_database_assets(database_audio_pair):
         sampling_frequency_hz=fs
     )
 
-    # Assert that the extracted physical interference correlates with the actual source
+    # Assert that the extracted physical interference correlates with the actual
+    # source. This is a fidelity bar, not a parity bar: the interference component
+    # is a filtered projection of the interferer, so it can never reach 1.0.
+    # Measured 2026-08-15 over the fixture parametrization:
+    #
+    #     asset         correlation    1 - corr
+    #     mono_16k      0.9921759      7.82e-03
+    #     stereo_16k    0.9820940      1.79e-02   <- worst
+    #
+    # Tightened 0.85 -> 0.95 on 2026-08-15: the old bar allowed a 1.5e-1 deficit
+    # against a measured 1.8e-02, i.e. 8.4x, so the decomposition could lose most of
+    # the interferer and still pass. 0.95 leaves ~2.8x, which is appropriate for a
+    # quantity that is deterministic given fixed input WAVs (no RNG; the backend
+    # arithmetic varies at ~1e-6, six decades below this bar).
     corr_interf = np.corrcoef(result.waveforms.interference.ravel(), interferer.ravel())[0, 1]
-    assert corr_interf > 0.85
+    assert corr_interf > 0.95, (
+        f"Extracted interference tracks the true interferer at only {corr_interf:.6f} "
+        f"on {identifier}"
+    )
