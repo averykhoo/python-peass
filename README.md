@@ -3,8 +3,10 @@
 [![Build Status](https://img.shields.io/github/actions/workflow/status/averykhoo/python-peass/main-tests.yml?branch=main&label=tests)](https://github.com/averykhoo/python-peass/actions)
 [![PyPI version](https://img.shields.io/pypi/v/python-peass.svg)](https://pypi.org/project/python-peass/)
 
-> This project was ported by Gemini 3.5 Flash from
+> This project was initially ported by Gemini 3.5 Flash from
 > https://gitlab.inria.fr/bass-db/peass/-/tree/22c7fc4ef670f8bb6eea9ab4abea98323006b769/v2.0.1
+>
+> Subsequent refactoring, performance work, and test coverage were done largely by Claude.
 
 A Python port of the **PEASS v2.0.1** (Perceptual Evaluation methods for Audio Source Separation) toolkit [1].
 
