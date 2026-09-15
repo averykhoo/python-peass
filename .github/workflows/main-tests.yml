@@ -22,3 +22,7 @@ jobs:
       os: ${{ matrix.os }}
       python-version: ${{ matrix.python-version }}
       remove-numba: ${{ matrix.remove-numba }}
+      # Post-merge runs the oracle on both numba legs: a numba kernel diverging from
+      # the reference is exactly what it exists to catch, and nothing is blocked by
+      # a red main the way a contributor is blocked by a red PR.
+      run-oracle: true

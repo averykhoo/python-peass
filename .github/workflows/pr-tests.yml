@@ -35,3 +35,9 @@ jobs:
       os: ${{ matrix.os }}
       python-version: ${{ matrix.python-version }}
       remove-numba: ${{ matrix.remove-numba }}
+      # Exactly one leg of the matrix, never all of them. hypothesis draws its own
+      # seeds here (no derandomize), so a run can go red for a latent bug the PR did
+      # not introduce; with `fail-fast: true` above, spreading that across five jobs
+      # would multiply the chance of one flake cancelling the whole matrix. This
+      # expression matches only the base ubuntu/3.14/numba combination.
+      run-oracle: ${{ matrix.os == 'ubuntu-latest' && matrix.python-version == '3.14' && !matrix.remove-numba }}

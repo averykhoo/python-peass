@@ -17,6 +17,10 @@ on:
         required: false
         type: boolean
         default: false
+      run-oracle: # Select the opt-in live-oracle suite, which is off by default
+        required: false
+        type: boolean
+        default: false
 
 jobs:
   run-tests:
@@ -55,6 +59,17 @@ jobs:
       - name: Run test suite with coverage
         run: |
           pytest -n auto --cov=peass --cov-report=xml
+
+      # pyproject.toml sets `addopts = ["-m", "not oracle"]`, so the step above never
+      # runs the live oracle. A command-line `-m` replaces that default, which makes
+      # this step the only thing selecting it -- without it the suite exists, reports
+      # success and is never executed. No coverage flags: a second --cov-report would
+      # overwrite the coverage.xml the summary steps below consume.
+      - name: Run reference oracle suite
+        if: ${{ inputs.run-oracle == true }}
+        run: |
+          pytest -m oracle -n auto
+        shell: bash
 
       - name: Generate Coverage Summary
         if: runner.os == 'Linux'
