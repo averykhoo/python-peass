@@ -1,5 +1,6 @@
-# scripts/extract_text.py writes papers/text/*.txt LF-only and re-extraction is
-# compared byte for byte, so the working-tree copy has to stay LF whatever
-# core.autocrlf says. These files also carry glyphs that line-ending conversion
-# has eaten before -- see trap 3 in that script. Nothing else here is pinned.
-papers/text/*.txt text eol=lf
+# papers/text/*.md are transcriptions of the PDFs, written LF-only, and
+# scripts/check_transcriptions.py reads them back to validate page coverage and
+# LaTeX delimiters. Keep the working-tree copy LF whatever core.autocrlf says:
+# these files carry glyphs that line-ending conversion has silently eaten before.
+# Nothing else here is pinned.
+papers/text/*.md text eol=lf
