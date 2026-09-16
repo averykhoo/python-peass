@@ -1,0 +1,5 @@
+# scripts/extract_text.py writes papers/text/*.txt LF-only and re-extraction is
+# compared byte for byte, so the working-tree copy has to stay LF whatever
+# core.autocrlf says. These files also carry glyphs that line-ending conversion
+# has eaten before -- see trap 3 in that script. Nothing else here is pinned.
+papers/text/*.txt text eol=lf
