@@ -65,7 +65,58 @@ it is not in the file. Reading the rendered page is the only way to recover it.
 
 ## How far to trust this
 
-Verified 2026-09-17.
+Verified 2026-09-17, in two rounds on the same day.
+
+### Round 2 — one reader per page, against that page's own render
+
+Every one of the 181 pages was rendered (whole page, plus two half-page crops at
+roughly double resolution) and handed to a reader that saw only that page's image
+and that page's slice of the transcription. Nothing a reader flagged was changed on
+its own say-so: each claim went to an independent reader who measured the figure or
+re-read the margin first, and contested claims went to a third.
+
+- **Printed text came through clean.** Across 181 pages the readers report checking
+  617 equations and found no wrong symbol, digit, equation, table value or reference
+  in any printed text. 129 pages were judged accurate outright, 52 carried minor
+  issues, none needed substantive repair. No page was missing or out of order.
+- **Every correction this round was in a figure description** — 24 of them, plus one
+  invented `**Footnotes**` heading removed. That is the same conclusion the earlier
+  audit reached, reached independently: the descriptions are the only part of these
+  files not anchored to printed text, and they are where the errors are. Examples:
+  two curves' values transposed so the ranking inverted (`706` p51); the optimal
+  detector said to run above the subject data where a subject sits 5 dB above it
+  (`706` p48); a curve called monotonic that rises before it falls (`706` p65); grey
+  highlight markers described as outliers below the diagonal when they sit on
+  plotted points, mostly above it (`emiya2011` p7).
+- **Of 24 contested description claims, 8 were rejected** on re-measurement, several
+  because the proposed correction was itself wrong. Disagreements were settled by
+  measuring the figure — usually by extracting the plot's vector geometry and
+  calibrating against the printed axis ticks — not by majority vote.
+
+### Round 2 — page numbers and running heads
+
+The transcriptions were inconsistent about margins: some pages carried the running
+head, most did not, and on 16 pages a running head had been transcribed as a
+markdown section heading, so `## 2.5 Results` appeared on six pages where that
+section begins only once. Without the printed folio you could not cite a page
+without reopening the PDF.
+
+Every page's margins were read and reproduced: 74 running heads, 11 JASA running
+footers and 2 bare folios added, and the 16 false headings turned into margin lines.
+The `706` folios were cross-checked mechanically — printed folio = PDF page − 10 on
+all 123 numbered pages, with the number on the left on verso pages and the right on
+recto pages, no exceptions.
+
+### What the repair itself broke
+
+Re-reading all 94 edited pages against their renders found 8 defects introduced by
+the edit — two duplicated clauses, two body headings that the page does not print, two
+bare folios in a blank bottom margin, a grammatical break, and a `\text` that had
+become a tab. All were repaired and re-verified. The lesson is recorded here because
+it is the likeliest way this file degrades: an edit applied in bulk, checked only by
+the tool that applied it.
+
+### The earlier round, for the record
 
 Each page was transcribed, then independently re-checked against the same page
 image by a second reader, who repaired 112 defects. A third, independent pass then

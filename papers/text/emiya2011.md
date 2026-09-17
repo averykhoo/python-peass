@@ -5,7 +5,10 @@ Emiya, Vincent, Harlander & Hohmann (2011). IEEE TASLP 19(7):2046-2057. doi:10.1
 > **What this file is.** A transcription of `papers/emiya2011.pdf`, made on 2026-09-17 by reading
 > every page image and typing out what is printed there. It replaces a mechanical `pdftotext`
 > extraction that was unusable for mathematics. Each page was transcribed and then independently
-> re-checked against the same page image by a second reader.
+> re-checked against the same page image by a second reader. On 2026-09-17 every page was
+> then read once more against its own render, one reader per page, and each defect that
+> reader claimed was re-measured independently before anything was changed; see
+> `papers/README.md` for what that pass found.
 >
 > **Conventions.**
 > - `<!-- page N -->` marks the start of PDF page N. All 13 pages are present.
@@ -212,6 +215,8 @@ Following [21], we split the distortion between the estimate $\hat{s}_{ij}(t)$ a
 
 <!-- page 6 -->
 
+*EMIYA et al.: SUBJECTIVE AND OBJECTIVE QUALITY ASSESSMENT OF AUDIO SOURCE SEPARATION 5*
+
 component $e_{ij}^{\text{target}}(t)$, an interference component $e_{ij}^{\text{interf}}(t)$ and
 an artifacts component $e_{ij}^{\text{artif}}(t)$ such that$^3$
 
@@ -319,6 +324,8 @@ $^4$For simplicity, we also denote by $t$ the time index after downsampling.
 
 <!-- page 7 -->
 
+*6 IEEE TRANSACTIONS ON AUDIO, SPEECH AND LANGUAGE PROCESSING*
+
 component is given by the residual distortion:
 
 $$e_{ijbu}^{\text{target}}(t) = \sum_{k=1}^{I} \sum_{\tau=-L/2}^{L/2} \alpha_{ijbu,kj}(\tau) s_{kjbu}^\tau(t) \tag{4}$$
@@ -384,7 +391,7 @@ obtained from the auditory-based PEMO-Q metric [35] in (15),
 sound examples of the PEASS toolkit (see Section VI).
 
 [Figure 4: Scatter plot of the energy ratios in dB (top) and the PEMO-Q-based features (bottom) for the state-of-the-art distortion decomposition (y-axis) vs. the proposed distortion decomposition (x-axis). The maximum value of energy ratios have been limited to 40 dB. Circled items can be listened to as part of the sound examples of the PEASS toolkit (see Section VI).]
-Six scatter panels in a 2×3 grid. Top row, axes in dB, "State of the art" (y-axis) vs "Proposed decomp." (x-axis), each with a diagonal dashed reference line: left panel "ISR" (axes 0 to 40, tick marks 0, 20, 40); center panel "SIR" (axes −20 to 40, tick marks −20, 0, 20, 40 on both x- and y-axes); right panel "SAR" (axes 0 to 40, tick marks 0, 20, 40). Bottom row, unitless PEMO-Q features, same axis convention: left panel $q_j^{\text{target}}$ (axes 0.8 to 1); center panel $q_j^{\text{interf}}$ (axes 0.5 to 1); right panel $q_j^{\text{artif}}$ (axes 0.6 to 1). Data points are shown as small filled dots, with a few circled markers (open circles around selected points) and a handful of distinguishable outlier markers (open triangle up, open triangle down, open square, open diamond, asterisk/star) scattered around and below the diagonal in each panel.
+Six scatter panels in a 2×3 grid. Top row, axes in dB, "State of the art" (y-axis) vs "Proposed decomp." (x-axis), each with a diagonal dashed reference line: left panel "ISR" (axes 0 to 40, tick marks 0, 20, 40); center panel "SIR" (axes −20 to 40, tick marks −20, 0, 20, 40 on both x- and y-axes); right panel "SAR" (axes 0 to 40, tick marks 0, 20, 40). Bottom row, unitless PEMO-Q features, same axis convention: left panel $q_j^{\text{target}}$ (axes 0.8 to 1); center panel $q_j^{\text{interf}}$ (axes 0.5 to 1); right panel $q_j^{\text{artif}}$ (axes 0.6 to 1). Data points are shown as small filled dots, with a few circled markers (open circles around selected points) and five further grey open markers (open square, open diamond, open triangle up, open triangle down, six-pointed star), each drawn over one of the plotted points rather than marking an outlier, lying mostly on or above the diagonal in the SIR and $q_j^{\text{target}}$ panels and mostly below it in the SAR and $q_j^{\text{artif}}$ panels.
 
 Many points are far from the diagonal dashed line, showing
 that the proposed decomposition differs from the state of the
@@ -419,6 +426,8 @@ artifacts components by means of energy ratios called respec-
 tively the Signal to Distortion Ratio (SDR), the source Image
 
 <!-- page 8 -->
+
+*EMIYA et al.: SUBJECTIVE AND OBJECTIVE QUALITY ASSESSMENT OF AUDIO SOURCE SEPARATION 7*
 
 to Spatial distortion Ratio (ISR), the Signal to Interference
 Ratio (SIR) and the Signal to Artifacts Ratio (SAR) [21]:
@@ -528,6 +537,8 @@ $^6$PEMO-Q only handles single-channel signals. An extension to multichan-
 nel signals can be obtained by concatenating all channels into a single one.
 
 <!-- page 9 -->
+
+*8 IEEE TRANSACTIONS ON AUDIO, SPEECH AND LANGUAGE PROCESSING*
 
 ## Table III
 
@@ -659,6 +670,8 @@ global quality. Performance is analyzed as a function of the
 
 <!-- page 10 -->
 
+*EMIYA et al.: SUBJECTIVE AND OBJECTIVE QUALITY ASSESSMENT OF AUDIO SOURCE SEPARATION 9*
+
 chosen distortion decomposition algorithm, distortion salience
 metrics and feature vector configuration. The proposed OPS
 measure achieves the best performance in terms of accuracy,
@@ -681,7 +694,7 @@ to performance of the MOS, which suggests that room is left
 for future improvement.
 
 [Figure 6: Global score prediction performance as a function of the size of the feature vector, corresponding to different feature vector configurations shown in the first column of Table III. The four curves correspond to the use of the state-of-the-art [21] (Old) vs. the proposed (New) distortion decomposition algorithm and of energy ratio-based (SxR) vs. PEMO-Q-based (PSM) salience features. The solid curves corresponds to the proposed OPS measure. The gray lines indicates the upper performance bound corresponding to performance of the MOS compared to individual scores.]
-Legend: dashed line "Old+SxR", dash-dot line "New+SxR", dotted line "Old+PSM", solid line "New+PSM". Three panels share the x-axis "Feature vector size" with tick marks 1, 3, 4 and y-axis 0 to 1 (ticks 0, 0.2, 0.4, 0.6, 0.8, 1): left panel "Accuracy", center panel "Monotonicity", right panel "Consistency". In each panel a horizontal gray line near the top marks the MOS upper bound; the dashed and dash-dot curves (Old+SxR, New+SxR) sit low, near 0.3–0.5 in Accuracy/Monotonicity and near 0.8 in Consistency; the dotted and solid curves (Old+PSM, New+PSM) sit higher, peaking at feature vector size 3 and falling slightly at size 4, with the solid "New+PSM" curve highest, reaching about 0.6 (Accuracy), 0.55 (Monotonicity) and 0.87 (Consistency) at feature vector size 4.
+Legend: dashed line "Old+SxR", dash-dot line "New+SxR", dotted line "Old+PSM", solid line "New+PSM". Three panels share the x-axis "Feature vector size" with tick marks 1, 3, 4 and y-axis 0 to 1 (ticks 0, 0.2, 0.4, 0.6, 0.8, 1): left panel "Accuracy", center panel "Monotonicity", right panel "Consistency". In each panel a horizontal gray line near the top marks the MOS upper bound; the dashed and dash-dot curves (Old+SxR, New+SxR) sit low, near 0.3–0.5 in Accuracy/Monotonicity and near 0.8 in Consistency; the dotted and solid curves (Old+PSM, New+PSM) sit higher; the solid New+PSM curve rises to its maximum at feature vector size 4 in Accuracy and Consistency, while in Monotonicity it peaks at size 3 and dips slightly at 4; the dotted Old+PSM curve falls slightly at size 4, with the solid "New+PSM" curve highest, reaching about 0.6 (Accuracy), 0.55 (Monotonicity) and 0.87 (Consistency) at feature vector size 4.
 
 An insight into the neural network trained in the best
 configuration – *i.e.* four inputs and one sigmoid – is given

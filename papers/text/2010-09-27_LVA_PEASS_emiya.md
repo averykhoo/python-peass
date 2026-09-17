@@ -5,7 +5,10 @@ Emiya, Vincent, Harlander & Hohmann (2010). LVA/ICA 2010 CONFERENCE POSTER. HAL 
 > **What this file is.** A transcription of `papers/2010-09-27_LVA_PEASS_emiya.pdf`, made on 2026-09-17 by reading
 > every page image and typing out what is printed there. It replaces a mechanical `pdftotext`
 > extraction that was unusable for mathematics. Each page was transcribed and then independently
-> re-checked against the same page image by a second reader.
+> re-checked against the same page image by a second reader. On 2026-09-17 every page was
+> then read once more against its own render, one reader per page, and each defect that
+> reader claimed was re-measured independently before anything was changed; see
+> `papers/README.md` for what that pass found.
 >
 > **Conventions.**
 > - `<!-- page N -->` marks the start of PDF page N. All 2 pages are present.
@@ -129,7 +132,7 @@ Legend for the curves below (printed in a box above the Task 1 plots): - - - Old
 
 [Figure: Prediction results (cross-validation on the PEASS database) for the 4 tasks: curves are various combinations of the old/new decompositions with the energy ratio/PEMO-Q measures, as a function of the number of features.] A grid of small multiples: rows Task 2 (x ticks 1,2,3,4), Task 3 (x ticks 1,3,4) and Task 4 (x ticks 1,2,3,4), columns Accuracy, Monotonicity, Consistency; each subplot, like the three large Task-1 plots to its left, shows four curves — dashed (Old+SxR), dash-dot (New+SxR), dotted (Old+PSM) and solid (New+PSM) — plus a thick grey horizontal reference line near the top of the axes; y-axis ticks 0, 0.5, 1, and the shared x-axis label is again "Feature vector size".
 
-[Figure: BSS eval vs. PEASS: scatter plots of the SiSEC 2010 results for the set of *Professionally produced music recordings*.] A rotated label "DEMO SiSEC 2010" runs up the left-hand side of this block. Four scatter plots of energy-ratio measures against the corresponding PEASS perceptual scores, each with a cloud of small filled blue dots and a few highlighted, labelled examples whose three points are joined by coloured lines into a triangle:
+[Figure: BSS eval vs. PEASS: scatter plots of the SiSEC 2010 results for the set of *Professionally produced music recordings*.] A rotated label "DEMO SiSEC 2010" runs up the left-hand side of this block. Four scatter plots of energy-ratio measures against the corresponding PEASS perceptual scores, each with a cloud of small filled blue dots and a few highlighted, labelled examples whose points are joined by coloured lines — three points into a triangle for Ex.1, Ex.3 and Ex.4, four into a quadrilateral for Ex.2, and only two, joined by a single near-flat segment at about SAR = 0 dB, for Ex.5:
 - SDR (dB), ticks −5 to 15, vs. OPS (0–100), titled "Accuracy = 0.23; Monotonicity = 0.21;": ○ Ex.1 (red, open circle), ◇ Ex.2 (green, open diamond).
 - ISR (dB), ticks −10 to 30, vs. TPS (0–100), titled "Accuracy = 0.29; Monotonicity = 0.31;": ◇ Ex.2 (green, open diamond), □ Ex.3 (magenta, open square).
 - SIR (dB), ticks −10 to 30, vs. IPS (0–100), titled "Accuracy = 0.64; Monotonicity = 0.64;": ○ Ex.4 (black, open circle).

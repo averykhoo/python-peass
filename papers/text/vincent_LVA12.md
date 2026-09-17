@@ -5,7 +5,10 @@ Vincent (2012). LVA/ICA 2012, pp.430-437. hal-00653196
 > **What this file is.** A transcription of `papers/vincent_LVA12.pdf`, made on 2026-09-17 by reading
 > every page image and typing out what is printed there. It replaces a mechanical `pdftotext`
 > extraction that was unusable for mathematics. Each page was transcribed and then independently
-> re-checked against the same page image by a second reader.
+> re-checked against the same page image by a second reader. On 2026-09-17 every page was
+> then read once more against its own render, one reader per page, and each defect that
+> reader claimed was re-measured independently before anything was changed; see
+> `papers/README.md` for what that pass found.
 >
 > **Conventions.**
 > - `<!-- page N -->` marks the start of PDF page N. All 9 pages are present.
